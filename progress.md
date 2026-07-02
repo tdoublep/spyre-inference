@@ -97,3 +97,45 @@ Do NOT revert the change or widen scope this round. The correctness posture is f
 ### Summary
 The required change is already in place from the prior attempt (commit round-1-r1-impl): in `SpyreAttentionMetadataBuilder.build`, `aligned_max_query_len = 1` when `max_query_len == 1`, else the previous round-up-to-32 formula. `_online_softmax_attention` needs no code change to skip the pad — the existing `if aligned_max_query_len > query_len:` guard naturally becomes false when both equal 1. `QUERY_CHUNK_SIZE=32` and `KV_LENGTH_ALIGNMENT=256` are unchanged; no new imports; platform.py untouched. Working tree is clean vs HEAD; only `spyre_inference/v1/attention/backends/spyre_attn.py` differs from `initial` (c4d3940). The judge's perf-tuning suggestions (in-kernel argmax, longer bench, per-region timing) all require expanding scope beyond `_online_softmax_attention`'s "keep identical" constraint or touching mask-tile transfer/CPU staging (explicitly deferred to M2/M3), so no additional edits were made this round.
 
+## Round 1 — Judge (attempt 2)
+- **verdict**: fail
+
+### Analysis
+## r2 change scope
+No source changes from r1. The only diff vs `round-1-r1-impl` is a note appended to `progress.md` acknowledging that the required change (in `SpyreAttentionMetadataBuilder.build`) is already in place from r1 and explaining why the r2 implementer declined to expand scope. Source diff vs `initial` (c4d3940) is still identical to r1: the one-branch guard at `spyre_inference/v1/attention/backends/spyre_attn.py:472-478` setting `aligned_max_query_len = 1` when `max_query_len == 1`, else round-up-to-32.
+
+## Correctness (pytest)
+`uv run --no-sync pytest -m "not upstream" -q` → **265 passed, 24 skipped, 1880 deselected, 4 xfailed** in 1078s. Identical to r1 and to the reported baseline. Gate PASS.
+
+## Performance (offline bench)
+`uv run --no-sync python examples/offline_inference/torch_spyre_inference.py --num-prompts 1` completed and printed `Time elapsed for 20 generated tokens is 50.85 sec` → **0.3933 tok/s**. Baseline: 0.411 tok/s. Ratio: **0.957× (−4.3%)**. Criterion 8 requires ≥ 1.10× (≥ 0.452 tok/s). **Blocker — same as r1.** Note the ~4% swing between r1 (0.4087) and r2 (0.3933) with identical source is within single-run bench noise; run-to-run variance on 20-token samples on this box is comparable to the observed delta from baseline, so we cannot claim either a real regression or a real improvement from this change. Either way, we're nowhere near the 10% threshold.
+
+## FallbackWarning gate
+`uv run --no-sync python -W "error::torch_spyre.ops.fallbacks.FallbackWarning" examples/offline_inference/torch_spyre_inference.py --num-prompts 1` — bench ran to completion, printed `Time elapsed for 20 generated tokens is 51.61 sec`. The shutdown-time `RuntimeError: Cannot access accelerator device when none is available.` traceback comes from vLLM's `cleanup_dist_env_and_memory` calling `torch.accelerator.empty_cache()` and is unrelated to fallbacks (identical behavior in r1, on the unmodified `initial` commit, and independent of this change). As noted in the r1 report, the `-W` filter itself is silently dropped in the child worker because `torch_spyre.ops.fallbacks` isn't importable at Python startup (before torch's device-backend autoload runs). The FallbackWarnings that print in the worker output are all pre-existing on `initial`: `aten.embedding.default` in `vllm/model_executor/layers/vocab_parallel_embedding.py:78` and `aten.argmax.default` at `spyre_attn.py:252`. No new decode-kernel fallback. Gate PASS in spirit.
+
+## Pass criteria audit
+1. pytest: ✅ 265 passed, no regression.
+2. Scope: ✅ only `spyre_inference/v1/attention/backends/spyre_attn.py` source-modified; `progress.md` is workflow log.
+3. `QUERY_CHUNK_SIZE = 32` at spyre_attn.py:54. ✅
+4. `KV_LENGTH_ALIGNMENT = 256` at spyre_attn.py:48. ✅
+5. No `torch.compile` change in `platform.py` (untouched vs `initial`). ✅
+6. `if max_query_len == 1: aligned_max_query_len = 1` at spyre_attn.py:472-473. ✅
+7. Bench prints required line; no new hot-path FallbackWarning. ✅
+8. Median tok/s ≥ 1.10× baseline: 0.3933 / 0.411 = 0.957×. ❌
+
+## Read of the situation
+The r2 implementer correctly identified that the metadata-builder change alone doesn't propagate to end-to-end tok/s at the required 10% level, and argued the remaining head-room requires expanding scope (in-kernel argmax at spyre_attn.py:252, mask-tile transfer, or a longer benchmark to amortize compile-cache misses on the new Q=1 shape). That analysis is coherent, but leaving the round with a no-op edit means criterion 8 is not addressed. The orchestrator has to decide whether to widen scope for round 2 or accept a partial win.
+
+### Feedback
+Criterion 8 still not met: 0.3933 tok/s vs 0.411 baseline (0.957×, need ≥ 1.10×). All static-inspection criteria and correctness/fallback gates are green. r2 made zero source changes vs r1 — the perf posture is essentially unchanged and still within run-to-run bench noise of baseline.
+
+The r2 implementer's own note in progress.md is honest: the metadata-builder guard alone is unlikely to reach 1.10× because per-decode-step wall time is dominated by non-attention work and by fixed costs the guard doesn't touch. Next round should either widen scope or the orchestrator should relax criterion 8 / adjust the plan. Concrete perf leads still on the table (implementer, orchestrator: pick one, don't scattershot):
+
+1. **Inline the online-softmax path for `Q=1`.** In `_online_softmax_attention` (spyre_attn.py:~229-269), when `padded_query_len == 1` the per-chunk `scores.max(dim=-1, keepdim=True)[0]` at spyre_attn.py:252 (which currently falls back to CPU per `aten.argmax.default` FallbackWarning) runs once per KV block. With Q=32 the CPU-fallback cost amortized across 32 query rows; with Q=1 it's now paid per single query. Consider a specialized decode branch that skips the online-softmax chunking entirely (single query → single pass over KV → normal softmax) and thus avoids the per-chunk max-reduction fallback altogether. That would both remove a hot-path CPU roundtrip and let the compiled kernel see a much simpler shape.
+
+2. **Confirm the Q=1 compile cache is warm.** Print or otherwise verify that the compiled attention kernel for the new `padded_query_len=1` bucket is not being recompiled per decode step. If `_maybe_compile` uses `dynamic=False` and the shape is stable, the first decode-step compile is amortized once — but 20 tokens is short, so warmup dominates. A quick test: run the bench twice back-to-back in the same process (if the example supports `--num-prompts 2` or two sequential prompts) and compare per-prompt tok/s.
+
+3. **Longer bench for signal.** 20 tokens is short enough that first-step compile / warmup dominates. If the example accepts `--max-tokens 64` or similar, use it to get a cleaner steady-state tok/s that would actually reflect the attention-kernel speedup.
+
+Do NOT re-run r2's approach unchanged. Either pick option (1) — which stays within `spyre_attn.py` and is the most likely to move the needle — or the orchestrator should reset criterion 8 with a more realistic threshold or expanded scope.
+
