@@ -139,3 +139,16 @@ The r2 implementer's own note in progress.md is honest: the metadata-builder gua
 
 Do NOT re-run r2's approach unchanged. Either pick option (1) — which stays within `spyre_attn.py` and is the most likely to move the needle — or the orchestrator should reset criterion 8 with a more realistic threshold or expanded scope.
 
+## Round 1 — Judge loop exhausted after 2 attempts
+- **last_feedback**: Criterion 8 still not met: 0.3933 tok/s vs 0.411 baseline (0.957×, need ≥ 1.10×). All static-inspection criteria and correctness/fallback gates are green. r2 made zero source changes vs r1 — the perf posture is essentially unchanged and still within run-to-run bench noise of baseline.
+
+The r2 implementer's own note in progress.md is honest: the metadata-builder guard alone is unlikely to reach 1.10× because per-decode-step wall time is dominated by non-attention work and by fixed costs the guard doesn't touch. Next round should either widen scope or the orchestrator should relax criterion 8 / adjust the plan. Concrete perf leads still on the table (implementer, orchestrator: pick one, don't scattershot):
+
+1. **Inline the online-softmax path for `Q=1`.** In `_online_softmax_attention` (spyre_attn.py:~229-269), when `padded_query_len == 1` the per-chunk `scores.max(dim=-1, keepdim=True)[0]` at spyre_attn.py:252 (which currently falls back to CPU per `aten.argmax.default` FallbackWarning) runs once per KV block. With Q=32 the CPU-fallback cost amortized across 32 query rows; with Q=1 it's now paid per single query. Consider a specialized decode branch that skips the online-softmax chunking entirely (single query → single pass over KV → normal softmax) and thus avoids the per-chunk max-reduction fallback altogether. That would both remove a hot-path CPU roundtrip and let the compiled kernel see a much simpler shape.
+
+2. **Confirm the Q=1 compile cache is warm.** Print or otherwise verify that the compiled attention kernel for the new `padded_query_len=1` bucket is not being recompiled per decode step. If `_maybe_compile` uses `dynamic=False` and the shape is stable, the first decode-step compile is amortized once — but 20 tokens is short, so warmup dominates. A quick test: run the bench twice back-to-back in the same process (if the example supports `--num-prompts 2` or two sequential prompts) and compare per-prompt tok/s.
+
+3. **Longer bench for signal.** 20 tokens is short enough that first-step compile / warmup dominates. If the example accepts `--max-tokens 64` or similar, use it to get a cleaner steady-state tok/s that would actually reflect the attention-kernel speedup.
+
+Do NOT re-run r2's approach unchanged. Either pick option (1) — which stays within `spyre_attn.py` and is the most likely to move the needle — or the orchestrator should reset criterion 8 with a more realistic threshold or expanded scope.
+
