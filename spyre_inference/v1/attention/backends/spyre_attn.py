@@ -412,6 +412,13 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Each tile: [aligned_max_query_len, block_size] on CPU.
     attention_mask_tiles: list[list[torch.Tensor]] | None = None
 
+    # Lazy-populated on the first layer's forward pass to share the H2D
+    # conversion across all L attention layers in a step. Same structure
+    # as attention_mask_tiles but with each tile on the Spyre target device.
+    # The metadata object is fresh per step, so cross-step staleness is
+    # impossible.
+    attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
+
     # Global aligned query length for stable kernel compilation.
     # max_query_len rounded up to QUERY_CHUNK_SIZE (32). All queries are
     # padded to this length so the compiled attention kernel receives
@@ -842,6 +849,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
 
+        # Cache mask-tile H2D transfers across the L attention layers that
+        # share this metadata object within a single step. The first layer's
+        # forward pass populates the device-side list; subsequent layers skip
+        # the redundant `convert()` calls.
+        mask_tiles_all_device = attn_metadata.attention_mask_tiles_device
+        if mask_tiles_all_device is None:
+            mask_tiles_all_device = [
+                [convert(m, device=_target_device) for m in seq_tiles]
+                for seq_tiles in mask_tiles_all
+            ]
+            attn_metadata.attention_mask_tiles_device = mask_tiles_all_device
+
         # Scattering into `output` on Spyre dim=0 has no working primitive:
         # `output[i:j] = ...` and `narrow().copy_(...)` silently write to row 0;
         # `torch.ops.spyre.overwrite` is deprecated and its compile_once wrapper
@@ -887,8 +906,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
             page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
-            # mask_tiles = [m.to(_target_device) for m in mask_tiles_all[seq_idx]]
-            mask_tiles = [convert(m, device=_target_device) for m in mask_tiles_all[seq_idx]]
+            mask_tiles = mask_tiles_all_device[seq_idx]
 
             # Run attention on target device
             q_dev = convert(q, device=_target_device)
