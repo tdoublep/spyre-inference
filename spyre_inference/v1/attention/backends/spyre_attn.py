@@ -282,6 +282,75 @@ def _create_compilable_page_attn(num_blocks: int, padded_query_len: int):
     return specialized_paged_attn_kernel
 
 
+def _create_compilable_page_attn_decode(num_blocks: int):
+    """Create a decode-only paged attention kernel (padded_query_len == 1).
+
+    With a single query row per sequence, we avoid per-block online softmax
+    (which requires per-block `scores.max(dim=-1)` — that path falls back to
+    CPU for the argmax component). Instead we concat all per-block scores
+    along the KV axis, run one global `torch.softmax` (Spyre-native
+    `aten._softmax`), and then compute the weighted V sum. Total scored KV
+    length is bounded by `MAX_MODEL_LEN_CAP` so a single fp16 softmax over
+    ≤128 values is numerically safe.
+
+    Dynamo unrolls the loops because num_blocks is a closure constant.
+    """
+
+    def specialized_paged_attn_kernel(q, k_pages, v_pages, page_indices, mask_tiles, scale):
+        """
+        Expected shapes:
+            q: [num_kv_heads, num_queries_per_kv, 1, head_size]
+            k_pages: list of [num_kv_heads, block_size, head_size]
+            v_pages: list of [num_kv_heads, block_size, head_size]
+            page_indices: [num_blocks]
+            mask_tiles: [num_blocks]
+        """
+        if num_blocks == 1:
+            # Fast single-block path — no concat overhead, no
+            # `_indirect_matmul_mock` dispatch overhead.
+            page_idx = page_indices[0]
+            k_page = k_pages[page_idx].unsqueeze(1).transpose(-2, -1)
+            v_page = v_pages[page_idx].unsqueeze(1)
+            scores = torch.matmul(q, k_page)
+            scores = scores * scale
+            scores = scores + mask_tiles[0]
+            probs = torch.softmax(scores, dim=-1)
+            return torch.matmul(probs, v_page)
+
+        score_chunks: list[torch.Tensor] = []
+        v_chunks: list[torch.Tensor] = []
+        for i in range(num_blocks):
+            page_idx = page_indices[i]
+            mask_tile = mask_tiles[i]
+            scores_i = _indirect_matmul_mock(
+                q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)
+            )
+            scores_i = scores_i * scale
+            scores_i = scores_i + mask_tile
+            score_chunks.append(scores_i)
+            # Gather V pages the same way — indirect indexing into a list —
+            # so the loop stays compile-unrollable. `.unsqueeze(1)` matches the
+            # `num_queries_per_kv` broadcast dim expected by the matmul below.
+            v_chunks.append(v_pages[page_idx].unsqueeze(1))
+
+        # Single global softmax across concatenated KV positions.
+        # `torch.softmax` decomposes to Spyre-native `aten._softmax` and thus
+        # avoids the per-block `aten.argmax.default` fallback that the online
+        # kernel's `.max(dim=-1)[0]` triggers each iteration.
+        scores = torch.cat(score_chunks, dim=-1)
+        probs = torch.softmax(scores, dim=-1)
+
+        # Single matmul against the concatenated V pages replaces the per-block
+        # accumulation loop. For decode the total KV length is bounded (≤
+        # `MAX_MODEL_LEN_CAP`), so the concat overhead is small compared with
+        # the per-block matmul dispatch cost.
+        v_all = torch.cat(v_chunks, dim=-2)
+        output = torch.matmul(probs, v_all)
+        return output
+
+    return specialized_paged_attn_kernel
+
+
 @dataclass
 class SpyreAttentionMetadata(AttentionMetadata):
     """Metadata for paged online-softmax attention on Spyre."""
@@ -648,9 +717,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
         key = (num_blocks, padded_query_len)
         if key not in self._attn_fns:
-            self._attn_fns[key] = _maybe_compile(
-                _create_compilable_page_attn(num_blocks, padded_query_len)
-            )
+            if padded_query_len == 1:
+                factory = _create_compilable_page_attn_decode(num_blocks)
+            else:
+                factory = _create_compilable_page_attn(num_blocks, padded_query_len)
+            self._attn_fns[key] = _maybe_compile(factory)
         return self._attn_fns[key]
 
     # `kv_cache` widens the base's `torch.Tensor` to `SpyrePagedKVCache`,
