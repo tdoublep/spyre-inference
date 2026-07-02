@@ -330,3 +330,76 @@ The underlying issue is unchanged from r1 judge feedback: a 1.02× threshold on 
 
 Do NOT ask the implementer to iterate further on the decode kernel unless option (1) or (2) is applied first — the current implementation is architecturally sound and any further tuning without a lower-variance measurement will be indistinguishable from noise.
 
+## Round 3 — Orchestrator
+- **reasoning**: The judge has explicitly said, twice in a row: do not iterate on the decode kernel until measurement is fixed. Bench variance is ~40% run-to-run, so any r1/r2-scale architectural win is invisible. Applying M2/M3/M4 without first fixing measurement will produce another round of "code correct, perf inside noise." The one-file edit to the example script — warmup pass + longer max_tokens — is minimal, has no correctness risk, and unblocks scoring every future attention change. It's the highest-EV thing we can do this round precisely because it multiplies the value of every subsequent round. The CoV≤10% criterion turns "did methodology work" from a vibe check into a concrete gate; the 0.95× baseline floor prevents an accidental regression from a badly-placed warmup call.
+
+### Task
+**Fix bench measurement signal (M0)** so future rounds can score attention changes against a low-variance number. The judge has now told us twice not to iterate on the decode kernel until this is done.
+
+Two orthogonal changes, both in `examples/offline_inference/torch_spyre_inference.py`:
+
+1. **Warmup pass.** Before the timed generation, run one warmup `llm.generate(...)` call whose wall time is *not* included in the `Time elapsed …` output. Use the exact same prompt(s) and sampling params as the measured run. This ensures the Spyre compile cache is hot for every `(num_blocks, padded_query_len)` bucket that will be hit during the measured decode — first-decode-step compile is currently ~30–40% of a 20-token bench and is exactly what makes r1/r2 measurements inside noise.
+
+2. **Longer default max_tokens for the single-prompt bench.** Change the `--max-tokens` default from `"20,65"` to `"128"` (or add a new arg like `--max-tokens-default` with default 128 that applies when the user doesn't pass `--max-tokens`). This amortizes any remaining per-step fixed cost over ~6× more decode steps and dilutes bench-boundary jitter proportionally. Keep the parser accepting the same comma-list format so `--max-tokens 20,65` still works for anyone who invokes it.
+
+Both changes together should:
+- Preserve the exact printed line format `Time elapsed for <N> generated tokens is <T> sec` (the framework parses this).
+- Preserve compatibility with the existing invocation `uv run --no-sync python examples/offline_inference/torch_spyre_inference.py --num-prompts 1` — the judge command must still run. The reported `<N>` will now be larger and `<T>` proportionally larger, but tok/s = N/T is the invariant.
+- Not change plugin source code. Only touch the example script.
+
+**Non-goals for this round:**
+- Do NOT touch `spyre_inference/**` source. This round is purely about bench methodology.
+- Do NOT change `--num-prompts` semantics or defaults.
+- Do NOT alter the compare-with-cpu code path.
+- Do NOT touch `platform.py`, `spyre_attn.py`, or `custom_ops/`.
+
+**Concrete edit plan for `examples/offline_inference/torch_spyre_inference.py`:**
+
+a. Change the `--max-tokens` default string from `"20,65"` to `"128"`. This is a one-line edit at the argparse definition.
+
+b. Just before the current timed `llm.generate(prompts, sampling_params)` block (currently around the line `t0 = time.time()`), insert a warmup call:
+
+    ```
+    # Warmup: prime the Spyre compile cache for all (num_blocks, padded_query_len)
+    # buckets the measured run will hit. Discard timing.
+    print("=============== WARMUP")
+    _ = llm.generate(prompts, sampling_params)
+    print("=============== END WARMUP")
+    ```
+
+   Place this before `t0 = time.time()` so its cost is not included in the reported elapsed time. Keep the "=============== GENERATE" print immediately before `t0 = time.time()` so the measured run's output section is still clearly labeled.
+
+c. Keep everything after `t0 = time.time()` untouched. The `Time elapsed for {total_tokens} generated tokens is {elapsed:.2f} sec` print must remain byte-identical in format (framework regex depends on it).
+
+**Verification steps the implementer must run:**
+
+1. `uv run --no-sync pytest -m "not upstream" -q` — must pass at the current 265-passed count. (No source change, so this is a formality; still run it to make sure nothing indirect broke.)
+
+2. Primary bench: `uv run --no-sync python examples/offline_inference/torch_spyre_inference.py --num-prompts 1`. Confirm:
+   - Two "GENERATE" style blocks print (warmup then measured).
+   - Exactly one `Time elapsed for <N> generated tokens is <T> sec` line prints, coming from the measured (post-warmup) run.
+   - `<N>` is 128 with the new default (not 20).
+   - The run completes successfully.
+   - Extract tok/s = N/T and record it. Also record the elapsed wall time separately for later comparison to r2's ~50s run.
+
+3. Reproducibility probe: run the same bench command **twice more back-to-back in separate processes**. Report all three tok/s values in `progress.md`. Coefficient of variation across the three should be materially lower than the ~40% seen in r1/r2 (target: CoV ≤ 10%). This validates that the warmup+longer-run methodology is actually delivering signal.
+
+4. Do NOT invoke `--compare-with-cpu`. Correctness is covered by pytest.
+
+**Files touched (should be exactly one source file):**
+- `examples/offline_inference/torch_spyre_inference.py`
+
+Reasoning why this is the right lever *right now*: r1 and r2 both landed correct, architecturally sound changes and both were declared "not measurably better" only because the measurement itself has ~40% variance. Landing M2/M3/M4 without first fixing measurement would produce another judge cycle that says "code correct, perf number inside noise". After M0 lands, every subsequent attention change can be scored against a bench that resolves single-digit-percent improvements.
+
+### Pass criteria
+1. `uv run --no-sync pytest -m "not upstream" -q` passes at the pre-change pass count (currently 265 passed, 24 skipped, 4 xfailed). No regressions.
+2. Only `examples/offline_inference/torch_spyre_inference.py` is source-modified. In particular, no files under `spyre_inference/` are changed.
+3. The argparse `--max-tokens` default in `examples/offline_inference/torch_spyre_inference.py` is `"128"` (or a per-prompt equivalent producing 128 tokens per prompt), not `"20,65"`.
+4. `examples/offline_inference/torch_spyre_inference.py` contains a warmup `llm.generate(...)` call whose wall time is not included in the elapsed measurement (i.e. it must precede the `t0 = time.time()` line that anchors the timed run).
+5. The measured-run print statement in `examples/offline_inference/torch_spyre_inference.py` still emits a line matching the regex `^Time elapsed for \d+ generated tokens is \d+\.\d+ sec` — the framework parses this exact format.
+6. Running `uv run --no-sync python examples/offline_inference/torch_spyre_inference.py --num-prompts 1` prints exactly one `Time elapsed for <N> generated tokens is <T> sec` line (from the measured run), with `<N>` equal to 128 (matching the new default).
+7. `spyre_inference/v1/attention/backends/spyre_attn.py` is byte-identical to its state at the start of this round — no source changes to the plugin. Confirm via `git diff HEAD -- spyre_inference/`.
+8. `spyre_inference/platform.py` is unchanged from its state at the start of this round — no `torch.compile(...)` calls added, no `MAX_MODEL_LEN_CAP` / `MAX_NUM_SEQS_CAP` changed.
+9. The implementer reports three independent tok/s measurements from three sequential process invocations of the bench command in `progress.md`. Coefficient of variation (stdev / mean) across those three is ≤ 0.10 (10%), demonstrating that the new methodology delivers signal materially better than the ~40% variance seen in r1/r2.
+10. Median tok/s of the three measured runs is ≥ 0.95× the baseline (0.411 × 0.95 = 0.390 tok/s). This is a "no significant regression" gate — the point of this round is to fix measurement, not to add perf; a small warmup-related shift is acceptable but a real regression is not.
+
