@@ -265,3 +265,51 @@ Do NOT undo the decode-factory dispatch; it's architecturally correct. If iterat
 ### Summary
 The decode factory `_create_compilable_page_attn_decode(num_blocks)` from round-2-r1-impl is already in place and satisfies static criteria 3-7 (verified: decode factory at spyre_attn.py:285, `_create_compilable_page_attn` still at line 212, `_get_attn_fn` dispatches at line 720 on `padded_query_len == 1`, `QUERY_CHUNK_SIZE=32` at line 54, `KV_LENGTH_ALIGNMENT=256` at line 48, zero `torch.compile(` calls in platform.py). This round's only code delta is a micro-optimization inside the num_blocks==1 fast path: fold `scale` into `q` pre-matmul (`torch.matmul(q * scale, k_page)`) so the elementwise multiply happens on the smaller `[.., 1, head_size]` q tensor rather than the post-matmul `[.., 1, block_size]` scores tensor — one fewer op across the larger shape per decode step per layer. Judge feedback flagged the perf issue as measurement-noise-dominated (43.93s–60.83s span on 20-token bench), not a code defect. All 73 attention tests pass; the argmax `FallbackWarning` at spyre_attn.py:252 originates only from the prefill kernel (per criterion 9, allowed) — the decode factory is fallback-free.
 
+## Round 2 — Judge (attempt 2)
+- **verdict**: fail
+
+### Analysis
+## r2 change scope (round 2, attempt 2)
+Minimal code delta vs r1 (round-2-r1-impl): a single micro-optimization in `_create_compilable_page_attn_decode`'s `num_blocks == 1` fast path — fold `scale` into `q` before the first matmul (`torch.matmul(q * scale, k_page)`) rather than scaling the post-matmul scores tensor. `q` has shape `[.., 1, head_size]` (small) while `scores` has `[.., 1, block_size]` (larger), so the elementwise multiply moves to the smaller tensor. Architecturally identical to r1: decode factory at spyre_attn.py:285, original prefill factory at line 212, `_get_attn_fn` dispatch at line 722, constants and `platform.py` untouched.
+
+## Correctness (pytest)
+`uv run --no-sync pytest -m "not upstream" -q` → **265 passed, 24 skipped, 1880 deselected, 4 xfailed** in 1075s. Matches baseline. Gate PASS.
+
+## Performance (offline bench)
+Primary un-filtered run: `Time elapsed for 20 generated tokens is 49.62 sec` → **0.4030 tok/s**. Baseline: 0.411. Ratio: **0.980× (−2.0%)**. Threshold this round is ≥ 1.02× (≥ 0.419 tok/s). **Blocker — criterion 10 not met, but by a very thin margin.** Notably better than r1's primary run (0.3759 tok/s at 53.21s), suggesting either the micro-optimization gave a small real win or this happened to be a luckier run on a very noisy bench (prior three runs on r1 code spanned 43.93s–60.83s, ~40% variance). One run cannot distinguish those.
+
+## FallbackWarning gate
+`uv run --no-sync python -W "error::torch_spyre.ops.fallbacks.FallbackWarning" examples/offline_inference/torch_spyre_inference.py --num-prompts 1` completed with `Time elapsed for 20 generated tokens is 50.52 sec`. As in all prior rounds, Python rejects the `-W` filter itself with `Invalid -W option ignored: invalid module name: 'torch_spyre.ops.fallbacks'` — the module isn't importable before torch's device-backend autoload runs, so the filter is silently dropped in-process and warnings still print. Every unique `FallbackWarning` origin in the run is either `vllm/.../vocab_parallel_embedding.py:78` (pre-existing baseline, unscored per criterion 9) or `spyre_inference/v1/attention/backends/spyre_attn.py:252` — the `.max(dim=-1)[0]` inside the OLD prefill factory `_create_compilable_page_attn`. The new decode factory at line 285 uses `torch.softmax` and emits zero fallbacks. Criterion 9 explicitly permits prefill fallback. Gate 3 PASS.
+
+## Pass criteria audit
+1. pytest 265 passed, same as baseline. ✅
+2. Only `spyre_attn.py` source-modified (+ workflow-tracked `progress.md`). ✅
+3. `_create_compilable_page_attn_decode` factory at spyre_attn.py:285. ✅
+4. Original `_create_compilable_page_attn` at spyre_attn.py:212. ✅
+5. `_get_attn_fn` dispatches to decode factory when `padded_query_len == 1` at spyre_attn.py:722. ✅
+6. `KV_LENGTH_ALIGNMENT = 256` (line 48), `QUERY_CHUNK_SIZE = 32` (line 54). ✅
+7. No `torch.compile` in platform.py. ✅
+8. Bench prints required `Time elapsed …` line. ✅
+9. Decode factory emits no `aten.argmax.default` fallback; only prefill-line-252 warnings fire (explicitly allowed). ✅
+10. tok/s ≥ 1.02× baseline: 0.4030 / 0.411 = 0.980×. ❌ (miss by 3.9%)
+
+## Signal quality
+Same fundamental problem the r1 judge flagged: a 1.02× threshold on a metric with ~40% run-to-run variance is coin-flip signal. Today's primary run (49.62s) sits comfortably inside the observed noise band from prior rounds. A single re-run could plausibly land anywhere in ~44s–60s and flip the verdict. r2's `progress.md` reports 5 runs of its own this round in the 47.88–57.00s range with a 51.58s median — consistent with what I'm seeing but again spanning both sides of the threshold. The engineering change is architecturally correct, criterion 9 is met, and the primary run happens to be within a few percent of both baseline and threshold; whether the real underlying tok/s clears 1.02× cannot be resolved with a 20-token single-run bench.
+
+### Feedback
+Perf criterion 10 not met: primary un-filtered bench = 0.4030 tok/s vs 0.411 baseline (0.980×, need ≥ 1.02×). Miss by ~3.9%. All static criteria (2-9), correctness, and no-new-fallback gate pass — the architectural change is in and working correctly. r2's `q * scale` micro-optimization landed a slightly better primary run than r1 (0.403 vs 0.376) but still under the threshold.
+
+The underlying issue is unchanged from r1 judge feedback: a 1.02× threshold on a benchmark with ~40% run-to-run variance is not a decidable signal. Same three orchestrator options apply — pick one:
+
+1. **Longer bench (strongest fix, no code change needed).** Modify the bench invocation (or the example script) to generate 128+ tokens instead of 20. First-decode-step compile cost dominates a 20-token run and is exactly what a Q=1 kernel bucket incurs on introduction. A longer run gives the new decode kernel time to reach steady state.
+
+2. **Warmup + measure.** Run one prompt as warmup, discard its timing, then measure the second prompt. If the harness doesn't natively support this, a tiny edit to the example script would.
+
+3. **Relax criterion 10 to "no significant regression" (e.g. ≥ 0.95× baseline) or drop it entirely for this round.** The change:
+   - passes all correctness gates,
+   - eliminates the decode-path CPU roundtrip that criterion 9 targets (design goal met),
+   - lands within ~2% of baseline on the primary run (well inside bench noise).
+   The 1.02× threshold was chosen partly as a defensible signal floor, but 0.980× on a metric that spans 0.33–0.46 across recent runs is not meaningfully worse than baseline either. The code is correct; the measurement isn't discriminating.
+
+Do NOT ask the implementer to iterate further on the decode kernel unless option (1) or (2) is applied first — the current implementation is architecturally sound and any further tuning without a lower-variance measurement will be indistinguishable from noise.
+
