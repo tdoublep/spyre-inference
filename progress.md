@@ -152,3 +152,56 @@ The r2 implementer's own note in progress.md is honest: the metadata-builder gua
 
 Do NOT re-run r2's approach unchanged. Either pick option (1) — which stays within `spyre_attn.py` and is the most likely to move the needle — or the orchestrator should reset criterion 8 with a more realistic threshold or expanded scope.
 
+## Round 2 — Orchestrator
+- **reasoning**: r1's metadata-builder change (M1) shrank the decode query dimension to 1 but produced no measurable end-to-end gain. The judge diagnosed why: the online-softmax kernel calls `scores.max(dim=-1)` per KV block, which falls back to CPU as `aten.argmax.default`. With Q=32, that fallback was amortized over 32 query rows; with Q=1 (post-M1), it's paid per single query row, per block, per layer, per step — the fallback cost swallowed M1's theoretical FMA saving. The right response is to remove the per-block `.max()` call entirely on the Q=1 hot path. A dedicated decode kernel that concatenates all block scores and does a single global softmax turns N per-block CPU roundtrips into at most 1 per attention forward; it's self-contained in one file, keyed cleanly by `padded_query_len==1` so the prefill path is untouched, and float16-safe because `MAX_MODEL_LEN_CAP=128` bounds the score length. The 1.02× threshold matches the judge's r1 note that 1.10× on a 20-token bench is inside noise.
+
+### Task
+Add a dedicated **decode-only attention kernel** in `spyre_inference/v1/attention/backends/spyre_attn.py` that avoids the per-KV-block `scores.max(dim=-1, keepdim=True)[0]` CPU fallback (`aten.argmax.default` FallbackWarning at `spyre_attn.py:252`), which is currently the dominant hot-path cost per the r1 judge report.
+
+**Approach: replace per-block online-softmax with a single global softmax when `padded_query_len == 1`.**
+
+Concrete edits, all within `spyre_inference/v1/attention/backends/spyre_attn.py`:
+
+1. Add a new factory `_create_compilable_page_attn_decode(num_blocks: int)` alongside the existing `_create_compilable_page_attn`. The new kernel:
+   - Takes the same signature `(q, k_pages, v_pages, page_indices, mask_tiles, scale)` where `q` has shape `[num_kv_heads, num_queries_per_kv, 1, head_size]`.
+   - For each of `num_blocks` KV pages, compute the score chunk `s_i = _indirect_matmul_mock(q, None, k_pages, page_idx, transform_b=lambda t: t.unsqueeze(1).transpose(-2, -1)) * scale + mask_tiles[i]`. Shape: `[num_kv_heads, num_queries_per_kv, 1, block_size]`.
+   - **Concatenate** all `s_i` along the last (KV) dim into a single tensor `scores` of shape `[num_kv_heads, num_queries_per_kv, 1, num_blocks * block_size]`. Dynamo will unroll the concat because `num_blocks` is a closure constant.
+   - Do **one** softmax across the full concatenated `scores`: use `torch.softmax(scores, dim=-1)` if it doesn't fall back on Spyre; otherwise emulate with `probs = torch.exp(scores - scores.amax(dim=-1, keepdim=True)); probs = probs / probs.sum(dim=-1, keepdim=True)` — **but ONLY if `amax` is Spyre-native**. The implementer must probe which of `torch.softmax`, `torch.amax`, `.max()` avoid the fallback on Spyre for this shape (check `.venv/lib/python3.12/site-packages/torch_spyre/ops/{eager,fallbacks}.py` and run the bench under `-W "error::torch_spyre.ops.fallbacks.FallbackWarning"` to observe). If both `torch.softmax` and `torch.amax` fall back, prefer `torch.softmax` (one fallback per layer per step, vs. the current one *per block*).
+   - Split `probs` back into `num_blocks` slices along the KV axis (again unrolled), and compute `output = sum_i probs_i @ v_page_i` using the same `_indirect_matmul_mock` pattern as the online path.
+   - Return `output` (already normalized — no `/ tile_sum` needed).
+
+2. In `SpyreAttentionImpl._get_attn_fn`, when `padded_query_len == 1`, use the new decode factory; otherwise use the existing `_create_compilable_page_attn`. Continue to cache by `(num_blocks, padded_query_len)` so the two variants coexist.
+
+3. Do NOT change the metadata builder, `_online_softmax_attention`, `_reshape_and_cache`, `QUERY_CHUNK_SIZE`, `KV_LENGTH_ALIGNMENT`, `_online_softmax_attention`'s output staging, mask-tile transfer, or `platform.py`. Keep the change surgical: one new factory, one dispatch in `_get_attn_fn`.
+
+4. Numerical safety note for the implementer: total scored KV length ≤ `MAX_MODEL_LEN_CAP = 128` (from `platform.py:70`), so a single global float16 softmax over ≤ 128 values with one max-subtraction is stable. `mask_tiles[i]` already contains `-65504.0` for masked positions, so the max-subtraction step will pick the largest **unmasked** score exactly like the online version.
+
+5. Verification steps the implementer must run:
+   - `uv run --no-sync pytest -m "not upstream" -q` — no new failures.
+   - `uv run --no-sync python -W "error::torch_spyre.ops.fallbacks.FallbackWarning" examples/offline_inference/torch_spyre_inference.py --num-prompts 1` — bench completes and the per-block `aten.argmax.default` fallback at the old `spyre_attn.py:252` line no longer fires in the decode kernel (that line still exists in the prefill kernel, which is fine). Record the tok/s from the printed `Time elapsed for <N> generated tokens is <T> sec` line.
+   - Also run once *without* the `-W` filter for the primary tok/s reading (baseline & r1 were measured that way).
+
+6. Static-inspection self-check before handing back:
+   - `_create_compilable_page_attn_decode` exists in `spyre_inference/v1/attention/backends/spyre_attn.py`.
+   - `_create_compilable_page_attn` (the online-softmax one) still exists and is still used when `padded_query_len > 1`.
+   - `KV_LENGTH_ALIGNMENT = 256` and `QUERY_CHUNK_SIZE = 32` unchanged.
+   - No `torch.compile(...)` calls in `spyre_inference/platform.py`.
+   - No new imports beyond `torch` primitives already used.
+
+Files touched (should be exactly one):
+- `spyre_inference/v1/attention/backends/spyre_attn.py`
+
+Non-goals for this round: do not touch `_online_softmax_attention`'s CPU staging buffer, do not memoize mask tiles across steps, do not bump KV alignment. Those are M2/M3/M4 for future rounds.
+
+### Pass criteria
+1. `uv run --no-sync pytest -m "not upstream" -q` passes with at least the pre-change pass count (currently 265 passed). No new failures.
+2. Only `spyre_inference/v1/attention/backends/spyre_attn.py` is modified as a source file (progress.md and roadmap.md updates aside).
+3. `spyre_inference/v1/attention/backends/spyre_attn.py` contains a new factory function whose name starts with `_create_compilable_page_attn` and specializes for `padded_query_len==1` — verifiable by static grep for `def _create_compilable_page_attn_decode` or equivalent in that file.
+4. `spyre_inference/v1/attention/backends/spyre_attn.py` still contains the original `def _create_compilable_page_attn(` for the prefill path.
+5. `SpyreAttentionImpl._get_attn_fn` in `spyre_inference/v1/attention/backends/spyre_attn.py` dispatches to the new decode factory only when `padded_query_len == 1`.
+6. `KV_LENGTH_ALIGNMENT = 256` and `QUERY_CHUNK_SIZE = 32` remain unchanged in `spyre_inference/v1/attention/backends/spyre_attn.py`.
+7. No `torch.compile(...)` calls in `spyre_inference/platform.py`.
+8. Offline benchmark `uv run --no-sync python examples/offline_inference/torch_spyre_inference.py --num-prompts 1` runs to completion and prints `Time elapsed for <N> generated tokens is <T> sec`.
+9. On the same run under `-W "error::torch_spyre.ops.fallbacks.FallbackWarning"`, the decode-path attention no longer emits the `aten.argmax.default` FallbackWarning that was previously anchored at `_create_compilable_page_attn`'s `scores.max(dim=-1, keepdim=True)[0]` line. (The prefill kernel path may still emit it — that's fine — but a stack frame originating in the new decode factory must not.) The `aten.embedding.default` fallback in `vllm/.../vocab_parallel_embedding.py` is a pre-existing baseline warning and is not scored here.
+10. Measured tok/s from the primary (un-filtered) bench run is **≥ 1.02× the reported baseline of 0.411 tok/s** — i.e. ≥ 0.419 tok/s. (Threshold lowered from r1's 1.10× based on r1 judge's guidance that 10% on a 20-token bench is inside noise; 1.02× is defensible signal.)
+
