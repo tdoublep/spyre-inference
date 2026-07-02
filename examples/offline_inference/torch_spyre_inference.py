@@ -47,7 +47,7 @@ def parse_args():
     parser.add_argument(
         "--max-tokens",
         type=str,
-        default="20,65",
+        default="128",
         dest="max_tokens",
         help="Comma-separated list of max tokens per prompt (cycled if shorter than num_prompts)",
     )
@@ -135,6 +135,12 @@ def main():
         enforce_eager=args.enforce_eager,
         num_gpu_blocks_override=args.num_gpu_blocks_override,
     )
+
+    # Warmup: prime the Spyre compile cache for all (num_blocks, padded_query_len)
+    # buckets the measured run will hit. Discard timing.
+    print("=============== WARMUP")
+    _ = llm.generate(prompts, sampling_params)
+    print("=============== END WARMUP")
 
     # Generate texts from the prompts. The output is a list of RequestOutput objects
     # that contain the prompt, generated text, and other information.
