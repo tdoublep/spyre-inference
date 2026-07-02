@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: spyre-inference
-Version: 0.1.dev114
+Version: 0.1.dev1
 Summary: Next iteration of sendnn-inference on the torch-spyre stack
 License: Apache-2.0
 Project-URL: Homepage, https://github.com/torch-spyre/spyre-inference

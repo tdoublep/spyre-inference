@@ -102,8 +102,17 @@ tests/test_vocab_parallel_embedding.py
 tests/plugin/README.md
 tests/plugin/pyproject.toml
 tests/plugin/spyre_testing_plugin/__init__.py
+tests/plugin/spyre_testing_plugin/_version.py
 tests/plugin/spyre_testing_plugin/models.py
 tests/plugin/spyre_testing_plugin/pytest_plugin.py
 tests/plugin/spyre_testing_plugin/sync_upstream_test_deps.py
 tests/plugin/spyre_testing_plugin/upstream_tests.yaml
+tests/plugin/spyre_testing_plugin.egg-info/PKG-INFO
+tests/plugin/spyre_testing_plugin.egg-info/SOURCES.txt
+tests/plugin/spyre_testing_plugin.egg-info/dependency_links.txt
+tests/plugin/spyre_testing_plugin.egg-info/entry_points.txt
+tests/plugin/spyre_testing_plugin.egg-info/requires.txt
+tests/plugin/spyre_testing_plugin.egg-info/scm_file_list.json
+tests/plugin/spyre_testing_plugin.egg-info/scm_version.json
+tests/plugin/spyre_testing_plugin.egg-info/top_level.txt
 tests/probes/tp_probe.py

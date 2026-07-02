@@ -64,6 +64,7 @@
     "experimental/attention_backend/paged_vector_add_target.py",
     "spyre_inference/__init__.py",
     "spyre_inference/platform.py",
+    "spyre_inference/_version.py",
     "spyre_inference/custom_ops/__init__.py",
     "spyre_inference/custom_ops/linear.py",
     "spyre_inference/custom_ops/parallel_lm_head.py",
@@ -99,6 +100,23 @@
     "tests/plugin/spyre_testing_plugin/pytest_plugin.py",
     "tests/plugin/spyre_testing_plugin/sync_upstream_test_deps.py",
     "tests/plugin/spyre_testing_plugin/upstream_tests.yaml",
-    "tests/probes/tp_probe.py"
+    "tests/plugin/spyre_testing_plugin/_version.py",
+    "tests/plugin/spyre_testing_plugin.egg-info/scm_version.json",
+    "tests/plugin/spyre_testing_plugin.egg-info/scm_file_list.json",
+    "tests/plugin/spyre_testing_plugin.egg-info/PKG-INFO",
+    "tests/plugin/spyre_testing_plugin.egg-info/dependency_links.txt",
+    "tests/plugin/spyre_testing_plugin.egg-info/entry_points.txt",
+    "tests/plugin/spyre_testing_plugin.egg-info/requires.txt",
+    "tests/plugin/spyre_testing_plugin.egg-info/top_level.txt",
+    "tests/plugin/spyre_testing_plugin.egg-info/SOURCES.txt",
+    "tests/probes/tp_probe.py",
+    "spyre_inference.egg-info/scm_version.json",
+    "spyre_inference.egg-info/scm_file_list.json",
+    "spyre_inference.egg-info/PKG-INFO",
+    "spyre_inference.egg-info/dependency_links.txt",
+    "spyre_inference.egg-info/entry_points.txt",
+    "spyre_inference.egg-info/requires.txt",
+    "spyre_inference.egg-info/top_level.txt",
+    "spyre_inference.egg-info/SOURCES.txt"
   ]
 }

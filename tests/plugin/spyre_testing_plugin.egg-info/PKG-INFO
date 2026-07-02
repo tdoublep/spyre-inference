@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: spyre-testing-plugin
-Version: 0.1.dev114
+Version: 0.1.dev1
 Summary: pytest plugin for spyre-inference upstream test integration
 License: Apache-2.0
 Requires-Python: >=3.11
