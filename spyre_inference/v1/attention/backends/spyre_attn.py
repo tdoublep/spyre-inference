@@ -307,12 +307,14 @@ def _create_compilable_page_attn_decode(num_blocks: int):
         """
         if num_blocks == 1:
             # Fast single-block path — no concat overhead, no
-            # `_indirect_matmul_mock` dispatch overhead.
+            # `_indirect_matmul_mock` dispatch overhead. Fold `scale` into q
+            # pre-matmul: q has [.., 1, head_size] elements (small), scores has
+            # [.., 1, block_size] (larger), so scaling q first is one fewer
+            # elementwise mul across the larger tensor.
             page_idx = page_indices[0]
             k_page = k_pages[page_idx].unsqueeze(1).transpose(-2, -1)
             v_page = v_pages[page_idx].unsqueeze(1)
-            scores = torch.matmul(q, k_page)
-            scores = scores * scale
+            scores = torch.matmul(q * scale, k_page)
             scores = scores + mask_tiles[0]
             probs = torch.softmax(scores, dim=-1)
             return torch.matmul(probs, v_page)
