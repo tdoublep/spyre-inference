@@ -490,3 +490,100 @@ All pass criteria and always-on gates met, with two marginal notes flagged for t
 
 Nothing to fix in code this round.
 
+## Round 4 — Orchestrator
+- **reasoning**: Post-M0, the bench delivers signal at ~9% CoV, so real changes can now score. Post-M1'/M1, the Q=1 decode kernel is fallback-free and query-padding-free. The next-highest-EV lever is the redundant per-layer mask-tile H2D transfer: every attention layer converts the same CPU mask tiles to Spyre, once per layer per step. For a 26-layer model with 120 measured decode steps and 2-4 blocks/step, that's ~6k-12k redundant transfers per bench. Caching them on the shared metadata object is a minimal, surgical change (one new dataclass field + one gated conversion) with tight correctness bounds — the metadata object is per-step so no cross-step staleness is possible, and existing attention pytest coverage will catch any semantic bug. This is exactly the kind of "removes per-step overhead that scales with L layers" work the new 120-token bench is designed to measure. Non-strict tok/s gate (≥ baseline) prevents the round from failing on measurement jitter alone while still catching real regressions.
+
+### Task
+**Implement M2: cache mask-tile H2D transfers across layers within a single decode step**, in `spyre_inference/v1/attention/backends/spyre_attn.py`.
+
+**Bottleneck being addressed.** In `SpyreAttentionImpl._online_softmax_attention` at `spyre_attn.py:891`, the code does:
+
+```
+mask_tiles = [convert(m, device=_target_device) for m in mask_tiles_all[seq_idx]]
+```
+
+`mask_tiles_all` comes from the shared `SpyreAttentionMetadata` object built once per step by `SpyreAttentionMetadataBuilder.build`. That object is passed to **every** attention layer in the forward pass — for a 26-layer model that's 26 identical CPU→Spyre transfers of the same tensors per step, i.e. `26 × num_blocks × decode_steps` per bench. All L-1 transfers after the first layer are redundant.
+
+**Fix.** Lazy-populate a Spyre-side cache attached to the metadata object. First layer to touch the metadata does the H2D and stashes the result; subsequent layers see it populated and skip the conversion.
+
+**Concrete edits (all in `spyre_inference/v1/attention/backends/spyre_attn.py`):**
+
+1. Extend the `SpyreAttentionMetadata` dataclass (around line 286) with a new optional field:
+
+   ```
+   # Lazy-populated on first layer's forward pass to share across all L
+   # attention layers in a step. Same shape as attention_mask_tiles but
+   # on the Spyre target device.
+   attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
+   ```
+
+   Default `None`. Do **not** populate this in the builder — the builder doesn't know `_target_device`. Populate lazily in the impl.
+
+2. In `SpyreAttentionImpl._online_softmax_attention` (around line 812), replace the per-seq per-layer `convert` block with a lookup-or-fill:
+
+   ```
+   # Before the seq loop:
+   mask_tiles_all_device = attn_metadata.attention_mask_tiles_device
+   if mask_tiles_all_device is None:
+       # First layer this step: convert once and stash on the shared metadata.
+       mask_tiles_all_device = [
+           [convert(m, device=_target_device) for m in seq_tiles]
+           for seq_tiles in mask_tiles_all
+       ]
+       attn_metadata.attention_mask_tiles_device = mask_tiles_all_device
+
+   # Inside the seq loop, replace:
+   #   mask_tiles = [convert(m, device=_target_device) for m in mask_tiles_all[seq_idx]]
+   # with:
+   mask_tiles = mask_tiles_all_device[seq_idx]
+   ```
+
+   The metadata object is fresh per step (built by
+   `SpyreAttentionMetadataBuilder.build` on line 455), so cross-step
+   staleness is impossible — the cache is discarded when Python
+   dereferences the metadata object.
+
+3. Do **NOT** change the metadata builder logic. Do NOT change
+   `SpyrePagedKVCache`, `_reshape_and_cache`, the decode kernel factories,
+   or any constants (`KV_LENGTH_ALIGNMENT`, `QUERY_CHUNK_SIZE`).
+
+4. Do **NOT** touch `platform.py`, `custom_ops/`, or the example script.
+
+**Correctness note for the implementer.** `attention_mask_tiles` on the CPU side is what `_build_attention_mask` produces at lines 396-453 using `seq_lens` — it correctly encodes both padding masks and causal masks. Converting element-wise to `_target_device` preserves values (float16 → float16 same-dtype H2D). The tests that exercise the attention path (`tests/test_spyre_attn.py`) compare against a CPU reference and will catch any semantic drift.
+
+**Verification steps the implementer must run:**
+
+1. `uv run --no-sync pytest -m "not upstream" -q` — must pass at the current 265-passed count. No new failures. `test_spyre_attn.py` is the primary correctness gate; the CPU reference in that test doesn't care about the caching, but if the lazy-populate logic is buggy (e.g. wrong indexing across seqs) it will show up as attention numerical drift.
+
+2. Primary bench (three sequential process invocations for signal):
+   `uv run --no-sync python examples/offline_inference/torch_spyre_inference.py --num-prompts 1`
+   Record all three tok/s values. Report median in `progress.md`. Expected: median ≥ new baseline 0.7315 tok/s. Ideally noticeably above — this change removes ~25 redundant per-step per-block H2D transfers per attention layer per step, which is real work on a slow bus, though the fraction of end-to-end time it consumes is unknown a priori.
+
+3. Fallback-warning probe:
+   `uv run --no-sync python examples/offline_inference/torch_spyre_inference.py --num-prompts 1 2>&1 | grep -c FallbackWarning`
+   (Or an equivalent count.) The count should not increase relative to the round-3-end state. New attention fallbacks would be a bug; the pre-existing `spyre_attn.py:252` prefill-path warning and `vocab_parallel_embedding.py:78` warning are the only ones expected.
+
+4. Do NOT invoke `--compare-with-cpu`. Correctness is covered by pytest.
+
+**Files touched (should be exactly one source file):**
+- `spyre_inference/v1/attention/backends/spyre_attn.py`
+
+**Non-goals for this round:**
+- Do NOT touch the CPU staging buffer (M3).
+- Do NOT change `KV_LENGTH_ALIGNMENT` (M4).
+- Do NOT extract `page_indices` into the metadata builder (M5).
+- Do NOT touch `platform.py`, `custom_ops/`, or the example script.
+- Do NOT rewrite `_reshape_and_cache` or the prefill kernel factory.
+
+### Pass criteria
+1. `uv run --no-sync pytest -m "not upstream" -q` passes with 265 passed (matching the pre-change baseline). No new failures.
+2. Only `spyre_inference/v1/attention/backends/spyre_attn.py` is source-modified. In particular, `examples/offline_inference/torch_spyre_inference.py`, `spyre_inference/platform.py`, and every file under `spyre_inference/custom_ops/` are byte-identical to their state at the start of this round (verifiable via `git diff HEAD` scoped to those paths).
+3. `spyre_inference/v1/attention/backends/spyre_attn.py`'s `SpyreAttentionMetadata` dataclass declares a new field for a Spyre-device mask-tile cache (a `list[list[torch.Tensor]] | None`-typed field defaulting to `None`, semantically representing the on-device mask tiles). Verifiable by static grep for the field name in the dataclass block.
+4. `SpyreAttentionImpl._online_softmax_attention` in `spyre_inference/v1/attention/backends/spyre_attn.py` performs the per-seq mask-tile H2D conversion **at most once per attn_metadata object**, and subsequent invocations against the same metadata reuse the cached list. Verifiable by static inspection: the `convert(m, device=_target_device)` call for mask tiles must be gated by a check that the new field is `None` (or equivalent), and the field must be assigned inside the gate.
+5. `KV_LENGTH_ALIGNMENT = 256` and `QUERY_CHUNK_SIZE = 32` remain unchanged in `spyre_inference/v1/attention/backends/spyre_attn.py`.
+6. No `torch.compile(...)` calls in `spyre_inference/platform.py`.
+7. The `_create_compilable_page_attn_decode` factory (introduced in r2) still exists in `spyre_inference/v1/attention/backends/spyre_attn.py`, and `SpyreAttentionImpl._get_attn_fn` still dispatches to it when `padded_query_len == 1`.
+8. Three sequential process invocations of `uv run --no-sync python examples/offline_inference/torch_spyre_inference.py --num-prompts 1` each print exactly one `Time elapsed for <N> generated tokens is <T> sec` line (from the measured, post-warmup run) with `<N> = 120`.
+9. No new `FallbackWarning` origin surfaces in the primary bench run relative to the round-3-end state. Specifically: `spyre_inference/v1/attention/backends/spyre_attn.py`-anchored FallbackWarnings must only originate from the pre-existing prefill-kernel line 252 (or its equivalent line in `_create_compilable_page_attn`); the Q=1 decode factory `_create_compilable_page_attn_decode` and the mask-caching code must be fallback-free. `vllm/.../vocab_parallel_embedding.py:78` remains as the pre-existing baseline warning and is not scored.
+10. Median tok/s across the three primary bench invocations is **≥ 0.7315** (the new-methodology baseline from r3-end). This is a "no regression" gate — the design goal of M2 is to remove redundant work, so a mild speedup is expected but not required at the strict-inequality level; the criterion floors at parity.
+
