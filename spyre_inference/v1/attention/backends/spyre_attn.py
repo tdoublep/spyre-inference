@@ -469,9 +469,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         apply_causal_mask = common_attn_metadata.causal and max_query_len > 1
 
-        aligned_max_query_len = (
-            (max_query_len + QUERY_CHUNK_SIZE - 1) // QUERY_CHUNK_SIZE * QUERY_CHUNK_SIZE
-        )
+        if max_query_len == 1:
+            aligned_max_query_len = 1
+        else:
+            aligned_max_query_len = (
+                (max_query_len + QUERY_CHUNK_SIZE - 1) // QUERY_CHUNK_SIZE * QUERY_CHUNK_SIZE
+            )
         aligned_max_seq_len = (
             (max_seq_len + KV_LENGTH_ALIGNMENT - 1) // KV_LENGTH_ALIGNMENT * KV_LENGTH_ALIGNMENT
         )
