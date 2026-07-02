@@ -1,0 +1,11 @@
+{
+  "files": [
+    "README.md",
+    "pyproject.toml",
+    "spyre_testing_plugin/__init__.py",
+    "spyre_testing_plugin/models.py",
+    "spyre_testing_plugin/pytest_plugin.py",
+    "spyre_testing_plugin/sync_upstream_test_deps.py",
+    "spyre_testing_plugin/upstream_tests.yaml"
+  ]
+}

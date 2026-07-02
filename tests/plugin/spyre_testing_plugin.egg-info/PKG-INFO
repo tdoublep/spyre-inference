@@ -1,0 +1,94 @@
+Metadata-Version: 2.4
+Name: spyre-testing-plugin
+Version: 0.1.dev114
+Summary: pytest plugin for spyre-inference upstream test integration
+License: Apache-2.0
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: pytest
+Requires-Dist: pyyaml
+Requires-Dist: albumentations>=2.0.8
+Requires-Dist: arctic-inference==0.1.1; platform_machine == "x86_64"
+Requires-Dist: av>=17.0.1
+Requires-Dist: backoff>=2.2.1
+Requires-Dist: bitsandbytes==0.49.2
+Requires-Dist: blobfile>=3.2.0
+Requires-Dist: buildkite-test-collector==0.1.9
+Requires-Dist: datamodel-code-generator>=0.54.1
+Requires-Dist: datasets<=3.6.0,>=3.3.0
+Requires-Dist: decord==0.6.0; platform_machine == "x86_64"
+Requires-Dist: einops>=0.8.2
+Requires-Dist: fastsafetensors>=0.3.2
+Requires-Dist: genai-perf>=0.0.8
+Requires-Dist: gpt-oss>=0.0.7; python_full_version >= "3.12"
+Requires-Dist: grpcio==1.78.0
+Requires-Dist: grpcio-reflection==1.78.0
+Requires-Dist: httpx>=0.28.1
+Requires-Dist: imagehash>=4.3.2
+Requires-Dist: instanttensor>=0.1.5; platform_machine == "x86_64"
+Requires-Dist: jiwer>=4.0.0
+Requires-Dist: kaldi-native-fbank>=1.18.7
+Requires-Dist: librosa>=0.11.0
+Requires-Dist: lm-eval[api]>=0.4.12
+Requires-Dist: matplotlib>=3.10.8
+Requires-Dist: mistral-common[audio,image]>=1.11.3
+Requires-Dist: mteb[bm25s]<3,>=2
+Requires-Dist: num2words>=0.5.14
+Requires-Dist: numba==0.65.0
+Requires-Dist: numpy>=2.2.6
+Requires-Dist: open-clip-torch==2.32.0
+Requires-Dist: opencv-python-headless>=4.13.0
+Requires-Dist: openpyxl>=3.1.5
+Requires-Dist: peft>=0.18.1
+Requires-Dist: perceptron>=0.2.1
+Requires-Dist: plotly>=6.6.0
+Requires-Dist: pqdm>=0.2.0
+Requires-Dist: pydantic>=2.12
+Requires-Dist: pytest-asyncio>=1.3.0
+Requires-Dist: pytest-cov>=7.0.0
+Requires-Dist: pytest-forked>=1.6.0
+Requires-Dist: pytest-rerunfailures>=16.1
+Requires-Dist: pytest-shard>=0.1.2
+Requires-Dist: pytest-timeout>=2.3.1
+Requires-Dist: ray[cgraph,default]>=2.48.0
+Requires-Dist: runai-model-streamer[azure,gcs,s3]==0.15.7
+Requires-Dist: schemathesis>=3.39.15
+Requires-Dist: segmentation-models-pytorch>0.4.0
+Requires-Dist: sentence-transformers>=5.2.0
+Requires-Dist: soundfile>=0.13.1
+Requires-Dist: tblib>=3.2.2
+Requires-Dist: tensorizer==2.10.1
+Requires-Dist: timm>=1.0.17
+Requires-Dist: tokenizers==0.22.2
+Requires-Dist: torch==2.11.0
+Requires-Dist: torchaudio==2.11.0
+Requires-Dist: torchvision==0.26.0
+Requires-Dist: transformers==5.5.3
+Requires-Dist: transformers-stream-generator>=0.0.5
+Requires-Dist: tritonclient>=2.51.0
+Requires-Dist: vector-quantize-pytorch>=1.27.21
+Requires-Dist: vocos>=0.1.0
+
+# spyre-testing-plugin
+
+pytest plugin for spyre-inference upstream test integration.
+
+This downloads and caches the upstream vllm unit tests, running a subset of them configured by upstream_tests.yaml.
+
+## Installation
+
+```bash
+uv sync --group dev  # from parent project
+```
+
+## Usage
+
+The plugin is automatically discovered by pytest via the `pytest11` entry point.
+
+## Development
+
+```bash
+cd tests/plugin
+uv sync
+uv run pytest
+```

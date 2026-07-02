@@ -1,0 +1,5 @@
+[vllm.general_plugins]
+spyre_inference_ops = spyre_inference:register_ops
+
+[vllm.platform_plugins]
+spyre_inference = spyre_inference:register

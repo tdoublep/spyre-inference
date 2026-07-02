@@ -1,0 +1,51 @@
+default_install_hook_types:
+  - pre-commit
+  - commit-msg
+default_stages:
+  - pre-commit # Run locally
+  - manual # Run in CI
+repos:
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  rev: v0.14.0
+  hooks:
+  - id: ruff
+    args: [--output-format, github, --fix]
+  - id: ruff-format
+    # args: [--diff] # Uncomment to show diffs (not reformatting files)
+- repo: https://github.com/crate-ci/typos
+  rev: v1.41.0
+  hooks:
+  - id: typos
+- repo: https://github.com/igorshubovych/markdownlint-cli
+  rev: v0.45.0
+  hooks:
+  - id: markdownlint
+    args: [
+      "--config",
+      "pyproject.toml",
+      "--configPointer",
+      "/tool/markdownlint",
+      "--fix"
+    ]
+    exclude: '.*\.inc\.md'
+- repo: https://github.com/rhysd/actionlint
+  rev: v1.7.7
+  hooks:
+  - id: actionlint
+- repo: local
+  hooks:
+    - id: ty
+      name: ty check
+      entry: uvx ty@0.0.16 check spyre_inference
+      # `system` here instead of python so that we avoid running inside an isolated venv created by
+      # prek, and instead have access to the .venv created by uv for the project
+      language: system
+      # `pass_filenames: false` is super important, this stops prek from passing the list of files
+      # modified by the current commit to the `ty` command. For type checking we want to always
+      # check all files because the staged changes may cause errors in unmodified files. Think
+      # deleting a method but forgetting to remove all of the call sites in other files.
+      pass_filenames: false
+      # Pinned to the pre-commit stage so the manual-stage CI run on
+      # ubuntu-latest (which does not install vllm/torch-spyre) skips it; a
+      # dedicated CI job on a Spyre runner runs `prek run ty --stage pre-commit`.
+      stages: [pre-commit]

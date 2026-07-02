@@ -1,0 +1,16 @@
+README.md
+pyproject.toml
+spyre_testing_plugin/__init__.py
+spyre_testing_plugin/_version.py
+spyre_testing_plugin/models.py
+spyre_testing_plugin/pytest_plugin.py
+spyre_testing_plugin/sync_upstream_test_deps.py
+spyre_testing_plugin/upstream_tests.yaml
+spyre_testing_plugin.egg-info/PKG-INFO
+spyre_testing_plugin.egg-info/SOURCES.txt
+spyre_testing_plugin.egg-info/dependency_links.txt
+spyre_testing_plugin.egg-info/entry_points.txt
+spyre_testing_plugin.egg-info/requires.txt
+spyre_testing_plugin.egg-info/scm_file_list.json
+spyre_testing_plugin.egg-info/scm_version.json
+spyre_testing_plugin.egg-info/top_level.txt

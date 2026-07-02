@@ -1,0 +1,12 @@
+*.pyc
+.git
+.hf_cache
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.venv
+__pycache__
+build
+dist
+exp_env
+node_modules
