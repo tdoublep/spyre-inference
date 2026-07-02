@@ -313,3 +313,20 @@ The underlying issue is unchanged from r1 judge feedback: a 1.02× threshold on 
 
 Do NOT ask the implementer to iterate further on the decode kernel unless option (1) or (2) is applied first — the current implementation is architecturally sound and any further tuning without a lower-variance measurement will be indistinguishable from noise.
 
+## Round 2 — Judge loop exhausted after 2 attempts
+- **last_feedback**: Perf criterion 10 not met: primary un-filtered bench = 0.4030 tok/s vs 0.411 baseline (0.980×, need ≥ 1.02×). Miss by ~3.9%. All static criteria (2-9), correctness, and no-new-fallback gate pass — the architectural change is in and working correctly. r2's `q * scale` micro-optimization landed a slightly better primary run than r1 (0.403 vs 0.376) but still under the threshold.
+
+The underlying issue is unchanged from r1 judge feedback: a 1.02× threshold on a benchmark with ~40% run-to-run variance is not a decidable signal. Same three orchestrator options apply — pick one:
+
+1. **Longer bench (strongest fix, no code change needed).** Modify the bench invocation (or the example script) to generate 128+ tokens instead of 20. First-decode-step compile cost dominates a 20-token run and is exactly what a Q=1 kernel bucket incurs on introduction. A longer run gives the new decode kernel time to reach steady state.
+
+2. **Warmup + measure.** Run one prompt as warmup, discard its timing, then measure the second prompt. If the harness doesn't natively support this, a tiny edit to the example script would.
+
+3. **Relax criterion 10 to "no significant regression" (e.g. ≥ 0.95× baseline) or drop it entirely for this round.** The change:
+   - passes all correctness gates,
+   - eliminates the decode-path CPU roundtrip that criterion 9 targets (design goal met),
+   - lands within ~2% of baseline on the primary run (well inside bench noise).
+   The 1.02× threshold was chosen partly as a defensible signal floor, but 0.980× on a metric that spans 0.33–0.46 across recent runs is not meaningfully worse than baseline either. The code is correct; the measurement isn't discriminating.
+
+Do NOT ask the implementer to iterate further on the decode kernel unless option (1) or (2) is applied first — the current implementation is architecturally sound and any further tuning without a lower-variance measurement will be indistinguishable from noise.
+
