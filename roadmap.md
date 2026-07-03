@@ -88,39 +88,24 @@ alternative-pathway rule.
 - **[done] M7: Force `block_size >= 128`.** +15.2% (T2).
 - **[done] M3a: Skip CPU staging when num_seqs==1.** +17.0% (T2).
 
-- **[in_progress] M8: Replace RMSNorm shape-matched epsilon buffer with a
-  scalar broadcast.** *Removes 6,240 shape-matched-tensor allocations +
-  6,240 hidden_size-fold redundant rsqrts per bench.* In
-  `SpyreRMSNorm.forward_spyre` (rms_norm.py:136-173), replace:
-
-  ```
-  variance_epsilon_t = torch.full(
-      x.shape, variance_epsilon, dtype=torch.float16, device=x.device
-  )
-  variance = x.pow(2).mean(dim=-1, keepdim=True)
-  x = x * torch.rsqrt(variance + variance_epsilon_t)
-  ```
-
-  with:
-
-  ```
-  variance = x.pow(2).mean(dim=-1, keepdim=True)
-  x = x * torch.rsqrt(variance + variance_epsilon)
-  ```
-
-  Where `variance_epsilon` is the Python float already passed in as a
-  parameter. `variance` has shape `[batch, 1]`, adding a scalar
-  broadcasts trivially, `rsqrt` now runs on a `[batch, 1]` tensor
-  (batch reciprocal-sqrts instead of `batch × hidden_size`), and the
-  final `x * rsqrt(...)` broadcasts `[batch, 1]` back to
-  `[batch, hidden_size]` — same numerical result as the old code.
-
-  Risks: the `torch.full` was a workaround per the module docstring
-  ("Creates epsilon tensor via `torch.full()`" is listed as one of the
-  key differences from upstream). If Spyre lacks scalar broadcast in
-  add or `.rsqrt` on `[batch, 1]` triggers a fallback, pytest will
-  catch it (numerical) or the FallbackWarning gate will (silent CPU
-  routing). Revert if either fires.
+- **[parked] M8 (r10): Replace RMSNorm shape-matched epsilon buffer with
+  a scalar broadcast.** Same-session A/B second-triplet ratio (primary
+  signal per r5 protocol): M8/r9-end = 0.8612/1.0605 = **0.812×
+  (−18.8%)**. T1 ratio 1.096× (+9.6%) disagreed; combined-6-run ratio
+  0.860× (−14.0%). Fallback-gate green (no new `custom_ops/rms_norm.py`
+  origin — Spyre natively handles both scalar-broadcast add and
+  `.rsqrt([batch, 1])`), and pytest all 265 green — so this isn't a
+  correctness issue, and the `torch.full` "workaround" flagged in the
+  module docstring wasn't load-bearing. The perf number just came in
+  below the 0.98× keep threshold on the primary triplet. Empirically
+  the shape-matched pattern is faster on this Spyre stack — likely
+  because a `[batch, hidden_size]` rsqrt kernel is more optimally
+  scheduled than the `[batch, 1]` version, or the `torch.full`
+  allocation is being memoized/pool-recycled inside Spyre in a way the
+  scalar-broadcast path can't match. Parked (not abandoned): revisit
+  if a future torch-spyre release changes rsqrt kernel selection, or
+  bundle with the `.pow(2).mean().rsqrt()` fusion path if that becomes
+  available.
 
 - **[todo] M3: Full CPU-staging-buffer removal.**
 - **[todo] M6b: Sweep remaining custom_ops.**
@@ -146,7 +131,12 @@ alternative-pathway rule.
 
 ## Parked
 
-(none yet)
+- M8 (r10): scalar-broadcast epsilon in RMSNorm. Correctness green,
+  fallback-gate green, but same-session A/B primary triplet ratio
+  0.812× — below the 0.98× keep threshold. Reverted. Direction is
+  still sound in principle (fewer allocations, fewer rsqrts); the
+  regression appears kernel-scheduling-dependent on the current
+  torch-spyre. Revisit under a future stack.
 
 ## Abandoned
 
