@@ -1382,3 +1382,63 @@ Both above 1.02× keep threshold. **Decision: keep M4 change at KV_LENGTH_ALIGNM
 ### Summary
 Implemented M4 in `spyre_inference/v1/attention/backends/spyre_attn.py` — one-line source change plus matching docstring: `KV_LENGTH_ALIGNMENT = 256` → `KV_LENGTH_ALIGNMENT = 512`, and the surrounding comment updated to describe 512-token tiers. `QUERY_CHUNK_SIZE = 32` and every r1-r6 change (decode kernel factory, M2 device mask cache, M5 precomputed scalars, M6a RMSNorm weight cache) untouched. Ran the full same-session A/B protocol requested by the task: two triplets each of M4 and r6-end (interleaved M4-T1 → r6-end-T1 → M4-T2 → r6-end-T2 via `git stash`/`git stash pop`). Same-session second-triplet ratio (primary signal per r5 judge) M4/r6-end = 1.179× (+17.9%); first-triplet ratio = 1.059× (+5.9%). Both above the 1.02× keep threshold — kept the change. Updated `roadmap.md` to move M4 from `in_progress` to `done` with the measured ratios and mechanism note. Updated `progress.md` with all six A/B measurements plus a primary-bench triplet on HEAD.
 
+## Round 7 — Judge (attempt 1)
+- **verdict**: pass
+- **tok_per_sec**: 0.9391
+
+### Analysis
+## r1 change scope (round 7, M4 KV alignment bump)
+One-line source change to `spyre_inference/v1/attention/backends/spyre_attn.py`:
+- Line 48: `KV_LENGTH_ALIGNMENT = 256` → `KV_LENGTH_ALIGNMENT = 512`.
+- Adjacent comment (lines 44-47) updated to describe 512-token tiers (512, 1024, …).
+
+All r1-r6 machinery is preserved: `_create_compilable_page_attn_decode` at spyre_attn.py:285, M2 `attention_mask_tiles_device` at spyre_attn.py:420, M5 four precomputed fields at spyre_attn.py:437 onward, M6a `_get_device_weight`/`_weight_device_cache`/`_weight_cache_src_id` at rms_norm.py:85-86 and 175-189. `QUERY_CHUNK_SIZE = 32` at spyre_attn.py:54 unchanged. `platform.py` untouched; no `torch.compile(` calls.
+
+Roadmap.md updated: M4 moved to "done" with measured ratios; retrospective log entry appended.
+
+## Correctness (pytest)
+`uv run --no-sync pytest -m "not upstream" -q` → **265 passed, 24 skipped, 1880 deselected, 4 xfailed** in 1072s. Matches baseline. No flakes. `tests/test_spyre_attn.py` included in the pass count. Gate PASS.
+
+## Performance — three primary bench runs on HEAD
+- Run 1: `Time elapsed for 120 generated tokens is 127.79 sec` → **0.9391 tok/s**
+- Run 2: `Time elapsed for 120 generated tokens is 149.51 sec` → **0.8026 tok/s**
+- Run 3: `Time elapsed for 120 generated tokens is 115.59 sec` → **1.0382 tok/s**
+
+Mean: 0.9266 tok/s. **Median: 0.9391 tok/s**. Sample stdev: 0.1181. CoV: 12.7%. Clears the 0.7315 fixed floor by +28.4%. Also 2.28× the r3 methodology baseline (0.411 tok/s).
+
+Implementer's reported same-session A/B (progress.md, six M4 + six r6-end runs, interleaved via git stash): T1 (cold) ratio M4/r6-end = 1.059×, T2 (warm, primary signal per r5 judge precedent) ratio = 1.179×. Both above the 1.02× signal threshold and above the 0.98× keep threshold. The mechanism note — doubling `aligned_max_seq_len` reduces the number of distinct Spyre-side kernel shape variants materialized as `kv_len` crosses block boundaries during a 120-token decode — is plausible; the effect would not show at scale-1 (single tier) reasoning but does show when the KV grows through per-block mask-tile shape variants.
+
+## FallbackWarning gate
+`uv run --no-sync python -W "error::torch_spyre.ops.fallbacks.FallbackWarning" …` completed with `Time elapsed for 120 generated tokens is 137.24 sec`. Python still rejects the `-W` filter itself (`Invalid -W option ignored: invalid module name: 'torch_spyre.ops.fallbacks'`), same as all prior rounds. Unique `FallbackWarning` origins:
+- `vllm/.../vocab_parallel_embedding.py:78` (pre-existing baseline, unscored)
+- `spyre_inference/v1/attention/backends/spyre_attn.py:252` inside `_create_compilable_page_attn` (prefill kernel, permitted)
+
+Zero new fallback origins from the alignment bump. Gate 3 PASS.
+
+## Pass criteria audit
+1. pytest 265 passed, baseline preserved. ✅
+2. Only `spyre_attn.py` source-modified (+ workflow `progress.md`, `roadmap.md`); `examples/`, `platform.py`, `v1/worker/`, `custom_ops/` byte-identical. ✅
+3. Final source has `KV_LENGTH_ALIGNMENT = 512` at spyre_attn.py:48; matches progress.md's explicit "keep" recommendation. ✅
+4. `QUERY_CHUNK_SIZE = 32` at spyre_attn.py:54 unchanged. ✅
+5. `_create_compilable_page_attn_decode` at spyre_attn.py:285; `_get_attn_fn` dispatches on `padded_query_len == 1` at spyre_attn.py:754. ✅
+6. `attention_mask_tiles_device` (M2) at spyre_attn.py:420; `query_starts`/`query_ends`/`kv_lens_list`/`page_indices_per_seq` (M5) at spyre_attn.py:437-442. ✅
+7. `_get_device_weight` at rms_norm.py:175; `_weight_device_cache` and `_weight_cache_src_id` init at rms_norm.py:85-86. ✅
+8. `platform.py` unchanged; no `torch.compile(` calls (only two docstring/comment mentions at lines 130 and 193). ✅
+9. All three primary bench runs printed exactly one `Time elapsed for 120 generated tokens is <T> sec` line; no runtime errors. ✅
+10. FallbackWarning origins limited to pre-existing prefill-kernel `spyre_attn.py:252` and `vocab_parallel_embedding.py:78`. ✅
+11. Same-session A/B ratio + all six times reported in progress.md; explicit "keep" decision documented. Keep-case sub-criteria: ratio 1.179× (T2) / 1.059× (T1) both ≥ 0.98× AND my primary median 0.9391 ≥ 0.7315. Both alternatives cleanly satisfied. ✅
+12. roadmap.md moves M4 from "in_progress" to "done" with measured ratio (+17.9% T2 / +5.9% T1) documented in the entry. ✅
+
+## Minor observation (not a criterion violation)
+The comment at spyre_attn.py:429 still reads "rounded up to KV_LENGTH_ALIGNMENT (256)" — stale after the alignment bump. The comment at lines 44-47 was updated but this one nearby was missed. Cosmetic issue, does not affect the verdict.
+
+## Interpretation
+Every criterion and always-on gate is met. The change is a one-line hyperparameter bump with a well-reasoned mechanism, backed by a controlled same-session A/B (implementer's data) and a strong same-session absolute perf on my re-measurement (median 0.9391 tok/s, +28.4% above the 0.7315 floor, 2.28× baseline). The correctness suite is green with no flakes. FallbackWarning surface is unchanged.
+
+Passing.
+
+### Feedback
+All criteria and always-on gates pass. Nothing to fix.
+
+Minor cosmetic note for future cleanup (not a criterion violation): comment at `spyre_inference/v1/attention/backends/spyre_attn.py:429` still reads "rounded up to KV_LENGTH_ALIGNMENT (256)" — the surrounding docstring at lines 44-47 was updated to 512 but this one nearby was missed. Fixing it is a one-line docstring edit for a future round if convenient.
+
