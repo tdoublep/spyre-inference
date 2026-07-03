@@ -426,9 +426,9 @@ class SpyreAttentionMetadata(AttentionMetadata):
     aligned_max_query_len: int = 0
 
     # Global aligned KV sequence length for stable kernel compilation.
-    # max_seq_len rounded up to KV_LENGTH_ALIGNMENT (256). The KV mask
+    # max_seq_len rounded up to KV_LENGTH_ALIGNMENT (512). The KV mask
     # dimension is padded to this length so recompilation only happens
-    # per 256-token tier, not per distinct sequence length.
+    # per 512-token tier, not per distinct sequence length.
     aligned_max_seq_len: int = 0
 
     # Precomputed per-seq scalars — populated once by the metadata builder
@@ -892,7 +892,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # result on CPU and bulk-copy at the end of the per-sequence loop.
         # Revisit when torch-spyre lands symbolic-offset overwrite
         # (torch-spyre#220 / #1371-3).
-        output_cpu = torch.zeros_like(output, device="cpu")
+        # `num_seqs == 1` short-circuit: the single-seq path fills the whole
+        # `output` in one shot, so the staging buffer + memcpy are pure
+        # overhead. Skip the allocation on that path.
+        if num_seqs > 1:
+            output_cpu = torch.zeros_like(output, device="cpu")
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
@@ -941,7 +945,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             result_cpu = convert(result, "cpu", output.dtype)
             result_cpu = result_cpu.reshape(1, num_heads, aligned_max_query_len, head_size)
             result_cpu = result_cpu.transpose(1, 2).contiguous()
-            output_cpu[q_start:q_end] = result_cpu[0, :query_len, :, :]
+            if num_seqs == 1:
+                # Single-seq: `output` is exactly `result_cpu[0, :query_len, :, :]`
+                # in shape, so push directly with no CPU staging.
+                output.copy_(convert(result_cpu[0, :query_len, :, :], device=_target_device))
+            else:
+                output_cpu[q_start:q_end] = result_cpu[0, :query_len, :, :]
 
-        output.copy_(convert(output_cpu, device=_target_device))
+        if num_seqs > 1:
+            output.copy_(convert(output_cpu, device=_target_device))
         return output

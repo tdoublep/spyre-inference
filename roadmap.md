@@ -88,17 +88,17 @@ same-session A/B ≥ 1.02×" alternative-pathway rule.
 - **[done] M4: `KV_LENGTH_ALIGNMENT` 256 → 512.** +17.9% (T2).
 - **[done] M7: Force `block_size >= 128`.** +15.2% (T2).
 
-- **[in_progress] M3a: Skip CPU staging buffer in `_online_softmax_attention`
-  when num_seqs == 1.** *Saves 3,120 CPU-tensor allocations + memcpys
-  per bench.* For the single-sequence case, `output_cpu` is a redundant
-  intermediate — `result_cpu[0, :query_len, :, :]` can be pushed
-  directly into `output` on Spyre. Keep the multi-seq (num_seqs > 1)
-  path unchanged since it needs the staging for the varlen scatter
-  pattern. Concretely, restructure the tail of `_online_softmax_attention`
-  (spyre_attn.py:895-946) to only allocate `output_cpu` when `num_seqs > 1`
-  or when a sequence's `query_len` doesn't cover all of `output`.
-  Test coverage: `tests/test_spyre_attn.py` exercises both single-seq
-  and multi-seq configurations.
+- **[done] M3a (r9): Skip CPU staging buffer in `_online_softmax_attention`
+  when num_seqs == 1.** Guarded the `torch.zeros_like(output, device="cpu")`
+  allocation, the `output_cpu[q_start:q_end] = ...` scatter, and the
+  trailing bulk-H2D behind `if num_seqs > 1:` blocks. Added a
+  `num_seqs == 1` branch that pushes `result_cpu[0, :query_len, :, :]`
+  directly into `output` via one H2D per attention layer per step.
+  Multi-seq path unchanged. Also bundled the stale comment fix at
+  spyre_attn.py:429 (`KV_LENGTH_ALIGNMENT (256)` → `(512)`).
+  Same-session A/B second-triplet ratio (primary signal):
+  M3a/r8-end = 0.8985/0.7679 = **1.170× (+17.0%)**. Primary bench
+  median on HEAD 0.8130 tok/s = 1.11× the 0.7315 methodology floor.
 
 - **[todo] M3: Full CPU-staging-buffer removal.** Broader than M3a —
   would eliminate the staging even for num_seqs > 1 by using an on-
@@ -111,8 +111,8 @@ same-session A/B ≥ 1.02×" alternative-pathway rule.
 
 ## Minor
 
-- **[todo] Fix stale comment at spyre_attn.py:429** — bundle into
-  M3a since we're editing `spyre_attn.py` anyway.
+- **[done] Fix stale comment at spyre_attn.py:429** — bundled into
+  r9/M3a. `KV_LENGTH_ALIGNMENT (256)` → `(512)`.
 - **[todo] Prefill `reshape_and_cache` Python-unrolled loop** —
   bench doesn't spend meaningful time in prefill.
 - **[todo] RMSNorm `torch.full(x.shape, ...)` epsilon buffer** —
@@ -131,6 +131,10 @@ same-session A/B ≥ 1.02×" alternative-pathway rule.
   (second-triplet), +5.9% (first-triplet).
 - M7 (r8): platform-level `block_size >= 128` bump. Same-session
   second-triplet +15.2%; primary bench median 0.9670 tok/s.
+- M3a (r9): skip CPU staging buffer in `_online_softmax_attention`
+  when num_seqs == 1. Same-session second-triplet +17.0%; primary
+  bench median 0.8130 tok/s. Also fixed stale KV_LENGTH_ALIGNMENT
+  (256) → (512) comment.
 
 ## Parked
 
