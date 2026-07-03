@@ -1593,3 +1593,64 @@ The two triplets disagree — a common pattern on this shared host, and the reas
 ### Summary
 Implemented M7 in `spyre_inference/platform.py` — added a Spyre-specific `SPYRE_MIN_BLOCK_SIZE = 128` bump inside `TorchSpyrePlatform.check_and_update_config`, immediately after the existing "round up to multiple of 64" block, with an info-level log. Also updated `tests/test_platform.py::test_block_size_override_user_specified` to expect the new 128 (not 64), which was needed because M7 changes the platform-level block_size contract. All other four platform tests continue to pass without any assertion change (they test the rounding formula, the `% 64 == 0` invariant, `block_size=100 → 128`, or `block_size=128 → 128`). Ran the full same-session A/B protocol with two triplets each, interleaved via `git stash`/`git stash pop`. Second-triplet primary ratio M7/r7-end = 1.152× (+15.2%); first-triplet 0.828×; combined-6-run 0.919× — the two triplets disagree, but per r5 judge rule the second-triplet is the primary signal (session-warmup control), and it clears the 1.02× keep threshold. Runtime log confirms the mechanism: "Overriding block_size from 16 to 64" followed by "Bumping block_size from 64 to 128 to collapse decode compile buckets on Spyre." Kept the change. Updated `roadmap.md` to move M7 to Done with the measured ratios; updated `progress.md` with all six A/B measurements and a primary-bench triplet on HEAD.
 
+## Round 8 — Judge (attempt 1)
+- **verdict**: pass
+- **tok_per_sec**: 0.7992
+
+### Analysis
+## r1 change scope (round 8, M7 platform block_size bump)
+Source changes (relative to r7-end):
+- `spyre_inference/platform.py` (lines 206-217): after the existing "round up to multiple of 64" block, added a Spyre-specific `SPYRE_MIN_BLOCK_SIZE = 128` bump guarded by `if cache_config.block_size < SPYRE_MIN_BLOCK_SIZE:` with an info-level log line. Mechanism: with `MAX_MODEL_LEN_CAP = 128` capping the model length, every sequence now fits in exactly one 128-token block → `num_blocks_needed = 1` for every decode step → every step routes through `_create_compilable_page_attn_decode`'s `num_blocks == 1` fast path (spyre_attn.py:308), skipping the `_indirect_matmul_mock` + concat path entirely. Runtime log confirms: `INFO platform.py:213 Bumping block_size from 64 to 128 to collapse decode compile buckets on Spyre.`
+- `tests/test_platform.py`: updated `test_block_size_override_user_specified` expected value from 64 to 128 (test contract co-update; without it the test would fail).
+- `roadmap.md`, `progress.md`: reporting.
+
+All r1-r7 machinery preserved: `spyre_attn.py` and `custom_ops/rms_norm.py` byte-identical to r7-end.
+
+## Correctness (pytest)
+`uv run --no-sync pytest -m "not upstream" -q` → **265 passed, 24 skipped, 1880 deselected, 4 xfailed** in 1072s. Matches baseline. No flakes. `tests/test_spyre_attn.py` and all 5 `tests/test_platform.py::test_block_size_*` green. Gate PASS.
+
+## Performance — three primary bench runs on HEAD
+- Run 1: `Time elapsed for 120 generated tokens is 163.99 sec` → **0.7317 tok/s**
+- Run 2: `Time elapsed for 120 generated tokens is 143.36 sec` → **0.8371 tok/s**
+- Run 3: `Time elapsed for 120 generated tokens is 150.16 sec` → **0.7992 tok/s**
+
+Mean: 0.7893 tok/s. **Median: 0.7992 tok/s**. Sample stdev: 0.0538. CoV: 6.8%. This session was tighter than r6/r7 evaluations but slower in absolute terms — Run 1 lands essentially at the floor (0.7317 vs 0.7315), and median clears the floor by +9.3%. Also 1.94× the r3 baseline (0.411).
+
+Runtime log confirmed the mechanism on Run 1: `Overriding block_size from 16 to 64` (existing r7 code) followed by `Bumping block_size from 64 to 128 to collapse decode compile buckets on Spyre.` (new r8 code) — the effect kicks in as designed.
+
+Implementer's reported same-session A/B (progress.md, two triplets each, `git stash`/`stash pop` interleaved): T1 (cold) ratio M7/r7-end = 0.828× (r7-end faster in cold state); T2 (warm, primary signal per r5 judge) ratio = **1.152× (+15.2%)** — M7 faster. Triplets disagree, which is characteristic of within-session drift the r4/r5 judges documented. Per r5 judge rule the second-triplet is the primary signal (session-warmup control) and both criterion 10 alternatives clear.
+
+## FallbackWarning gate
+`uv run --no-sync python -W "error::torch_spyre.ops.fallbacks.FallbackWarning" …` completed with `Time elapsed for 120 generated tokens is 152.22 sec`. Python still rejects the `-W` filter itself (`Invalid -W option ignored: invalid module name: 'torch_spyre.ops.fallbacks'`), same as all prior rounds. Unique `FallbackWarning` origins:
+- `vllm/.../vocab_parallel_embedding.py:78` (pre-existing baseline, unscored)
+- `spyre_inference/v1/attention/backends/spyre_attn.py:252` inside `_create_compilable_page_attn` (prefill kernel, permitted)
+
+**Zero** new fallback origins from `platform.py` or the num_blocks==1 fast path at `spyre_attn.py:308`. Gate 3 PASS.
+
+## Pass criteria audit
+1. pytest 265 passed. ✅
+2. Only `spyre_inference/platform.py` source-modified (+ workflow `roadmap.md`/`progress.md`, and `tests/test_platform.py` for the assertion refresh). The forbidden path list in criterion 2 (`examples/`, `spyre_inference/v1/`, `spyre_inference/distributed/`, `spyre_inference/custom_ops/`) is empty of diffs. `tests/` is not on the forbidden list, and the test change is a necessary co-update to reflect the new platform contract — without it the test would fail and criterion 1 would break. Reasonable read: permissible test co-change. **⚠️ Strict-letter tension: "only platform.py is source-modified" could be read to exclude test-file edits, but the criterion is worded around forbidden paths and the test isn't on that list. Accepting as intent-consistent.**
+3. Keep case: `SPYRE_MIN_BLOCK_SIZE = 128` guarded assignment at platform.py:211-217 inside `check_and_update_config`, matches progress.md's explicit "keep" decision. ✅
+4. `MAX_MODEL_LEN_CAP = 128` at platform.py:70, `MAX_NUM_SEQS_CAP = 8` at platform.py:71 unchanged. ✅
+5. `git diff HEAD~1 -- spyre_inference/v1/attention/backends/spyre_attn.py` empty; `KV_LENGTH_ALIGNMENT = 512`, `QUERY_CHUNK_SIZE = 32`, `_create_compilable_page_attn_decode`, `attention_mask_tiles_device`, and all M5 fields all still present. ✅
+6. `git diff HEAD~1 -- spyre_inference/custom_ops/rms_norm.py` empty; M6a preserved. ✅
+7. `platform.py` has zero `torch.compile(` calls (only docstring/comment mentions at lines 130 and 193). ✅
+8. All three primary bench runs printed exactly one `Time elapsed for 120 generated tokens is <T> sec` line; no runtime errors. ✅
+9. FallbackWarning origins limited to pre-existing `spyre_attn.py:252` (prefill kernel) and `vocab_parallel_embedding.py:78`; **zero new origins from `platform.py` or the num_blocks==1 fast path at `spyre_attn.py:308`**. ✅
+10. Same-session A/B ratio + all six times reported in progress.md; explicit "keep" decision documented. Keep-case sub-criteria: implementer's T2 ratio 1.152× ≥ 0.98× AND primary median (my measurement 0.7992, implementer's 0.9670) ≥ 0.7315. Both alternatives satisfied. Additionally the T2 ratio 1.152× also clears the ≥ 1.02× signal threshold. ✅
+11. `roadmap.md` moves M7 out of "in_progress" — now `[done] M7 (r8): Force block_size >= 128 …` with measured ratios (T2: +15.2%, T1: 0.828×, combined 6-run: 0.919×) explicitly documented. ✅
+
+## Interpretation and verdict
+Every static criterion and always-on gate is met. The change is a small, well-scoped platform contract update; the mechanism is verifiable from the runtime log; the correctness suite is green; the fallback surface is unchanged. Same-session A/B second-triplet is +15.2% (primary signal); my independent measurement of the primary bench triplet median (0.7992 tok/s) clears the 0.7315 floor by +9.3%.
+
+One arguable point is the co-modification of `tests/test_platform.py`. Criterion 2's forbidden path list doesn't include `tests/`, and the change is a required assertion refresh to reflect the platform contract change (without it pytest would fail and criterion 1 would break). Accepting as intent-consistent — the test change is a co-update, not a scope violation.
+
+Passing.
+
+### Feedback
+All criteria and always-on gates pass. Nothing to fix.
+
+Small process notes for future rounds:
+- Criterion 2 as literally worded reads "Only `spyre_inference/platform.py` is source-modified", which is in mild tension with the necessary `tests/test_platform.py` assertion refresh. In practice the criterion's forbidden-path list (which does NOT include `tests/`) is what matters, and the test change is a mandatory co-update. Future criterion phrasing could either explicitly permit `tests/` for contract-refresh cases or ask the implementer to justify test co-changes in progress.md (they already did — "test-contract update to match the new platform config invariant").
+- The comment at `spyre_inference/v1/attention/backends/spyre_attn.py:429` still reads "rounded up to KV_LENGTH_ALIGNMENT (256)" — leftover from the pre-M4 alignment. Noted in r7 judge feedback; still not fixed. Not this round's job but worth mopping up whenever `spyre_attn.py` is next touched.
+
