@@ -14,7 +14,7 @@
 
 """Paged KV-cache attention backend for Spyre using list-of-pages and online softmax."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, ClassVar, NamedTuple
 
 import torch
@@ -431,6 +431,16 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # per 256-token tier, not per distinct sequence length.
     aligned_max_seq_len: int = 0
 
+    # Precomputed per-seq scalars — populated once by the metadata builder
+    # so each layer's forward pass avoids CPU-tensor `.item()` round-trips.
+    # Shared across all L attention layers within a step.
+    query_starts: list[int] = field(default_factory=list)
+    query_ends: list[int] = field(default_factory=list)
+    kv_lens_list: list[int] = field(default_factory=list)
+    # One list per sequence — page_indices_per_seq[s] has length
+    # ceil(kv_lens_list[s] / block_size).
+    page_indices_per_seq: list[list[int]] = field(default_factory=list)
+
     @property
     def query_lens(self) -> torch.Tensor:
         """Per-sequence query lengths, derived from query_start_loc. [num_seqs]"""
@@ -567,15 +577,25 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             torch.device("cpu"),
         )
 
+        # Bulk-materialize CPU-side scalars once per step so each of the L
+        # attention layers reads them by Python list index instead of paying
+        # per-element `.item()` GIL round-trips.
+        qsl_cpu = query_start_loc.detach().cpu().tolist()
+        query_starts = qsl_cpu[:-1]
+        query_ends = qsl_cpu[1:]
+        kv_lens_list = seq_lens.detach().cpu().tolist()
+        block_table_cpu = block_table.detach().cpu()
+
         # Pre-tile the mask: split into per-block tiles.
         # Query dimension is uniform (aligned_max_query_len) for all sequences,
         # so tiling only follows the KV dimension.
         num_seqs = common_attn_metadata.num_reqs
         block_size = self.block_size
         attention_mask_tiles: list[list[torch.Tensor]] = []
+        page_indices_per_seq: list[list[int]] = []
         for s in range(num_seqs):
             seq_tiles: list[torch.Tensor] = []
-            kv_len_s = int(seq_lens[s].item())
+            kv_len_s = kv_lens_list[s]
             num_blocks_s = (kv_len_s + block_size - 1) // block_size
             for b in range(num_blocks_s):
                 col_start = b * block_size
@@ -583,6 +603,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 tile = mask_cpu[s, :aligned_max_query_len, col_start:col_end]
                 seq_tiles.append(tile.contiguous())
             attention_mask_tiles.append(seq_tiles)
+            page_indices_per_seq.append(block_table_cpu[s, :num_blocks_s].tolist())
 
         # Precompute slot indices on CPU to avoid CPU round-trip during forward
         sm_cpu = slot_mapping.detach().cpu()
@@ -609,6 +630,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             attention_mask_tiles=attention_mask_tiles,
             aligned_max_query_len=aligned_max_query_len,
             aligned_max_seq_len=aligned_max_seq_len,
+            query_starts=query_starts,
+            query_ends=query_ends,
+            kv_lens_list=kv_lens_list,
+            page_indices_per_seq=page_indices_per_seq,
         )
 
 
@@ -837,12 +862,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         head_size = self.head_size
         num_kv_heads = self.num_kv_heads
         num_queries_per_kv = self.num_queries_per_kv
-        block_size = attn_metadata.block_size
 
         num_seqs = attn_metadata.num_seqs
-        query_start_loc = attn_metadata.query_start_loc
-        seq_lens = attn_metadata.seq_lens
-        block_table = attn_metadata.block_table
         mask_tiles_all = attn_metadata.attention_mask_tiles
         aligned_max_query_len = attn_metadata.aligned_max_query_len
         assert mask_tiles_all is not None, (
@@ -876,10 +897,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
             # over sequences or GQA optimization
-            q_start = int(query_start_loc[seq_idx].item())
-            q_end = int(query_start_loc[seq_idx + 1].item())
+            q_start = attn_metadata.query_starts[seq_idx]
+            q_end = attn_metadata.query_ends[seq_idx]
             query_len = q_end - q_start
-            kv_len = int(seq_lens[seq_idx].item())
 
             q_seq = query_cpu[q_start:q_end]
 
@@ -904,8 +924,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # works correctly. See error: "cannot restickify any input layout of y
             # to carry y_var=d2" in propagate_layouts.py:341
 
-            num_blocks_needed = (kv_len + block_size - 1) // block_size
-            page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]
+            page_indices = attn_metadata.page_indices_per_seq[seq_idx]
+            num_blocks_needed = len(page_indices)
             mask_tiles = mask_tiles_all_device[seq_idx]
 
             # Run attention on target device
