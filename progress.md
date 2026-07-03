@@ -622,3 +622,72 @@ Median = 0.5878 tok/s. This is below r3-end's 0.7315 median, but system baseline
 ### Summary
 Implemented M2 mask-tile H2D caching in `spyre_inference/v1/attention/backends/spyre_attn.py` only. Two edits: (1) added `attention_mask_tiles_device: list[list[torch.Tensor]] | None = None` to `SpyreAttentionMetadata`; (2) in `SpyreAttentionImpl._online_softmax_attention`, before the per-seq loop, look up `attn_metadata.attention_mask_tiles_device`; if `None`, materialize the full nested `[[convert(m, device=_target_device) for m in seq_tiles] for seq_tiles in mask_tiles_all]` and stash it back on the metadata. Inside the seq loop, replaced the per-layer per-seq `[convert(m, device=_target_device) for m in mask_tiles_all[seq_idx]]` with a straight `mask_tiles_all_device[seq_idx]` lookup. Net effect: per-step mask-tile H2D transfer count drops from `L × num_seqs × num_blocks_per_seq` to `1 × num_seqs × num_blocks_per_seq` (L=26 for micro-g3.3-8b bench). `progress.md` updated with three tok/s measurements. No other files changed.
 
+## Round 4 — Judge (attempt 1)
+- **verdict**: fail
+- **tok_per_sec**: 0.663
+
+### Analysis
+## r1 change scope (round 4, M2 mask-tile caching)
+Single-file source change to `spyre_inference/v1/attention/backends/spyre_attn.py`:
+- Line 420 (`SpyreAttentionMetadata` dataclass): new optional field `attention_mask_tiles_device: list[list[torch.Tensor]] | None = None`. Not populated by the metadata builder; filled lazily on first-layer forward.
+- Lines 852-862 (`SpyreAttentionImpl._online_softmax_attention`): before the per-seq loop, look up `attn_metadata.attention_mask_tiles_device`; if `None`, materialize the full nested `[[convert(m, device=_target_device) for m in seq_tiles] for seq_tiles in mask_tiles_all]` and stash back on the metadata object.
+- Line 909: inside the seq loop, replaced the per-layer per-seq `[convert(m, device=_target_device) for m in mask_tiles_all[seq_idx]]` with `mask_tiles = mask_tiles_all_device[seq_idx]`.
+
+Architecturally sound: `SpyreAttentionMetadata` is a plain `@dataclass` (not frozen), so field mutation works; the builder rebuilds metadata every step (line 609), so cross-step staleness is impossible. Per-step H2D convert count drops from `L × num_seqs × num_blocks_per_seq` to `1 × num_seqs × num_blocks_per_seq` (L=26 for the bench model) — strictly less work.
+
+## Correctness (pytest)
+`uv run --no-sync pytest -m "not upstream" -q` → **265 passed, 24 skipped, 1880 deselected, 4 xfailed** in 1085s. Matches baseline. Gate PASS.
+
+## Performance (three primary bench runs)
+Ran three sequential process invocations of `uv run --no-sync python examples/offline_inference/torch_spyre_inference.py --num-prompts 1`:
+- Run 1: `Time elapsed for 120 generated tokens is 182.09 sec` → **0.6590 tok/s**
+- Run 2: `Time elapsed for 120 generated tokens is 181.00 sec` → **0.6630 tok/s**
+- Run 3: `Time elapsed for 120 generated tokens is 167.74 sec` → **0.7154 tok/s**
+
+Mean: 0.6791 tok/s. **Median: 0.6630 tok/s**. Sample stdev: 0.0314. CoV: 4.6%. All three runs printed exactly one post-warmup `Time elapsed …` line with `<N> = 120`. Threshold (criterion 10): ≥ 0.7315 tok/s (r3-end median). **My median (0.6630) is 9.4% below.** Implementer's own three-run sample from progress.md was even lower (median 0.5878 tok/s). Both fall short of the parity floor.
+
+The implementer flagged in progress.md that back-to-back baseline runs today (with their change stashed) also produced 121-188s (0.638-0.990 tok/s), i.e. today's machine drift is wider than at r3-end. My CoV of 4.6% is tight within this run session, but the *absolute level* is 10-20% below r3-end's 0.7315 — consistent with a global machine drift, not internal-batch variance. Whether the regression is real (mask-caching adds some overhead not visible in the transfer count — e.g. Python-side list construction of the nested cache) or measurement drift cannot be resolved from a single evaluation session.
+
+## FallbackWarning gate
+`uv run --no-sync python -W "error::torch_spyre.ops.fallbacks.FallbackWarning" …` completed with `Time elapsed for 120 generated tokens is 201.29 sec`. As in all prior rounds, Python rejects the `-W` filter itself (`Invalid -W option ignored: invalid module name: 'torch_spyre.ops.fallbacks'`) — the module isn't importable at Python startup before torch's device-backend autoload. Warnings still print but don't error. Unique `FallbackWarning` origins:
+- `vllm/.../vocab_parallel_embedding.py:78` (pre-existing baseline, unscored per criterion 9)
+- `spyre_inference/v1/attention/backends/spyre_attn.py:252` inside the OLD prefill factory `_create_compilable_page_attn` (explicitly permitted by criterion 9)
+
+The new mask-caching code (lines 852-862) and the Q=1 decode factory (line 285+) emit zero fallbacks. Gate 3 PASS.
+
+## Pass criteria audit
+1. pytest 265 passed. ✅
+2. Only `spyre_attn.py` source-modified (+ workflow `progress.md`); `examples/`, `platform.py`, `custom_ops/` byte-identical. ✅
+3. `attention_mask_tiles_device: list[list[torch.Tensor]] | None = None` in `SpyreAttentionMetadata` at spyre_attn.py:420. ✅
+4. In `_online_softmax_attention`: `if mask_tiles_all_device is None:` gate at line 857; `convert(m, device=_target_device)` calls occur only inside the gate (lines 858-861); field assignment `attn_metadata.attention_mask_tiles_device = mask_tiles_all_device` inside the gate at line 862; per-seq loop uses cached `mask_tiles_all_device[seq_idx]` at line 909. ✅
+5. `KV_LENGTH_ALIGNMENT = 256`, `QUERY_CHUNK_SIZE = 32` at lines 48, 54. ✅
+6. No `torch.compile` change in `platform.py`. ✅
+7. `_create_compilable_page_attn_decode` at spyre_attn.py:285; `_get_attn_fn` dispatches on `padded_query_len == 1` at line 729. ✅
+8. All three bench runs printed exactly one `Time elapsed for 120 generated tokens is <T> sec`. ✅
+9. Only pre-existing prefill-kernel line 252 fallback fires; new mask-caching code fallback-free. ✅
+10. Median tok/s ≥ 0.7315: 0.6630 / 0.7315 = **0.906× (−9.4% regression)**. ❌
+
+## Interpretation
+Design and static criteria are all met. The change is architecturally strictly less work — it removes 25 redundant per-step per-block H2D transfers per attention layer for a 26-layer model. The measurement, however, misses the "no regression" parity floor. Two hypotheses for why:
+
+1. **Machine drift.** Both the implementer and I are seeing much slower absolute times today than r3-end's evaluation session. The implementer explicitly reports that back-to-back baselines with their change stashed also landed at 121-188s per run (0.64-0.99 tok/s span). My CoV is tight (4.6%) but the absolute level is uniformly ~10-15% below r3-end. This is consistent with global system load rather than a change-induced regression.
+
+2. **Real minor regression from Python-side cache construction.** The nested list-comprehension `[[convert(m, ...) for m in seq_tiles] for seq_tiles in mask_tiles_all]` is one Python allocation per (seq, block) pair on the first-layer call. For small models this is dominated by the H2D win; for the micro-g3.3-8b bench it may or may not be. Nothing in the code jumps out as broken.
+
+The parity threshold was set as a "no regression" floor, so a measured 9.4% regression fails it regardless of cause. But the orchestrator should note that: (a) the round-3 judge feedback already warned that "the baseline needs to be re-measured under the new methodology on the same plugin state" — the 0.7315 number was one evaluation session's snapshot, and one-session snapshots on a shared box are demonstrably drifting by 20+%; (b) the change itself passes all architectural criteria and is fallback-free; (c) if criterion 10 is enforced strictly, the honest next step is to re-baseline on the current session before deciding whether M2 is a genuine regression.
+
+### Feedback
+Criterion 10 not met: median primary tok/s = 0.6630 vs 0.7315 threshold (0.906×, −9.4%). All other pass criteria and always-on gates pass. The engineering change is correct: architecturally reduces per-step H2D transfers from L× to 1× (L=26 for the bench model), fallback-free, dataclass mutation is safe (non-frozen, fresh per step), all correctness tests green.
+
+The regression is very likely measurement drift, not a real code-caused slowdown:
+1. Implementer's own three-run sample (0.588 tok/s median) is worse than mine (0.663) — same code, different session; they explicitly report that even a stashed-change baseline lands at 121-188s per run on today's machine, spanning 0.64-0.99 tok/s.
+2. My CoV within this evaluation session is tight (4.6%), but the absolute level is 10-15% below r3-end's 0.7315 across the board. That is a session-vs-session offset, not internal variance — consistent with background load on the shared host.
+3. The round-3 judge report already warned that "the baseline needs to be re-measured under the new methodology on the same plugin state" — the 0.7315 threshold was one snapshot on one machine day. Multi-day drift of 10-20% on a shared box has now been observed on both sides of the comparison.
+
+Options for the orchestrator:
+- **A. Re-baseline before deciding.** Have the implementer run the round-3-end code (git checkout 43c5e17 -- spyre_inference/v1/attention/backends/spyre_attn.py, keep the bench script) three times back-to-back in the same session as the round-4 bench, so both numbers come from the same machine day. If both land near ~0.66 tok/s, this round's change is a wash. If round-3-end code cleanly beats round-4 code in the same session, there's a real regression to fix.
+- **B. Relax criterion 10 to compare against a same-session re-baseline** rather than a fixed 0.7315 threshold. This is what criterion 10's "no regression" intent actually calls for.
+- **C. Accept as fail and iterate.** If the orchestrator wants to hunt for a real change-caused slowdown: the most likely culprit is the outer-scope Python list comprehension on the first-layer call. Try (a) eagerly populating `attention_mask_tiles_device` in the metadata builder instead (moves the work outside the timed inner loop and out of `_online_softmax_attention` entirely), or (b) flatten the nested cache to a single-level dict keyed by `(seq_idx, block_idx)` so the first-layer allocation cost is bounded by total block count rather than nested-Python-list overhead.
+
+Do NOT ask the implementer to iterate on the caching logic without first re-baselining in the same session — otherwise the next round will be chasing the same drift-vs-code question.
+
