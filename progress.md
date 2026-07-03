@@ -1442,3 +1442,104 @@ All criteria and always-on gates pass. Nothing to fix.
 
 Minor cosmetic note for future cleanup (not a criterion violation): comment at `spyre_inference/v1/attention/backends/spyre_attn.py:429` still reads "rounded up to KV_LENGTH_ALIGNMENT (256)" — the surrounding docstring at lines 44-47 was updated to 512 but this one nearby was missed. Fixing it is a one-line docstring edit for a future round if convenient.
 
+## Round 8 — Orchestrator
+- **reasoning**: M4's +17.9% surprise revealed compile-bucket churn as a real hidden cost. M7 is the natural next step in the same class: another shape-varying compile-bucket dimension collapsed to a single tier. Currently decode has num_blocks ∈ {1, 2} across the 120-token run — with block_size=64 the run crosses kv_len=64 around decode step 55 and materializes a second decode-kernel compile bucket. Forcing block_size=128 keeps every step in num_blocks==1 territory, which not only reduces compile churn but also routes every step through the already-existing `num_blocks == 1` fast path in the decode kernel (spyre_attn.py:308-320) that avoids `_indirect_matmul_mock` dispatch and concat overhead. It's a one-line platform.py change with tight correctness bounds (block_size=128 satisfies all `MultipleOf(64)` alignment constraints and is smaller than MAX_MODEL_LEN_CAP=128). Risks are per-step matmul size doubling (Spyre kernels usually prefer larger single matmuls) and mask-tile size doubling on CPU (small vs Spyre-side work). The keep/revert criterion follows the r7 pattern: same-session A/B is decisive, criterion allows either outcome as a passing round because the value here is the empirical decision.
+
+### Task
+**Implement M7: force `block_size = 128` in `TorchSpyrePlatform.check_and_update_config`** in `spyre_inference/platform.py`.
+
+**Bottleneck being addressed.** M4's success in r7 (+17.9% same-session, second-triplet) revealed that compile-bucket churn from shape-varying kernel specializations is a real end-to-end cost even on a 120-token bench. M4 halved the count of distinct `aligned_max_seq_len` values seen across a run. M7 collapses another dimension of the same phenomenon: `num_blocks_needed`.
+
+Currently `platform.py:194-204` only rounds `cache_config.block_size` up to the nearest multiple of 64 (so vLLM's default 16/32 → 64). With `block_size = 64` and `MAX_MODEL_LEN_CAP = 128`, decode steps produce `num_blocks_needed` values of 1 (kv_len ≤ 64) and 2 (kv_len 65-128). That materializes two distinct decode-kernel compile buckets. Every step at kv_len > 64 misses the `num_blocks == 1` fast path in `_create_compilable_page_attn_decode` (spyre_attn.py:308-320) and instead goes through the general path with `_indirect_matmul_mock` dispatch + concat overhead.
+
+**Fix.** In the platform config, after the existing "round up to multiple of 64" logic, ensure `block_size >= 128`. That gives:
+- `MAX_MODEL_LEN_CAP=128` implies `num_blocks_needed = 1` for every decode step (one 128-token block holds the full sequence). Every step hits the fast path.
+- Compile-bucket count for decode drops from 2 to 1.
+- KV cache page count halves (each page is 2× larger; total memory the same).
+
+**Concrete edits (all in `spyre_inference/platform.py`):**
+
+In `TorchSpyrePlatform.check_and_update_config`, immediately after the block_size roundup block (lines 190-204), add a Spyre-specific minimum:
+
+```python
+# Force block_size >= 128 for Spyre. With MAX_MODEL_LEN_CAP=128, this
+# gives num_blocks_needed=1 for every decode step, collapsing two decode
+# kernel compile buckets to one and keeping all steps on the fast path
+# in `_create_compilable_page_attn_decode`. block_size must remain a
+# multiple of 64 (128 satisfies this — see the roundup above).
+SPYRE_MIN_BLOCK_SIZE = 128
+if cache_config.block_size < SPYRE_MIN_BLOCK_SIZE:
+    logger.info(
+        "Bumping block_size from %d to %d to collapse decode compile "
+        "buckets on Spyre.",
+        cache_config.block_size,
+        SPYRE_MIN_BLOCK_SIZE,
+    )
+    cache_config.block_size = SPYRE_MIN_BLOCK_SIZE
+```
+
+That's the entire source edit. No changes to `spyre_attn.py`, `custom_ops/`, or the example script.
+
+**Correctness guarantees.**
+- `SpyreAttentionMetadataBuilder.__init__` asserts `self.block_size % 64 == 0` at spyre_attn.py:469 — 128 satisfies this.
+- `SpyreAttentionBackend.get_supported_kernel_block_sizes` returns `[MultipleOf(64)]` — 128 satisfies.
+- The `num_blocks == 1` fast path at spyre_attn.py:308-320 is well-tested (it's the code path for kv_len ≤ 64 currently).
+- `_reshape_and_cache` writes per-token via `_overwrite(k_tok, k_pages[block_indices[t]], [1], [block_offsets[t]])` — the block_size affects only the page shape, not the number of `_overwrite` calls per step.
+- Mask tiles have shape `[aligned_max_query_len, block_size]` — 128 is a valid width. Mask-tile building loop bounded by `num_blocks_s = ceil(kv_len_s / block_size)`, so no out-of-range indexing.
+- `num_gpu_blocks_override` at platform.py:255-259 computes `max_num_seqs × ceil(max_model_len / block_size)`. With max_num_seqs=8, max_model_len=128, block_size=128 → 8 blocks. With block_size=64 was 16. Half the allocation; still fits.
+
+**Correctness gate.** `tests/test_spyre_attn.py` exercises the attention path against a CPU reference. It sets block_size via `AttentionSpec` — verify the tests still parameterize correctly. If any test hard-codes block_size=64, it will still work (this change only affects platform-level auto-config, not explicit test parameterizations). The pytest suite is the authoritative correctness signal.
+
+**Same-session A/B is mandatory** (r5-r7 lesson). The implementer MUST:
+
+1. Checkout `round-7-end` plugin state.
+2. Run three sequential bench invocations. Record all three tok/s.
+3. Restore HEAD (the M7 change).
+4. Run three more sequential bench invocations. Record all three tok/s.
+5. **Repeat steps 1-4 once more** so we have two triplets each. Use the second triplet from each branch (session-warmup control) as the primary signal.
+6. Compute `median(M7 T2) / median(r7-end T2)`. This is the primary keep/revert signal.
+
+If ratio ≥ 1.02× → keep, mark M7 done in roadmap.
+If ratio 0.98× to 1.02× → keep but note "no measurable effect"; mechanism is still sound (compile bucket collapse) so it's a defensible retention.
+If ratio ≤ 0.98× → revert, move M7 to Abandoned with the empirical reason (e.g. per-step matmul cost of 2× block_size outweighed compile bucket savings).
+
+**Verification steps (whichever final state):**
+
+1. `uv run --no-sync pytest -m "not upstream" -q` — 265 passed / 24 skipped / 4 xfailed. `tests/test_spyre_attn.py` green.
+
+2. Primary bench: three sequential runs on final HEAD state. Report all three tok/s and median.
+
+3. FallbackWarning gate: same bench, redirect stderr. Only pre-existing `spyre_attn.py:252` (prefill kernel) and `vocab_parallel_embedding.py:78` should fire. No new origins.
+
+4. Do NOT invoke `--compare-with-cpu`.
+
+**Files touched:**
+- `spyre_inference/platform.py` (either changed or restored depending on outcome)
+- `roadmap.md` if reverted (M7 moved to Abandoned) or kept (M7 moved to Done)
+- `progress.md` for reporting
+
+**Non-goals for this round:**
+- Do NOT modify `spyre_inference/v1/attention/backends/spyre_attn.py`.
+- Do NOT modify any `custom_ops/*.py`.
+- Do NOT modify `examples/offline_inference/torch_spyre_inference.py`.
+- Do NOT touch `MAX_MODEL_LEN_CAP`, `MAX_NUM_SEQS_CAP`, `KV_LENGTH_ALIGNMENT`, or `QUERY_CHUNK_SIZE`.
+- Do NOT fix the stale comment at spyre_attn.py:429 in this round (bundle that with a future edit to that file).
+
+### Pass criteria
+1. `uv run --no-sync pytest -m "not upstream" -q` passes with 265 passed (matching the pre-change baseline). No new failures. `tests/test_spyre_attn.py` green (a single flaky failure of `tests/test_spyre_comms_native_probes.py` that passes on re-run is acceptable per r4 judge precedent).
+2. Only `spyre_inference/platform.py` is source-modified (plus `roadmap.md` / `progress.md` for reporting). `git diff HEAD` scoped to `examples/`, `spyre_inference/v1/`, `spyre_inference/distributed/`, and every file under `spyre_inference/custom_ops/` is empty.
+3. Depending on the same-session A/B outcome, `spyre_inference/platform.py` contains either:
+    - **Keep case:** a new guarded assignment that ensures `cache_config.block_size >= 128` inside `TorchSpyrePlatform.check_and_update_config`, verifiable by static grep for a value ≥ 128 written to `cache_config.block_size` in that method.
+    - **Revert case:** `platform.py` byte-identical to its state at `round-7-end`.
+4. `MAX_MODEL_LEN_CAP = 128` and `MAX_NUM_SEQS_CAP = 8` remain unchanged in `spyre_inference/platform.py`.
+5. `spyre_inference/v1/attention/backends/spyre_attn.py` is byte-identical to its `round-7-end` state (all r1/r2/r4/r5 machinery preserved: `_create_compilable_page_attn_decode`, `attention_mask_tiles_device`, the four M5 precomputed fields, `KV_LENGTH_ALIGNMENT = 512`, `QUERY_CHUNK_SIZE = 32`).
+6. `spyre_inference/custom_ops/rms_norm.py` is byte-identical to its `round-7-end` state (M6a preserved).
+7. No `torch.compile(...)` calls in `spyre_inference/platform.py`.
+8. Three sequential bench invocations on final HEAD each print exactly one `Time elapsed for 120 generated tokens is <T> sec` line and complete without runtime error.
+9. No new `FallbackWarning` origin surfaces in the primary bench run vs `round-7-end`. Only pre-existing warnings from `_create_compilable_page_attn` at `spyre_attn.py:252` (prefill kernel) and `vocab_parallel_embedding.py:78` are permitted. In particular, no new origin from any code path in `spyre_inference/platform.py` or `spyre_inference/v1/attention/backends/spyre_attn.py:308` (the num_blocks==1 fast path that will now handle every decode step).
+10. Same-session A/B ratio, `median(M7 T2) / median(r7-end T2)`, is reported in `progress.md` alongside all six individual bench times (two triplets each). The final decision (keep block_size≥128 vs revert) is documented, and either:
+    - **Keep case:** ratio ≥ 0.98× AND (primary median on HEAD ≥ 0.7315 baseline OR same-session A/B ≥ 1.02× at T2).
+    - **Revert case:** ratio < 0.98× AND `platform.py` is restored to `round-7-end` state AND `roadmap.md` moves M7 to "Abandoned" with the empirical reason.
+    Either outcome satisfies the criterion; the round produces a clean empirical decision.
+11. `roadmap.md` moves M7 out of "in_progress" — to "Done" (with the measured ratios) if kept, or to "Abandoned" (with the empirical reason) if reverted.
+
