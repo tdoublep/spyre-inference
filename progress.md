@@ -1817,3 +1817,58 @@ Same "T1 disagrees, T2 confirms" pattern as r8 M7. Within-triplet spreads are wi
 ### Summary
 Implemented M3a in `spyre_inference/v1/attention/backends/spyre_attn.py`. In `SpyreAttentionImpl._online_softmax_attention`: guarded the `torch.zeros_like(output, device="cpu")` allocation behind `if num_seqs > 1:`; inside the seq loop, added a `if num_seqs == 1:` branch that pushes `result_cpu[0, :query_len, :, :]` directly into `output` via one `output.copy_(convert(...))` — no CPU staging. The multi-seq path (`num_seqs > 1`) keeps the original scatter-then-bulk-H2D pattern. Trailing `output.copy_(convert(output_cpu, ...))` is now conditional on `num_seqs > 1`. Bundled the stale comment fix: `SpyreAttentionMetadata.aligned_max_seq_len` docstring updated from `KV_LENGTH_ALIGNMENT (256)` to `(512)`. Ran the full same-session A/B protocol with two triplets each, interleaved via `git stash`/`git stash pop`. Second-triplet primary ratio M3a/r8-end = 1.170× (+17.0%); first-triplet 0.874×. Per r5 judge rule the second-triplet is primary — clears the 1.02× keep threshold decisively. Kept the change. Updated `roadmap.md` to move M3a and the stale-comment-fix minor to Done with the measured ratios; updated `progress.md` with all six A/B measurements plus a primary-bench triplet on HEAD.
 
+## Round 9 — Judge (attempt 1)
+- **verdict**: pass
+- **tok_per_sec**: 0.8189
+
+### Analysis
+## r1 change scope (round 9, M3a — skip CPU staging when num_seqs == 1)
+Single-file source change to `spyre_inference/v1/attention/backends/spyre_attn.py`:
+- `SpyreAttentionMetadata.aligned_max_seq_len` docstring (lines 429-431): "KV_LENGTH_ALIGNMENT (256)" → "(512)" — bundled cleanup of the stale comment r7 and r8 judges flagged.
+- `SpyreAttentionImpl._online_softmax_attention`:
+  - Line 898: gated `output_cpu = torch.zeros_like(output, device="cpu")` allocation behind `if num_seqs > 1:` (previously unconditional).
+  - Lines 948-953: split the seq-loop tail on `num_seqs`. Fast path (`num_seqs == 1`, line 948) writes result_cpu directly to `output` via `output.copy_(convert(result_cpu[0, :query_len, :, :], device=_target_device))` — no CPU staging. Multi-seq path (line 952-953) preserves the original `output_cpu[q_start:q_end] = result_cpu[...]` scatter.
+  - Lines 955-956: trailing `output.copy_(convert(output_cpu, device=_target_device))` is now conditional on `num_seqs > 1`.
+
+All r1-r8 machinery preserved: `platform.py` and `custom_ops/rms_norm.py` byte-identical to r8-end (M6a, M7 unchanged); `spyre_attn.py`'s r1/r2/r4/r5 machinery all present (`_create_compilable_page_attn_decode`, `attention_mask_tiles_device`, four M5 fields, `KV_LENGTH_ALIGNMENT = 512`, `QUERY_CHUNK_SIZE = 32`).
+
+## Correctness (pytest)
+`uv run --no-sync pytest -m "not upstream" -q` → **265 passed, 24 skipped, 1880 deselected, 4 xfailed** in 1075s. Matches baseline. No flakes. Both single-seq and multi-seq parameterizations in `tests/test_spyre_attn.py` green (implicit in the 265 count — the parameterized suite covers both paths). Gate PASS.
+
+## Performance — three primary bench runs on HEAD
+- Run 1: `Time elapsed for 120 generated tokens is 112.90 sec` → **1.0629 tok/s**
+- Run 2: `Time elapsed for 120 generated tokens is 174.04 sec` → **0.6895 tok/s**
+- Run 3: `Time elapsed for 120 generated tokens is 146.53 sec` → **0.8189 tok/s**
+
+Mean: 0.8571 tok/s. **Median: 0.8189 tok/s**. Sample stdev: 0.1874. CoV: 21.9%. Wide session variance again (as in every prior round evaluation), but median comfortably clears the 0.7315 fixed floor by +11.9%. Also 1.99× the r3 baseline (0.411 tok/s).
+
+Implementer's reported same-session A/B (progress.md, two triplets each, `git stash`/`stash pop` interleaved): T1 (cold) ratio M3a/r8-end = 0.874× (r8-end faster in cold state); **T2 (warm, primary signal per r5 judge) ratio = 1.170× (+17.0%)** — M3a faster. Same "T1 disagrees, T2 confirms" pattern as r7 M4 and r8 M7. Per r5 judge rule the second-triplet is the primary signal, which decisively clears the 1.02× keep threshold.
+
+## FallbackWarning gate
+`uv run --no-sync python -W "error::torch_spyre.ops.fallbacks.FallbackWarning" …` completed with `Time elapsed for 120 generated tokens is 137.29 sec`. Python still rejects the `-W` filter itself (`Invalid -W option ignored: invalid module name: 'torch_spyre.ops.fallbacks'`), same as all prior rounds. Unique `FallbackWarning` origins:
+- `vllm/.../vocab_parallel_embedding.py:78` (pre-existing baseline, unscored)
+- `spyre_inference/v1/attention/backends/spyre_attn.py:252` inside `_create_compilable_page_attn` (prefill kernel, permitted)
+
+**Zero** new fallback origins from the num_seqs branching. Gate 3 PASS.
+
+## Pass criteria audit
+1. pytest 265 passed. ✅
+2. Only `spyre_attn.py` source-modified (+ workflow `progress.md`, `roadmap.md`); `git diff HEAD~1` for the forbidden paths (`examples/`, `platform.py`, `v1/worker/`, `distributed/`, all of `custom_ops/`) is empty. ✅
+3. `torch.zeros_like(output, device="cpu")` at spyre_attn.py:899 is gated by `if num_seqs > 1:` at line 898. ✅
+4. Fast path (num_seqs == 1, line 948) writes `output.copy_(convert(result_cpu[0, :query_len, :, :], device=_target_device))` at line 951 — no `output_cpu` reference inside this branch. ✅
+5. Multi-seq path (num_seqs > 1, else at line 952) keeps `output_cpu[q_start:q_end] = result_cpu[0, :query_len, :, :]` at line 953, then trailing bulk H2D at line 956. ✅
+6. `grep "KV_LENGTH_ALIGNMENT (256)"` returns zero matches — stale comment fixed at spyre_attn.py:429 to reference (512). ✅
+7. `KV_LENGTH_ALIGNMENT = 512` at line 48, `QUERY_CHUNK_SIZE = 32` at line 54. ✅
+8. `_create_compilable_page_attn_decode` at spyre_attn.py:285; `_get_attn_fn` dispatches on `padded_query_len == 1` at spyre_attn.py:754. ✅
+9. `attention_mask_tiles_device` at spyre_attn.py:420; M5 four fields (`query_starts`/`query_ends`/`kv_lens_list`/`page_indices_per_seq`) at spyre_attn.py:437-442. ✅
+10. `platform.py` and `custom_ops/rms_norm.py` byte-identical to r8-end (`git diff HEAD~1` for those paths empty); `SPYRE_MIN_BLOCK_SIZE = 128` at platform.py:211, `_get_device_weight` at rms_norm.py:175. `platform.py` has zero `torch.compile(` calls (only docstring/comment mentions at lines 130 and 193). ✅
+11. All three primary bench runs printed exactly one `Time elapsed for 120 generated tokens is <T> sec` line; no runtime errors. ✅
+12. FallbackWarning origins limited to pre-existing `spyre_attn.py:252` (prefill kernel) and `vocab_parallel_embedding.py:78`; zero new origins from M3a's fast-path branch. ✅
+13. Positive-signal path: implementer's T2 A/B ratio 1.170× ≥ 1.02× AND primary median on HEAD (my measurement 0.8189, implementer's 0.8130) ≥ 0.7315. Both alternatives in criterion 13 cleared. ✅
+
+## Interpretation and verdict
+Every static criterion and always-on gate is met. The change is minimal, correctness-preserving, and architecturally sound — the CPU staging buffer + memcpy is pure overhead when `num_seqs == 1`, and with the M7 platform config guaranteeing single-block decode plus the bench having `--num-prompts 1`, that condition holds for every decode step. The bundled stale-comment fix from the r7/r8 judge feedback is included. Passing.
+
+### Feedback
+
+
