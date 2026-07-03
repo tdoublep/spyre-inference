@@ -1543,3 +1543,53 @@ If ratio ≤ 0.98× → revert, move M7 to Abandoned with the empirical reason (
     Either outcome satisfies the criterion; the round produces a clean empirical decision.
 11. `roadmap.md` moves M7 out of "in_progress" — to "Done" (with the measured ratios) if kept, or to "Abandoned" (with the empirical reason) if reverted.
 
+
+### Round 8 (M7) — Force `block_size >= 128` in platform
+
+**Changes**:
+- `spyre_inference/platform.py`: after the existing "round up to 64" block (lines 194-204), added a Spyre-specific `SPYRE_MIN_BLOCK_SIZE = 128` bump. If `cache_config.block_size < 128` after the roundup, it's bumped to 128 with an info-level log line "Bumping block_size from X to 128 to collapse decode compile buckets on Spyre." With `MAX_MODEL_LEN_CAP = 128`, every sequence fits in one 128-token block, so `num_blocks_needed = 1` for every decode step — every step hits the `num_blocks == 1` fast path in `_create_compilable_page_attn_decode` (spyre_attn.py:308) and skips the `_indirect_matmul_mock`/concat path entirely.
+- `tests/test_platform.py`: updated `test_block_size_override_user_specified` expected value from 64 to 128, and refreshed its docstring to note the Spyre-specific minimum. This is a test-contract update to match the new platform config invariant; it isn't a source-file change. The other four `test_block_size_*` tests already pass unchanged (they either test the rounding formula directly, assert `% 64 == 0`, use `block_size = 100 → 128` which was always the expected value, or use `block_size = 128 → 128` unchanged).
+
+**Mechanism verified from bench log**: "WARNING platform.py:198] Block size must be a multiple of 64 for the list-based attention backend. Overriding block_size from 16 to 64." followed immediately by "INFO platform.py:213] Bumping block_size from 64 to 128 to collapse decode compile buckets on Spyre."
+
+**Correctness**: `uv run --no-sync pytest -m "not upstream" -q` → 265 passed / 24 skipped / 4 xfailed / 110 warnings in ~1099s. Matches pre-change baseline exactly. `tests/test_spyre_attn.py` green; `tests/test_platform.py` all 5 green after the assertion refresh.
+
+**FallbackWarning probe**: `grep FallbackWarning | sort -u` gives only two unique origins — `vllm/.../vocab_parallel_embedding.py:78` (pre-existing baseline) and `spyre_inference/v1/attention/backends/spyre_attn.py:252` inside `_create_compilable_page_attn` (prefill kernel, allowed). No new origins from `platform.py` or the fast path at spyre_attn.py:308.
+
+**Perf — same-session A/B** (two triplets each, `stash`/`stash pop` interleaved):
+
+| Config | Triplet | Run 1 (s / tok/s) | Run 2 (s / tok/s) | Run 3 (s / tok/s) | Triplet median tok/s |
+|--------|---------|-------------------|-------------------|-------------------|----------------------|
+| M7     | T1      | 136.30 / 0.8804 | 160.00 / 0.7500 | 144.77 / 0.8289 | **0.8289** |
+| r7-end | T1      | 119.82 / 1.0015 | 110.66 / 1.0844 | 139.85 / 0.8580 | **1.0015** |
+| M7     | T2      | 178.52 / 0.6722 | 131.19 / 0.9147 | 117.99 / 1.0170 | **0.9147** |
+| r7-end | T2      | 118.79 / 1.0102 | 153.72 / 0.7807 | 151.16 / 0.7938 | **0.7938** |
+
+Ratios:
+- **T2 (primary, session-warmup control per r5 judge): M7/r7-end = 0.9147 / 0.7938 = 1.152× (+15.2%)**.
+- T1 (cold): M7/r7-end = 0.8289 / 1.0015 = 0.828× (−17.2%).
+- Combined 6-run median: M7 0.8547 vs r7-end 0.9297 → 0.919× (−8.1%).
+
+The two triplets disagree — a common pattern on this shared host, and the reason r5 judge established the "second triplet is primary" rule. T1 shows r7-end faster; T2 shows M7 faster. Within-triplet spreads are wide (r7-end T1: 0.858 → 1.084 tok/s across three consecutive runs; M7 T2: 0.672 → 1.017). Cross-session drift is materially larger than the M7 effect at this bench scale.
+
+**Decision: keep M7.** Rationale:
+1. Primary second-triplet A/B (1.152×) clears the 1.02× keep threshold explicitly named in criterion 10.
+2. Primary bench median on HEAD is 0.9670 tok/s = 1.32× the 0.7315 methodology floor — the alternative-pathway also clears.
+3. Mechanism is architecturally sound and verifiable from the runtime log: every decode step provably hits the `num_blocks == 1` fast path. Under any bench where compile-bucket churn matters, this is a monotonic reduction in work.
+4. Half the KV-cache page count for the same total capacity (each page is 2× larger), matching a mechanically cleaner allocation.
+
+**Perf — primary bench (three sequential runs on HEAD)**: 124.10s (0.9670), 137.28s (0.8741), 117.92s (1.0176). Median **0.9670 tok/s**. 1.322× the r3 methodology-baseline floor of 0.7315 tok/s.
+
+**Static criteria summary**:
+- `SPYRE_MIN_BLOCK_SIZE = 128` guarded bump present in `TorchSpyrePlatform.check_and_update_config`.
+- `MAX_MODEL_LEN_CAP = 128`, `MAX_NUM_SEQS_CAP = 8` unchanged.
+- `spyre_inference/v1/attention/backends/spyre_attn.py` byte-identical to r7-end (`KV_LENGTH_ALIGNMENT = 512`, `QUERY_CHUNK_SIZE = 32`, `_create_compilable_page_attn_decode`, all M2/M5 fields preserved).
+- `spyre_inference/custom_ops/rms_norm.py` byte-identical to r7-end (`_get_device_weight`, `_weight_device_cache`, `_weight_cache_src_id` all present).
+- `spyre_inference/platform.py` still has zero `torch.compile(` calls.
+- `git diff HEAD -- examples/ spyre_inference/v1/ spyre_inference/distributed/ spyre_inference/custom_ops/` is empty.
+## Round 8 — Implementer (attempt 1)
+- **expected_behavior**: Correctness gate `uv run --no-sync pytest -m "not upstream" -q` passes at 265 / 24 skipped / 4 xfailed (verified this round, 1099s; `tests/test_spyre_attn.py` green; all 5 `tests/test_platform.py::test_block_size_*` green). Only `spyre_inference/platform.py` is source-modified (plus `tests/test_platform.py` for the block_size assertion refresh, and `roadmap.md`/`progress.md` for reporting); `git diff HEAD -- examples/ spyre_inference/v1/ spyre_inference/distributed/ spyre_inference/custom_ops/` is empty. Static criteria: `SPYRE_MIN_BLOCK_SIZE = 128` guarded assignment present in `check_and_update_config`; `MAX_MODEL_LEN_CAP = 128` and `MAX_NUM_SEQS_CAP = 8` unchanged; zero `torch.compile(` calls in `platform.py`. r1-r7 machinery in `spyre_attn.py` and `rms_norm.py` byte-identical to r7-end. FallbackWarning origins unchanged: only `vllm/.../vocab_parallel_embedding.py:78` (baseline) and prefill-kernel `spyre_attn.py:252` fire; no new origins from `platform.py` or the num_blocks==1 fast path at spyre_attn.py:308. Same-session A/B (two triplets each): M7 T1 medians 136.30/160.00/144.77s → 0.8289 tok/s, r7-end T1 119.82/110.66/139.85s → 1.0015 tok/s (ratio 0.828×); M7 T2 178.52/131.19/117.99s → 0.9147 tok/s, r7-end T2 118.79/153.72/151.16s → 0.7938 tok/s (**ratio 1.152× second-triplet primary signal, +15.2%**). Primary bench on HEAD (3 sequential): 124.10s/137.28s/117.92s → median 0.9670 tok/s = 1.322× the 0.7315 r3 methodology floor. Criterion 10 keep pathway: both A/B ratio 1.152× ≥ 1.02× AND primary median 0.9670 ≥ 0.7315 satisfied.
+
+### Summary
+Implemented M7 in `spyre_inference/platform.py` — added a Spyre-specific `SPYRE_MIN_BLOCK_SIZE = 128` bump inside `TorchSpyrePlatform.check_and_update_config`, immediately after the existing "round up to multiple of 64" block, with an info-level log. Also updated `tests/test_platform.py::test_block_size_override_user_specified` to expect the new 128 (not 64), which was needed because M7 changes the platform-level block_size contract. All other four platform tests continue to pass without any assertion change (they test the rounding formula, the `% 64 == 0` invariant, `block_size=100 → 128`, or `block_size=128 → 128`). Ran the full same-session A/B protocol with two triplets each, interleaved via `git stash`/`git stash pop`. Second-triplet primary ratio M7/r7-end = 1.152× (+15.2%); first-triplet 0.828×; combined-6-run 0.919× — the two triplets disagree, but per r5 judge rule the second-triplet is the primary signal (session-warmup control), and it clears the 1.02× keep threshold. Runtime log confirms the mechanism: "Overriding block_size from 16 to 64" followed by "Bumping block_size from 64 to 128 to collapse decode compile buckets on Spyre." Kept the change. Updated `roadmap.md` to move M7 to Done with the measured ratios; updated `progress.md` with all six A/B measurements and a primary-bench triplet on HEAD.
+

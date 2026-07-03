@@ -203,6 +203,21 @@ class TorchSpyrePlatform(CpuPlatform):
             )
             cache_config.block_size = new_block_size
 
+        # Force block_size >= 128 for Spyre. With MAX_MODEL_LEN_CAP=128 this
+        # gives num_blocks_needed=1 for every decode step, collapsing two
+        # decode kernel compile buckets to one and keeping every step on the
+        # `num_blocks == 1` fast path in `_create_compilable_page_attn_decode`.
+        # block_size must remain a multiple of 64 (128 satisfies this).
+        SPYRE_MIN_BLOCK_SIZE = 128
+        if cache_config.block_size < SPYRE_MIN_BLOCK_SIZE:
+            logger.info(
+                "Bumping block_size from %d to %d to collapse decode compile "
+                "buckets on Spyre.",
+                cache_config.block_size,
+                SPYRE_MIN_BLOCK_SIZE,
+            )
+            cache_config.block_size = SPYRE_MIN_BLOCK_SIZE
+
         parallel_config = vllm_config.parallel_config
 
         # Spyre does not currently support data parallelism. The worker's
