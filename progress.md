@@ -1654,3 +1654,120 @@ Small process notes for future rounds:
 - Criterion 2 as literally worded reads "Only `spyre_inference/platform.py` is source-modified", which is in mild tension with the necessary `tests/test_platform.py` assertion refresh. In practice the criterion's forbidden-path list (which does NOT include `tests/`) is what matters, and the test change is a mandatory co-update. Future criterion phrasing could either explicitly permit `tests/` for contract-refresh cases or ask the implementer to justify test co-changes in progress.md (they already did — "test-contract update to match the new platform config invariant").
 - The comment at `spyre_inference/v1/attention/backends/spyre_attn.py:429` still reads "rounded up to KV_LENGTH_ALIGNMENT (256)" — leftover from the pre-M4 alignment. Noted in r7 judge feedback; still not fixed. Not this round's job but worth mopping up whenever `spyre_attn.py` is next touched.
 
+## Round 9 — Orchestrator
+- **reasoning**: Post-M7, decode fires through `num_blocks == 1` fast path, so the biggest remaining low-risk lever is the CPU staging buffer that has been documented in code as a workaround for the multi-seq varlen case. For num_seqs=1 (bench case) the staging tensor is a copy of the already-CPU-resident `result_cpu` — pure redundancy at 3,120 iterations per bench. The fix is surgical: add a num_seqs==1 fast path that skips staging and writes to `output` directly, keeping the multi-seq path untouched for correctness. This matches the M2/M6a "cache-what's-redundant" pattern applied to a per-invocation allocation. Bundling the stale-comment fix (r7/r8 judge feedback) because we're editing that file anyway keeps roadmap items tidy. Not attempting the full M3 (multi-seq staging removal) because that's blocked on the deprecated `torch.ops.spyre.overwrite` mechanism-level probe. The keep/revert criterion follows the r7/r8 pattern with the alternative-pathway rule for cross-session drift.
+
+### Task
+**Implement M3a: skip the CPU staging buffer in `_online_softmax_attention` when `num_seqs == 1`** in `spyre_inference/v1/attention/backends/spyre_attn.py`.
+
+**Bottleneck being addressed.** After r8's `block_size >= 128`, every decode step hits the `num_blocks == 1` fast path. The remaining per-layer per-step overhead in `_online_softmax_attention` (spyre_attn.py:844-947) is the CPU staging buffer:
+
+```python
+output_cpu = torch.zeros_like(output, device="cpu")   # line 895 — fresh alloc every call
+...
+result_cpu = convert(result, "cpu", output.dtype)     # line 941 — pull attn result to CPU (necessary; reshape/transpose broken on Spyre)
+result_cpu = result_cpu.reshape(...).transpose(1, 2).contiguous()  # CPU-side reshape
+output_cpu[q_start:q_end] = result_cpu[0, :query_len, :, :]        # CPU-side copy into staging
+...
+output.copy_(convert(output_cpu, device=_target_device))           # line 946 — bulk H2D of staging
+```
+
+For `num_seqs == 1` (bench case), `q_start = 0`, `q_end = query_len`, and `output.shape[0] == num_actual_tokens == query_len`. So `output_cpu` is literally holding a copy of `result_cpu[0, :query_len, :, :]` before being pushed to Spyre.
+
+The staging buffer exists to handle the multi-seq varlen case where different sequences write different rows of `output`. When `num_seqs == 1` the whole scaffolding is redundant: 26 layers × 120 decode steps = **3,120 per-bench allocations of a ~6KB CPU tensor + one CPU-to-CPU memcpy of the result**. All discarded a moment later. Same "redundant work at bench scale" pattern as M2/M6a.
+
+**Fix.** Add a `num_seqs == 1` fast path that skips `output_cpu` entirely: compute `result_cpu`, reshape/transpose on CPU (still required — Spyre transpose+contiguous on head axes is broken per existing comments), then push directly into `output` via one H2D. Keep the multi-seq path unchanged.
+
+**Concrete edits (all in `spyre_inference/v1/attention/backends/spyre_attn.py`):**
+
+1. Guard the staging allocation by `num_seqs > 1`. Change spyre_attn.py:895 area:
+
+   ```python
+   # Multi-seq varlen path needs a CPU staging buffer for scattering across rows.
+   # Single-seq decode can push each layer's result directly into `output`.
+   if num_seqs > 1:
+       output_cpu = torch.zeros_like(output, device="cpu")
+   ```
+
+2. Inside the seq loop, split the tail handling by `num_seqs`. After computing `result_cpu = result_cpu.transpose(1, 2).contiguous()` (currently line 943), replace the assignment to `output_cpu[q_start:q_end]` with:
+
+   ```python
+   if num_seqs == 1:
+       # Direct H2D into `output`; no CPU staging needed for a single sequence.
+       output.copy_(convert(result_cpu[0, :query_len, :, :], device=_target_device))
+   else:
+       output_cpu[q_start:q_end] = result_cpu[0, :query_len, :, :]
+   ```
+
+3. The trailing `output.copy_(convert(output_cpu, device=_target_device))` (spyre_attn.py:946) becomes conditional — it must only run when `num_seqs > 1`:
+
+   ```python
+   if num_seqs > 1:
+       output.copy_(convert(output_cpu, device=_target_device))
+   return output
+   ```
+
+4. **Bundle: fix the stale comment at spyre_attn.py:429.** The r7/r8 judges have both noted it: it says "rounded up to KV_LENGTH_ALIGNMENT (256)" but alignment is 512 since r7. Update to "(512)". One-line cosmetic edit inside the same file.
+
+5. Do NOT modify:
+   - Any factory or kernel body (`_create_compilable_page_attn_decode`, `_create_compilable_page_attn`, `_create_compilable_reshape_and_cache`).
+   - The `_reshape_and_cache` method.
+   - The metadata builder (`SpyreAttentionMetadataBuilder`) or dataclass fields.
+   - The M2 `attention_mask_tiles_device` lazy-cache logic.
+   - The M5 precomputed `query_starts` / `query_ends` / `kv_lens_list` / `page_indices_per_seq` fields.
+   - `platform.py`, `custom_ops/`, or the example script.
+   - Constants: `KV_LENGTH_ALIGNMENT = 512`, `QUERY_CHUNK_SIZE = 32`.
+
+**Correctness note for the implementer.** The `num_seqs == 1` case is what `tests/test_spyre_attn.py` primarily exercises when it runs single-prompt configurations, but the multi-seq path is *also* exercised by the same test file across parameterizations. Both branches must be green after the change. Numerically nothing changes — for num_seqs=1, the sequence of operations before this change was:
+
+    result_cpu[0, :1, :, :] → output_cpu[0:1] → convert(output_cpu, spyre) → output.copy_(...)
+
+And after:
+
+    result_cpu[0, :1, :, :] → convert(..., spyre) → output.copy_(...)
+
+Same tensor values reach `output`; only the intermediate CPU staging is removed.
+
+**Verification steps the implementer must run:**
+
+1. `uv run --no-sync pytest -m "not upstream" -q` — must pass at 265 passed / 24 skipped / 4 xfailed. `tests/test_spyre_attn.py` in particular must be green across all parameterizations (both num_seqs=1 and num_seqs>1).
+
+2. Same-session A/B (r5-r8 protocol):
+   - Checkout `round-8-end` plugin state.
+   - Run three sequential bench invocations. Record all three tok/s.
+   - Restore HEAD (M3a change).
+   - Run three more sequential bench invocations. Record all three tok/s.
+   - Repeat once more so we have two triplets each. Use the second triplet from each branch as the primary signal.
+   - Compute `median(M3a T2) / median(r8-end T2)`. Primary keep/revert signal.
+
+3. Independent primary bench: three sequential runs on HEAD. Report all three tok/s and median.
+
+4. FallbackWarning gate: same bench, redirect stderr. Only the pre-existing `spyre_attn.py:252` (prefill kernel) and `vocab_parallel_embedding.py:78` should fire.
+
+5. Do NOT invoke `--compare-with-cpu`.
+
+**Files touched (should be exactly one source file):**
+- `spyre_inference/v1/attention/backends/spyre_attn.py`
+
+**Non-goals for this round:**
+- Do NOT touch the multi-seq staging logic — keep it working, only add a num_seqs==1 short-circuit around it.
+- Do NOT modify `platform.py`, `custom_ops/`, or `examples/`.
+- Do NOT alter M2 mask-caching, M5 precomputed fields, or M1' Q=1 decode kernel factory.
+- Do NOT probe `torch.ops.spyre.overwrite` in this round (that's the full-M3 mechanism-level probe — separate future work).
+- Do NOT change `KV_LENGTH_ALIGNMENT` or `QUERY_CHUNK_SIZE`.
+
+### Pass criteria
+1. `uv run --no-sync pytest -m "not upstream" -q` passes with 265 passed (matching the pre-change baseline). No new failures. Both single-seq and multi-seq parameterizations in `tests/test_spyre_attn.py` are green. (A single flaky failure of `tests/test_spyre_comms_native_probes.py` that passes on re-run is acceptable per r4 judge precedent.)
+2. Only `spyre_inference/v1/attention/backends/spyre_attn.py` is source-modified. `git diff HEAD` scoped to `examples/`, `spyre_inference/platform.py`, `spyre_inference/v1/worker/`, `spyre_inference/distributed/`, and every file under `spyre_inference/custom_ops/` is empty.
+3. `SpyreAttentionImpl._online_softmax_attention` in `spyre_inference/v1/attention/backends/spyre_attn.py` contains a `num_seqs == 1` fast path that does NOT allocate a `torch.zeros_like(output, device="cpu")` staging tensor. Verifiable by static inspection: the `torch.zeros_like(output, device="cpu")` call must be gated by a condition equivalent to `num_seqs > 1` (or equivalently, an `if num_seqs > 1:` block).
+4. In the fast path (num_seqs == 1), the attention result is written directly into `output` via a call to `output.copy_(convert(...))` (or equivalent) that references `result_cpu` (or its reshape/transpose result) — NOT via an intermediate `output_cpu` variable. Verifiable by static grep.
+5. The multi-seq (`num_seqs > 1`) path continues to use the CPU staging buffer with the same allocation-then-scatter-then-bulk-H2D pattern as before, so multi-seq correctness is preserved.
+6. The stale comment at (formerly) `spyre_attn.py:429` no longer references "KV_LENGTH_ALIGNMENT (256)" — it either says "(512)" or is rewritten to match the current alignment. Verifiable by grepping `spyre_inference/v1/attention/backends/spyre_attn.py` for the string `KV_LENGTH_ALIGNMENT (256)` — must return zero matches.
+7. `KV_LENGTH_ALIGNMENT = 512` and `QUERY_CHUNK_SIZE = 32` remain unchanged in `spyre_inference/v1/attention/backends/spyre_attn.py`.
+8. `_create_compilable_page_attn_decode` still exists in `spyre_inference/v1/attention/backends/spyre_attn.py` and `SpyreAttentionImpl._get_attn_fn` still dispatches to it when `padded_query_len == 1` (M1' preserved).
+9. `SpyreAttentionMetadata` still has the `attention_mask_tiles_device` field (M2 preserved) and the `query_starts` / `query_ends` / `kv_lens_list` / `page_indices_per_seq` fields (M5 preserved).
+10. `spyre_inference/platform.py` and `spyre_inference/custom_ops/rms_norm.py` byte-identical to their `round-8-end` state. In particular, `SPYRE_MIN_BLOCK_SIZE = 128` bump (M7) and `_get_device_weight` cache (M6a) are preserved. No `torch.compile(...)` calls in `platform.py`.
+11. Three sequential primary bench invocations on HEAD each print exactly one `Time elapsed for 120 generated tokens is <T> sec` line and complete without runtime error.
+12. No new `FallbackWarning` origin surfaces vs `round-8-end`. Only pre-existing warnings from `_create_compilable_page_attn` at `spyre_attn.py:252` (prefill kernel) and `vocab_parallel_embedding.py:78` are permitted.
+13. Same-session A/B ratio `median(M3a T2) / median(r8-end T2)` reported in `progress.md` alongside all six individual bench times. Either the ratio is ≥ 0.98× AND the primary median on HEAD ≥ 0.7315 baseline (no regression), or the ratio is ≥ 1.02× (positive signal). Any of these paths satisfies the criterion.
+

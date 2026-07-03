@@ -16,38 +16,39 @@ Conventions:
 
 ## Bottleneck model (single-prompt decode, `--num-prompts 1`)
 
-Decode steps have `max_query_len=1`. After r1-r7, the following are handled:
-query padding, per-block argmax fallback, per-layer mask-tile H2D, per-layer
-scalar `.item()` sync, per-forward RMSNorm weight H2D, measurement noise,
-and coarser KV alignment (M4's +17.9% surprise showed compile-bucket
-churn was a hidden cost).
+Decode steps have `max_query_len=1`, `num_seqs=1`, `num_blocks_needed=1`
+(post-M7). Post-r8 the remaining hot-path costs are:
 
-M4's success reframed the bottleneck model: **compile-bucket churn from
-shape-varying kernel specializations is a hidden per-step cost** that's
-invisible to per-op analysis but shows up in end-to-end tok/s. Any change
-that reduces the number of distinct `(num_blocks, padded_query_len,
-aligned_max_seq_len, ...)` combinations materialized across a run is a
-candidate.
+- **[M3a target] CPU staging buffer in `_online_softmax_attention`.**
+  `output_cpu = torch.zeros_like(output, device="cpu")` at
+  `spyre_attn.py:895` allocates a fresh CPU staging tensor every layer
+  per step. Result flows: Spyre-side `result` → CPU-side `result_cpu`
+  (reshape/transpose there — Spyre transpose+contiguous is broken) →
+  writes into `output_cpu[q_start:q_end]` → `output.copy_(convert(
+  output_cpu, ...))` bulk H2D at end. **For num_seqs=1 (bench case)**
+  the staging buffer holds one row (`q_start=0`, `q_end=1` == `query_len`
+  for decode), so `output_cpu` is literally a copy of `result_cpu`. The
+  staging + memcpy + push adds one CPU alloc + one CPU memcpy per layer
+  per step — 26 layers × 120 steps = 3,120 redundant allocations. Direct
+  H2D of `result_cpu[0, :query_len]` into `output` skips both.
+- **[M6c candidate] QKV D→H at `custom_ops/linear.py:128`.** QKV output
+  pulled to CPU because downstream `.split()` on strided Spyre views is
+  broken. Structural change; requires rewriting the split or accepting
+  a torch-spyre limitation.
+- **[Minor] RMSNorm `torch.full(x.shape, ...)`** — size-matched broadcast
+  crutch; mechanism-level probe on Spyre scalar/0-d broadcast support.
+- **[Stale comment] spyre_attn.py:429** still says "rounded up to
+  KV_LENGTH_ALIGNMENT (256)"; alignment is 512 since r7. Cosmetic.
 
-Remaining candidates:
+## Meta-pattern observations
 
-- **[M7 target] `block_size` = 128** (currently 64, min stick alignment).
-  Bench has `MAX_MODEL_LEN_CAP=128`, so with block_size=128 every decode
-  step uses exactly ONE KV page — `num_blocks_needed = 1` always. The
-  decode kernel has an explicit `num_blocks == 1` fast path
-  (spyre_attn.py:308-320) that skips `_indirect_matmul_mock` dispatch
-  and the concat/cat overhead. With block_size=64 the current bench
-  crosses into `num_blocks == 2` at kv_len > 64 — 90% of the run's
-  120 decode steps. Bumping block_size to 128 (a) collapses two decode
-  kernel compile buckets to one, (b) keeps all decode steps on the
-  fast path, (c) halves the number of KV pages allocated (each is
-  larger but total memory unchanged). Same class of intervention as
-  M4 — one hyperparameter change that reduces kernel variant count.
-- **RMSNorm `torch.full(x.shape, ...)` epsilon buffer** — size-matched
-  broadcast crutch; scalar or 0-d tensor may work. Mechanism-level probe.
-- **QKV D→H at custom_ops/linear.py:128.** Structural change (M6c).
-- **`output_cpu = zeros_like(output, device="cpu")` staging round-trip**
-  (M3). Requires torch-spyre op-support probe.
+Successful rounds have all fit one of two templates:
+1. **Cache-what's-redundant-across-N-invocations** (M2, M5, M6a).
+2. **Reduce compile-bucket variants materialized during a run** (M4, M7).
+
+M3a fits template 1: `output_cpu` is allocated fresh 3,120× per bench
+for identical purpose. Same pattern as M2/M6a — the fix is to short-
+circuit the staging when the general-varlen scaffolding isn't needed.
 
 ## Measurement (fixed r3, sharpened r4-r7)
 
@@ -69,11 +70,12 @@ same-session A/B ≥ 1.02×" alternative-pathway rule.
 - **r6 (M6a, done):** cache RMSNorm weight on Spyre. Clean, drift-
   dominated signal.
 - **r7 (M4, done):** `KV_LENGTH_ALIGNMENT` 256 → 512. Same-session
-  +17.9% (second-triplet), +5.9% (first-triplet). Halved distinct
-  compile-bucket shapes materialized during 120-token bench.
+  +17.9% (second-triplet), +5.9% (first-triplet).
+- **r8 (M7, done):** platform `block_size >= 128`. Same-session +15.2%
+  (second-triplet). Every decode step now hits the `num_blocks == 1`
+  fast path.
 - **Meta-learning:** compile-bucket count reduction is a real end-to-
-  end win because each new bucket triggers a Spyre-side re-specialization
-  that isn't visible in per-op timing but shows up in wall-clock.
+  end win invisible to per-op timing but shows up in wall-clock.
 
 ## Major
 
@@ -84,33 +86,33 @@ same-session A/B ≥ 1.02×" alternative-pathway rule.
 - **[done] M5: Precompute per-seq scalars in metadata builder.** +5-10%.
 - **[done] M6a: Cache RMSNorm weight on Spyre.**
 - **[done] M4: `KV_LENGTH_ALIGNMENT` 256 → 512.** +17.9% (T2).
+- **[done] M7: Force `block_size >= 128`.** +15.2% (T2).
 
-- **[done] M7 (r8): Force `block_size >= 128` in
-  `TorchSpyrePlatform.check_and_update_config`.** Added a Spyre-
-  specific `SPYRE_MIN_BLOCK_SIZE = 128` bump after the existing
-  64-multiple roundup. Runtime log confirms mechanism kicks in:
-  "Bumping block_size from 64 to 128 to collapse decode compile
-  buckets on Spyre." Same-session A/B second-triplet ratio (primary
-  signal): M7/r7-end = 0.9147/0.7938 = **1.152× (+15.2%)**. First-
-  triplet ratio was 0.828× — the two triplets disagreed, dominated
-  by within-session drift; combined-6-run median was 0.919× so the
-  signal isn't clean, but the second-triplet primary signal is
-  positive AND the mechanism is architecturally sound (every decode
-  step now provably hits the `num_blocks == 1` fast path), so kept.
-  Primary bench on HEAD median 0.9670 tok/s = 1.32× the 0.7315
-  methodology floor.
+- **[in_progress] M3a: Skip CPU staging buffer in `_online_softmax_attention`
+  when num_seqs == 1.** *Saves 3,120 CPU-tensor allocations + memcpys
+  per bench.* For the single-sequence case, `output_cpu` is a redundant
+  intermediate — `result_cpu[0, :query_len, :, :]` can be pushed
+  directly into `output` on Spyre. Keep the multi-seq (num_seqs > 1)
+  path unchanged since it needs the staging for the varlen scatter
+  pattern. Concretely, restructure the tail of `_online_softmax_attention`
+  (spyre_attn.py:895-946) to only allocate `output_cpu` when `num_seqs > 1`
+  or when a sequence's `query_len` doesn't cover all of `output`.
+  Test coverage: `tests/test_spyre_attn.py` exercises both single-seq
+  and multi-seq configurations.
 
-- **[todo] M3: Eliminate the CPU staging buffer in attention output.**
-  Blocked on mechanism-level probing of `torch.ops.spyre.overwrite`.
+- **[todo] M3: Full CPU-staging-buffer removal.** Broader than M3a —
+  would eliminate the staging even for num_seqs > 1 by using an on-
+  Spyre write primitive. Blocked on `torch.ops.spyre.overwrite`
+  reliability probe. M3a captures the bench-case win without the
+  mechanism risk.
 - **[todo] M6b: Sweep remaining custom_ops.** Low expected value.
 - **[todo] M6c: QKV `.split()` on Spyre.** Structural, requires torch-
-  spyre op support probe.
+  spyre op-support probe.
 
 ## Minor
 
-- **[todo] Fix stale comment at spyre_attn.py:429** — still says
-  "rounded up to KV_LENGTH_ALIGNMENT (256)" after r7 bump to 512.
-  Cosmetic, noted by r7 judge. Bundle into a future round if convenient.
+- **[todo] Fix stale comment at spyre_attn.py:429** — bundle into
+  M3a since we're editing `spyre_attn.py` anyway.
 - **[todo] Prefill `reshape_and_cache` Python-unrolled loop** —
   bench doesn't spend meaningful time in prefill.
 - **[todo] RMSNorm `torch.full(x.shape, ...)` epsilon buffer** —
@@ -126,13 +128,9 @@ same-session A/B ≥ 1.02×" alternative-pathway rule.
 - M6a (r6): RMSNorm weight caching on Spyre (mechanically clean; drift-
   dominated signal).
 - M4 (r7): `KV_LENGTH_ALIGNMENT` 256 → 512. Same-session +17.9%
-  (second-triplet), +5.9% (first-triplet). Halved distinct compile-
-  bucket shapes materialized across a 120-token bench.
+  (second-triplet), +5.9% (first-triplet).
 - M7 (r8): platform-level `block_size >= 128` bump. Same-session
-  second-triplet +15.2%; primary bench median 0.9670 tok/s
-  (1.32× the 0.7315 methodology floor). Every decode step now hits
-  the `num_blocks == 1` fast path in
-  `_create_compilable_page_attn_decode`.
+  second-triplet +15.2%; primary bench median 0.9670 tok/s.
 
 ## Parked
 
