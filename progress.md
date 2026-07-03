@@ -2025,3 +2025,58 @@ The mechanism is architecturally clean (fewer allocations, fewer rsqrts, matches
 ### Summary
 Attempted M8 (scalar-broadcast epsilon replacing shape-matched `torch.full` in `SpyreRMSNorm.forward_spyre`), then **reverted** per the task's revert rule. The M8 code change itself was correctly implemented (deleted `variance_epsilon_t = torch.full(...)`, changed `rsqrt(variance + variance_epsilon_t)` to `rsqrt(variance + variance_epsilon)` with scalar-broadcast, updated the module docstring and `forward_spyre` "Key differences from upstream" comment to drop the torch.full bullet). Correctness gate green (265/24/4 same as baseline), fallback-gate green (zero new `custom_ops/rms_norm.py` origins — Spyre natively handles the scalar broadcast add + `[batch, 1]` rsqrt). But same-session A/B second-triplet primary ratio came in at 0.812× (−18.8%), well below the 0.98× keep threshold; combined-6-run 0.860×. Only T1 favored M8 (+9.6%). Per task spec's revert rule (ratio ≤ 0.98× → revert to Parked), reverted the change via `git checkout HEAD -- spyre_inference/custom_ops/rms_norm.py` and moved M8 to the Parked section in `roadmap.md` with the empirical reason (kernel-scheduling-dependent regression on current torch-spyre; direction still architecturally sound). Only `roadmap.md` and `progress.md` differ from HEAD; `git diff HEAD -- spyre_inference/` is empty.
 
+## Round 10 — Judge (attempt 1)
+- **verdict**: pass
+- **tok_per_sec**: 0.9968
+
+### Analysis
+## r1 change scope (round 10, M8 — REVERTED)
+Only `progress.md` and `roadmap.md` differ from `HEAD~1`. Source files (`spyre_inference/custom_ops/rms_norm.py`, `spyre_inference/v1/attention/backends/spyre_attn.py`, `spyre_inference/platform.py`) are byte-identical to r9-end (`git diff e66c2e9 -- spyre_inference/` empty).
+
+The implementer attempted the M8 scalar-broadcast epsilon change (`torch.full(x.shape, variance_epsilon, ...)` removed; `torch.rsqrt(variance + variance_epsilon)` with scalar broadcast), ran the same-session A/B protocol, and reverted after the primary-triplet ratio came in at 0.812× (−18.8%). Per the task's explicit revert rule (ratio ≤ 0.98× → revert, move M8 to Parked with the empirical reason), this is the correct outcome.
+
+## Correctness (pytest)
+`uv run --no-sync pytest -m "not upstream" -q` → **265 passed, 24 skipped, 1880 deselected, 4 xfailed** in 1073s. Matches baseline. `tests/test_rms_norm.py` green (implicit in the 265 count; parametrized RMSNorm tests all pass — as expected, since the working tree is r9-end code). No flakes. Gate PASS.
+
+## Performance — three primary bench runs on HEAD (= r9-end code)
+- Run 1: `Time elapsed for 120 generated tokens is 120.93 sec` → **0.9924 tok/s**
+- Run 2: `Time elapsed for 120 generated tokens is 112.96 sec` → **1.0623 tok/s**
+- Run 3: `Time elapsed for 120 generated tokens is 120.38 sec` → **0.9968 tok/s**
+
+Mean: 1.0172 tok/s. **Median: 0.9968 tok/s**. Sample stdev: 0.0392. CoV: 3.9% (unusually tight for this shared host). Clears the 0.7315 floor by +36.3%; 2.42× the r3 baseline (0.411 tok/s). This session was fast in absolute terms.
+
+Implementer's reported same-session A/B (progress.md, two triplets each of M8 and r9-end, interleaved via `git stash`/`stash pop`): T1 ratio M8/r9-end = 1.096×, T2 ratio = **0.812× (−18.8%)**. Combined-6-run 0.860×. Per r5 rule the second-triplet is the primary signal, and 0.812× < 0.98× → revert per the task spec. The implementer honored this rule rather than cherry-picking T1 or arguing the noise.
+
+## FallbackWarning gate
+`uv run --no-sync python -W "error::torch_spyre.ops.fallbacks.FallbackWarning" …` completed with `Time elapsed for 120 generated tokens is 127.58 sec`. Python still rejects the `-W` filter itself (`Invalid -W option ignored: invalid module name: 'torch_spyre.ops.fallbacks'`), same as all prior rounds. Unique `FallbackWarning` origins:
+- `vllm/.../vocab_parallel_embedding.py:78` (pre-existing baseline, unscored)
+- `spyre_inference/v1/attention/backends/spyre_attn.py:252` inside `_create_compilable_page_attn` (prefill kernel, permitted)
+
+**Zero** from `custom_ops/rms_norm.py` (as expected — code is r9-end, and even the attempted M8 change passed the fallback-gate per implementer's report). Gate 3 PASS.
+
+## Pass criteria audit
+1. pytest 265 passed. ✅
+2. Only `progress.md` and `roadmap.md` differ from HEAD~1 (reporting files); `git diff HEAD~1` for `examples/`, `platform.py`, `v1/`, `distributed/`, all of `custom_ops/` is empty. ✅
+3. **Revert case:** `spyre_inference/custom_ops/rms_norm.py` byte-identical to r9-end. Verified `git diff e66c2e9 -- spyre_inference/custom_ops/rms_norm.py` returns empty. ✅
+4. `_get_device_weight` at rms_norm.py:175; `_weight_device_cache` and `_weight_cache_src_id` init at rms_norm.py:85-86. M6a preserved. ✅
+5. `spyre_inference/v1/attention/backends/spyre_attn.py` byte-identical to r9-end. All r1/r2/r4/r5/r7/r9 machinery preserved: `_create_compilable_page_attn_decode` at line 285, `attention_mask_tiles_device` at line 420, M5 fields at line 437+, `KV_LENGTH_ALIGNMENT = 512` at line 48, `QUERY_CHUNK_SIZE = 32` at line 54, num_seqs==1 fast path present. ✅
+6. `spyre_inference/platform.py` byte-identical to r9-end; `SPYRE_MIN_BLOCK_SIZE = 128` at platform.py:211 (M7 preserved); zero `torch.compile(` calls (only docstring/comment mentions at lines 130 and 193). ✅
+7. All three primary bench runs printed exactly one `Time elapsed for 120 generated tokens is <T> sec` line; no runtime errors. ✅
+8. FallbackWarning origins limited to pre-existing `spyre_attn.py:252` (prefill kernel) and `vocab_parallel_embedding.py:78`. Zero from `custom_ops/rms_norm.py`. ✅
+9. **Revert case** fully satisfied: implementer's reported T2 ratio 0.812× < 0.98× (regression trigger); `rms_norm.py` restored to r9-end state (verified); `roadmap.md` moves M8 to "Parked" with the empirical reason (documented at roadmap.md — regression attributed to kernel-scheduling-dependent behavior on current torch-spyre, since correctness and fallback gates were both green). ✅
+10. `roadmap.md` moves M8 out of "in_progress" to "Parked" (new "Parked" section entry, cross-referenced from the retrospective log) with the empirical reason. ✅
+
+## Interpretation and verdict
+This round is a textbook execution of the "empirical decision" protocol the multi-round loop was designed around. The implementer:
+1. Made the surgical M8 change,
+2. Ran pytest and got green (proving numerical correctness of scalar-broadcast + `.rsqrt([batch, 1])`),
+3. Ran the fallback probe and got green (proving Spyre natively supports the shape combination — this isn't a torch-spyre op-gap issue),
+4. Ran the two-triplet same-session A/B and got a clear regression on the primary triplet (T2 ratio 0.812×, combined 0.860×),
+5. Reverted per the task's revert rule instead of forcing a pass,
+6. Moved M8 to Parked in `roadmap.md` with an honest empirical explanation (kernel-scheduling-dependent regression) rather than "Abandoned" (leaving the door open for a future stack revisit).
+
+The primary bench median on the final HEAD (0.9968 tok/s) is 2.42× the original r3 baseline and 1.36× the methodology floor. All preservation criteria (r1-r9 machinery intact) verified. Passing under the revert-case pathway of criterion 9.
+
+### Feedback
+
+
