@@ -42,10 +42,10 @@ logger = init_logger(__name__)
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
 # Because torch.compile treats shapes as static constants, every distinct kv_len
-# triggers a full recompile. Aligning to 256 buckets sequence lengths into tiers
-# (256, 512, 768, ...) so only the first request at each tier pays compilation cost,
+# triggers a full recompile. Aligning to 512 buckets sequence lengths into tiers
+# (512, 1024, ...) so only the first request at each tier pays compilation cost,
 # rather than recompiling on every decode step.
-KV_LENGTH_ALIGNMENT = 256
+KV_LENGTH_ALIGNMENT = 512
 
 # Query chunk size for padding - ensures consistent tensor sizes for Spyre compilation
 # TODO: decode tokens (max_query_len=1) are always padded to 32, which is wasteful.

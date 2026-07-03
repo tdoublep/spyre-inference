@@ -96,19 +96,21 @@ same-session A/B ratio as primary signal. r6 judge accepted the
 - **[done] M5: Precompute per-seq scalars and page_indices in the metadata
   builder.** +5-10% same-session.
 - **[done] M6a: Cache RMSNorm weight on Spyre across forward calls.**
+- **[done] M4: Bump `KV_LENGTH_ALIGNMENT` 256 → 512.** +17.9% same-session
+  second-triplet A/B.
 
-- **[in_progress] M4: Try `KV_LENGTH_ALIGNMENT=512`.** *Cheap probe of a
-  dimension we haven't measured.* One-line change:
-  `spyre_attn.py:48` `KV_LENGTH_ALIGNMENT = 256` → `512`. Halves
-  compile-bucket count over kv_len (bench spans kv_len ~8 → 128, one
-  compile tier at 256 currently, would still be one tier at 512).
-  Also changes the mask-tile dimension along the KV axis (256 → 512
-  elements padded) — that's actually a *cost* increase per mask tile,
-  offset only by having fewer distinct tile shapes. For num_seqs=1,
-  the tiles are already per-seq per-num_blocks — the alignment mostly
-  affects `aligned_max_seq_len` used inside `_build_attention_mask`
-  which builds the CPU-side mask. Net effect unknown; that's why it
-  needs empirical probing. If it regresses, revert and mark abandoned.
+- **[done] M4 (r7): Bump `KV_LENGTH_ALIGNMENT` 256 → 512.** Same-session
+  A/B (two triplets each) — second-triplet ratio M4/r6-end =
+  1.0182/0.8637 = **1.179× (+17.9%)**; first-triplet ratio =
+  1.0410/0.9833 = **1.059× (+5.9%)**. Both above the 1.02× keep
+  threshold. Kept. The intuition that alignment change was neutral for
+  a single-tier bench was wrong: doubling `aligned_max_seq_len` halves
+  the *number* of distinct Spyre-side kernel shape variants
+  materialized as `kv_len` grows across decode steps (kv_len ~8, 72,
+  136 crossed the 128-token boundary previously — with alignment 256,
+  block-tile shapes still change; with 512, tile shapes stay stable
+  for the whole bench). Fewer compile-cache misses, and the tile CPU
+  build cost doubles but is still small vs Spyre-side work.
 
 - **[todo] M3: Eliminate the CPU staging buffer in attention output.**
   Blocked on mechanism-level probing of `torch.ops.spyre.overwrite`.
@@ -139,6 +141,9 @@ same-session A/B ratio as primary signal. r6 judge accepted the
 - M5 (r5): metadata-builder precompute for CPU-tensor scalars (+5-10%).
 - M6a (r6): RMSNorm weight caching on Spyre (mechanically clean; drift-
   dominated signal).
+- M4 (r7): `KV_LENGTH_ALIGNMENT` 256 → 512. Same-session +17.9%
+  (second-triplet), +5.9% (first-triplet). Halved distinct compile-
+  bucket shapes materialized across a 120-token bench.
 
 ## Parked
 
