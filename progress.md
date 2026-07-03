@@ -1025,3 +1025,123 @@ For subsequent rounds, if the fixed-floor part of criterion 10 is meant to be ro
 
 Nothing for the implementer to address. Passing.
 
+## Round 6 — Orchestrator
+- **reasoning**: M2 and M5 both hit ~+5-10% same-session by removing per-forward-call work that produced identical results across calls. RMSNorm's per-forward-call weight H2D transfer is the exact same anti-pattern, applied to a frozen model Parameter. The scale is comparable to M2/M5 (52 forwards/step × 120 steps = 6240 redundant transfers). Fix is surgical: one file, one helper method, one call-site swap. Risk is minimal — weight is a Parameter with class-attribute lifetime, and the tests/test_rms_norm.py suite catches numerical drift at fp16 tolerance. Same-session A/B is required to control for session-warmup drift, per r5 lessons. The criterion 11 flexibility (either primary-median ≥ 0.7315 OR same-session ratio ≥ 1.02×) prevents cold-first-triplet artifacts from failing a real improvement, consistent with r5 judge's methodology note. M6b (sweep other custom_ops) is deferred so this round can measure M6a in isolation.
+
+### Task
+**Implement M6a: cache the RMSNorm weight on Spyre across forward calls** in `spyre_inference/custom_ops/rms_norm.py`.
+
+**Bottleneck being addressed.** In `SpyreRMSNorm._forward_spyre_impl` (custom_ops/rms_norm.py:167), every forward call executes:
+
+```python
+convert(self.weight.data, self._target_device, self._target_dtype) if self.has_weight else None
+```
+
+at line 201. The weight is a frozen `nn.Parameter` — `self.weight.data` is invariant across forward calls, so the resulting Spyre-side tensor is identical every time. A 26-layer transformer with 2 RMSNorms per layer (pre-attn, pre-mlp) executes 52 RMSNorm forwards per decode step. Over a 120-token bench, that's **6,240 redundant weight H2D transfers per bench**. The tensor is small (hidden_size fp16 = a few KB) but the per-call H2D overhead is dominated by round-trip latency, not bandwidth — the same pattern that made M2 (mask-tile caching) worth +9.8%.
+
+**Fix.** Lazy-cache the Spyre-side weight on the layer instance. First forward populates it; every subsequent forward reads the cached tensor.
+
+**Concrete edits (all in `spyre_inference/custom_ops/rms_norm.py`):**
+
+1. Add a `_weight_device_cache: torch.Tensor | None = None` attribute (initialized in `SpyreRMSNorm.__init__`, after the existing `_target_device` / `_target_dtype` setup around lines 77-79).
+
+   Also stash the `id()` of the source `self.weight.data` at cache-population time, so we can detect if the underlying Parameter has been re-assigned (defensive against hypothetical weight re-loading paths):
+   ```python
+   self._weight_device_cache: torch.Tensor | None = None
+   self._weight_cache_src_id: int | None = None
+   ```
+
+2. Add a small helper method on the class to fetch the cached weight, populating on demand:
+
+   ```python
+   def _get_device_weight(self) -> torch.Tensor | None:
+       if not self.has_weight:
+           return None
+       src = self.weight.data
+       if self._weight_device_cache is None or self._weight_cache_src_id != id(src):
+           self._weight_device_cache = convert(src, self._target_device, self._target_dtype)
+           self._weight_cache_src_id = id(src)
+       return self._weight_device_cache
+   ```
+
+3. In `_forward_spyre_impl` at line 197-207, replace the inline weight `convert()` call with the cached lookup:
+
+   Change:
+   ```python
+   outs = self.maybe_compiled_forward_spyre(
+       convert(x, self._target_device, self._target_dtype),
+       self.variance_epsilon,
+       self.hidden_size,
+       convert(self.weight.data, self._target_device, self._target_dtype)
+       if self.has_weight
+       else None,
+       convert(residual, self._target_device, self._target_dtype)
+       if residual is not None
+       else None,
+   )
+   ```
+   to:
+   ```python
+   outs = self.maybe_compiled_forward_spyre(
+       convert(x, self._target_device, self._target_dtype),
+       self.variance_epsilon,
+       self.hidden_size,
+       self._get_device_weight(),
+       convert(residual, self._target_device, self._target_dtype)
+       if residual is not None
+       else None,
+   )
+   ```
+
+4. Do NOT touch anything else. Specifically:
+   - Do NOT modify `forward_spyre` (the compiled kernel).
+   - Do NOT modify `forward_oot` — it dispatches to `_forward_spyre_impl`.
+   - Do NOT modify the `_op_func`/`register()` machinery.
+   - Do NOT change how `x` or `residual` are converted (those are step-varying tensors — caching them would be a correctness bug).
+   - Do NOT touch other `custom_ops/*.py`, `spyre_attn.py`, `platform.py`, or the example script.
+
+**Correctness note for the implementer.** The weight is a `torch.nn.Parameter` set up by upstream `RMSNorm.__init__`. It's typically loaded once at model-load and never modified during inference. The `id(src)` guard handles the edge case where `self.weight` gets re-assigned or replaced (unlikely in this codebase but the check is cheap). The Spyre-cached tensor is a value-preserving conversion of `self.weight.data`, so numerical behavior is identical to the current path. `tests/test_rms_norm.py` exercises the RMSNorm path against a CPU reference at fp16 tolerance — that gate will catch any semantic drift.
+
+Note on the compiled kernel path: `self.maybe_compiled_forward_spyre` is set up in `__init__` via `self.maybe_compile(self.forward_spyre)`. If `torch.compile` is active it will re-trace when a tensor identity changes; using the cached tensor gives it a *stable* tensor identity across calls, which is if anything better for compile-cache reuse than the current per-call fresh tensor.
+
+**Verification steps the implementer must run:**
+
+1. `uv run --no-sync pytest -m "not upstream" -q` — must pass at 265 passed / 24 skipped / 4 xfailed. In particular `tests/test_rms_norm.py` must be green.
+
+2. Same-session A/B (the r5 lesson made this mandatory):
+   - Checkout `round-5-end` plugin state.
+   - Run three sequential bench invocations: `uv run --no-sync python examples/offline_inference/torch_spyre_inference.py --num-prompts 1`. Record all three tok/s.
+   - Restore HEAD (M6a change).
+   - Run three more sequential bench invocations. Record all three tok/s.
+   - Compute the medians. Report the same-session ratio.
+   - **Bonus (highly encouraged for signal):** Repeat once more per branch so you have two triplets each. Session warmup makes the *second* triplet more comparable to the *second* triplet on the other branch than to the first.
+
+3. Independent primary bench for the judge: three sequential runs on HEAD. Report all three and the median.
+
+4. FallbackWarning gate: same bench, redirect stderr, grep for `FallbackWarning`. Only the pre-existing `spyre_attn.py:252` (prefill kernel) and `vocab_parallel_embedding.py:78` should fire. The RMSNorm change must not introduce a new fallback origin.
+
+5. Do NOT invoke `--compare-with-cpu`. Correctness is covered by pytest.
+
+**Files touched (should be exactly one source file):**
+- `spyre_inference/custom_ops/rms_norm.py`
+
+**Non-goals for this round:**
+- Do NOT touch `spyre_inference/v1/attention/backends/spyre_attn.py` (attention is not this round's lever).
+- Do NOT touch `spyre_inference/platform.py`.
+- Do NOT touch `examples/offline_inference/torch_spyre_inference.py`.
+- Do NOT sweep the other `custom_ops/*.py` files (that's M6b, next round).
+- Do NOT change `variance_size_override`, dtype semantics, or padding logic.
+
+### Pass criteria
+1. `uv run --no-sync pytest -m "not upstream" -q` passes with 265 passed (matching the pre-change baseline). No new failures. In particular `tests/test_rms_norm.py` is green. (A single flaky failure of `tests/test_spyre_comms_native_probes.py` that passes on re-run is acceptable per r4 judge precedent — unrelated to RMSNorm.)
+2. Only `spyre_inference/custom_ops/rms_norm.py` is source-modified. `git diff HEAD` scoped to `examples/`, `spyre_inference/platform.py`, `spyre_inference/v1/`, and every other file under `spyre_inference/custom_ops/` is empty.
+3. `SpyreRMSNorm.__init__` (or a helper it calls) in `spyre_inference/custom_ops/rms_norm.py` initializes a per-instance attribute holding the cached Spyre-device weight (initially `None`) plus a tracker of the source `Parameter` identity. Verifiable by static grep for a new instance attribute assignment inside the class.
+4. `SpyreRMSNorm._forward_spyre_impl` in `spyre_inference/custom_ops/rms_norm.py` no longer contains a `convert(self.weight.data, ...)` call. Verifiable by static grep: after the change, `_forward_spyre_impl` must contain zero occurrences of `self.weight.data`.
+5. The cached weight is populated lazily on first forward *or* eagerly in `__init__`, and reused on subsequent calls. Verifiable by static inspection: there must exist a code path in `spyre_inference/custom_ops/rms_norm.py` that stores `convert(self.weight.data, self._target_device, self._target_dtype)` on the instance and returns the stored value on subsequent invocations.
+6. The `_get_device_weight`-style helper (or equivalent inline code) includes a defensive check that re-populates the cache if the underlying `Parameter` identity changes (comparing `id(self.weight.data)` or equivalent).
+7. `spyre_inference/v1/attention/backends/spyre_attn.py` is byte-identical to its state at the start of this round. Specifically, `_create_compilable_page_attn_decode`, the M2 `attention_mask_tiles_device` cache, and the M5 `query_starts` / `query_ends` / `kv_lens_list` / `page_indices_per_seq` fields all remain unchanged. Verifiable via `git diff HEAD -- spyre_inference/v1/`.
+8. `spyre_inference/platform.py` unchanged; no `torch.compile(...)` calls anywhere in it.
+9. Three sequential bench invocations on HEAD each print exactly one `Time elapsed for 120 generated tokens is <T> sec` line and complete without runtime error.
+10. No new `FallbackWarning` origin surfaces in the primary bench run vs round-5-end. Only pre-existing warnings from `_create_compilable_page_attn` at `spyre_attn.py:252` (prefill kernel) and `vocab_parallel_embedding.py:78` are permitted. In particular, `custom_ops/rms_norm.py` must emit zero `FallbackWarning` origins that weren't present at round-5-end.
+11. Same-session A/B ratio, `median(M6a tok/s) / median(round-5-end tok/s)`, is ≥ 1.00 across the same-session comparison (three triplet vs three triplet, or ideally two triplets each with the second triplet used for comparison to control for session-warmup drift). A ratio ≥ 1.02× would indicate clear signal. The primary bench median on HEAD must be ≥ 0.7315 tok/s (the r3 methodology baseline) OR the same-session A/B must be ≥ 1.02× — either passes this criterion, since a cold-triplet result can under-report warm code (per r5 judge's observation).
+
