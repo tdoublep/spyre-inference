@@ -1195,3 +1195,52 @@ Ordering: the T1 measurements ran in the same interleaved sequence (M6a T1 → r
 ### Summary
 Implemented M6a in `spyre_inference/custom_ops/rms_norm.py` only. Added two `SpyreRMSNorm` instance attributes in `__init__` after `_target_device`/`_target_dtype`: `_weight_device_cache: torch.Tensor | None = None` and `_weight_cache_src_id: int | None = None`. Added new `_get_device_weight()` method that returns `None` if `not self.has_weight`, otherwise checks the cache (populating via `convert(self.weight.data, self._target_device, self._target_dtype)` on first call or on `id(self.weight.data)` mismatch) and returns the cached tensor. In `_forward_spyre_impl`, replaced the inline `convert(self.weight.data, self._target_device, self._target_dtype) if self.has_weight else None` argument with `self._get_device_weight()`. `x` and `residual` `convert()` paths left untouched (step-varying tensors). `progress.md` updated with two same-session A/B triplets each and the primary-bench triplet.
 
+## Round 6 — Judge (attempt 1)
+- **verdict**: pass
+- **tok_per_sec**: 0.8477
+
+### Analysis
+## r1 change scope (round 6, M6a RMSNorm weight caching)
+Single-file source change to `spyre_inference/custom_ops/rms_norm.py`:
+- `SpyreRMSNorm.__init__` (rms_norm.py:85-86): two new instance attributes — `_weight_device_cache: torch.Tensor | None = None` and `_weight_cache_src_id: int | None = None`.
+- New helper `_get_device_weight()` (rms_norm.py:175-189): returns `None` if `not self.has_weight`; otherwise refreshes the cache when empty or when `id(self.weight.data)` no longer matches the recorded `_weight_cache_src_id`, then returns the cached device tensor.
+- `_forward_spyre_impl` (rms_norm.py:222-227): replaced the inline `convert(self.weight.data, self._target_device, self._target_dtype) if self.has_weight else None` argument with `self._get_device_weight()`. The `x` and `residual` `convert()` paths (both are step-varying tensors) are left unchanged.
+
+The weight tensor is invariant across forwards for a loaded model, so memoizing the H2D-converted view is safe. The `id()` identity guard handles the (rare) case of Parameter re-assignment. 52 RMSNorm modules × 120 decode steps per bench = ~6,240 per-step redundant H2D transfers now amortized to one per module lifetime.
+
+## Correctness (pytest)
+`uv run --no-sync pytest -m "not upstream" -q` → **265 passed, 24 skipped, 1880 deselected, 4 xfailed** in 1068s. Matches baseline. No flakes. `tests/test_rms_norm.py` green (implicit in the 265 count; test suite includes it and no failures reported). Gate PASS.
+
+## Performance — three primary bench runs on HEAD
+- Run 1: `Time elapsed for 120 generated tokens is 109.62 sec` → **1.0947 tok/s**
+- Run 2: `Time elapsed for 120 generated tokens is 153.73 sec` → **0.7806 tok/s**
+- Run 3: `Time elapsed for 120 generated tokens is 141.56 sec` → **0.8477 tok/s**
+
+Mean: 0.9077 tok/s. **Median: 0.8477 tok/s**. Sample stdev: 0.1607. CoV: 17.7%. This session shows the drift the r4/r5 judges documented (~40% span between fastest and slowest run). The median comfortably clears the 0.7315 fixed floor (+15.9%). Also 2.06× the r3 methodology baseline (0.411 tok/s).
+
+## FallbackWarning gate
+`uv run --no-sync python -W "error::torch_spyre.ops.fallbacks.FallbackWarning" …` completed with `Time elapsed for 120 generated tokens is 110.95 sec`. Python still rejects the `-W` filter itself (`Invalid -W option ignored: invalid module name: 'torch_spyre.ops.fallbacks'`), same as all prior rounds. Unique `FallbackWarning` origins:
+- `vllm/.../vocab_parallel_embedding.py:78` (pre-existing baseline, unscored per criterion 10)
+- `spyre_inference/v1/attention/backends/spyre_attn.py:252` inside `_create_compilable_page_attn` (prefill kernel, permitted by criterion 10)
+
+**Zero** `FallbackWarning` origins from `spyre_inference/custom_ops/rms_norm.py`. Gate 3 PASS.
+
+## Pass criteria audit
+1. pytest 265 passed, baseline preserved. ✅
+2. Only `spyre_inference/custom_ops/rms_norm.py` source-modified (+ workflow `progress.md`); `git diff HEAD~1` scoped to `examples/`, `spyre_inference/platform.py`, `spyre_inference/v1/`, and every other file under `spyre_inference/custom_ops/` is empty. ✅
+3. `_weight_device_cache: torch.Tensor | None = None` and `_weight_cache_src_id: int | None = None` initialized in `SpyreRMSNorm.__init__` at rms_norm.py:85-86. ✅
+4. Zero `self.weight.data` occurrences inside `_forward_spyre_impl` (verified via `awk '/def _forward_spyre_impl/,/^    def /'` → `grep 'self.weight.data'` returns 0 hits; the sole `self.weight.data` reference in the file is at rms_norm.py:185 inside `_get_device_weight`). ✅
+5. Cache populated lazily in `_get_device_weight` (`if self._weight_device_cache is None or self._weight_cache_src_id != id(src): self._weight_device_cache = convert(...)` at rms_norm.py:186-187); subsequent calls short-circuit and return the cached tensor. ✅
+6. Defensive identity guard: `id(src)` comparison at rms_norm.py:186, updated at rms_norm.py:188 whenever the cache is refreshed. Handles Parameter re-assignment defensively. ✅
+7. `git diff HEAD~1 -- spyre_inference/v1/` returns empty; `_create_compilable_page_attn_decode` at spyre_attn.py:285, M2 `attention_mask_tiles_device` at spyre_attn.py:420, and M5 `query_starts`/`query_ends`/`kv_lens_list`/`page_indices_per_seq` at spyre_attn.py:437-442 are all still present unchanged. ✅
+8. `platform.py` unchanged from r5-end; no `torch.compile(` calls anywhere in the file (only two docstring/comment mentions at lines 130 and 193). ✅
+9. All three primary bench runs printed exactly one `Time elapsed for 120 generated tokens is <T> sec` line; no runtime errors. ✅
+10. FallbackWarning origins limited to the pre-existing `spyre_attn.py:252` (prefill kernel) and `vocab_parallel_embedding.py:78`; zero from `custom_ops/rms_norm.py`. ✅
+11. Primary bench median on HEAD = 0.8477 tok/s ≥ 0.7315 threshold (1.159×) — the alternative pathway of criterion 11 is satisfied. Same-session A/B was not performed independently by me because the primary-bench median already clears the fixed floor. Implementer's reported same-session data (T1 cold: 1.259×, T2 warm: 0.906×, combined 6-run: 1.009×) is drift-dominated as they noted, and per r5 judge precedent, either pathway is acceptable. ✅
+
+## Interpretation
+Every static criterion and always-on gate is met. The change is minimal, correctness-preserving, and defensively invalidated. The expected end-to-end perf win is modest (each weight tile is small; 6240 avoided transfers saves microseconds each, aggregated to a few percent at best) and sits inside the shared-host drift envelope — the implementer honestly reported this rather than cherry-picking a favorable ordering. Passing.
+
+### Feedback
+
+
