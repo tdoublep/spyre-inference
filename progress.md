@@ -1872,3 +1872,109 @@ Every static criterion and always-on gate is met. The change is minimal, correct
 ### Feedback
 
 
+## Round 10 — Orchestrator
+- **reasoning**: M2/M5/M6a/M3a exhausted the "cache-redundant-work" pattern. M4/M7 exhausted the "compile-bucket-collapse" pattern. M8 introduces a third pattern: shape-shrink of intermediate tensors to eliminate compute we never needed. The current code allocates a [batch, hidden_size] filled-with-scalar tensor 6,240 times per bench, then adds it to a [batch, 1] `variance`, producing a [batch, hidden_size] intermediate, then `rsqrt`'s hidden_size × batch values — but every value along the hidden_size axis is identical. Scalar broadcast produces the same numerical result while running rsqrt on batch values instead of batch × hidden_size. The comment flagging this as a Spyre workaround makes the direction empirically testable: if Spyre lacks scalar broadcast in add or rsqrt on [batch, 1], pytest and the fallback-gate will catch it. If it works, we get a real reduction in per-forward FLOPs and allocations. Small tensor, small op, but the invocation count (6,240/bench) is what makes this M2/M6a-scale. The revert path (Parked, not Abandoned — the direction is still believable, the specific implementation may just need a shape-preserving-but-tiny variant like `torch.tensor(eps, ...)` instead of a Python float) keeps this reversible if Spyre proves picky about scalar-broadcast semantics.
+
+### Task
+**Implement M8: replace RMSNorm's shape-matched epsilon buffer with scalar broadcast** in `spyre_inference/custom_ops/rms_norm.py`.
+
+**Bottleneck being addressed.** In `SpyreRMSNorm.forward_spyre` (rms_norm.py:136-173), the current code allocates a full `[batch, hidden_size]` tensor filled with a scalar constant just to match `x`'s shape before adding it to `variance`:
+
+```python
+variance_epsilon_t = torch.full(
+    x.shape, variance_epsilon, dtype=torch.float16, device=x.device
+)
+variance = x.pow(2).mean(dim=-1, keepdim=True)   # shape [batch, 1]
+x = x * torch.rsqrt(variance + variance_epsilon_t)   # (broadcasts [batch,1] up to shape[x])
+```
+
+Two problems:
+1. **Redundant allocation.** `variance_epsilon_t` has shape `[batch, hidden_size]` (typically `[1, 2048]` for the bench). It's freshly allocated every RMSNorm call — 52 modules × 120 decode steps = **6,240 per-bench allocations**.
+2. **Redundant compute.** `variance + variance_epsilon_t` produces `[batch, hidden_size]`, and `rsqrt` then runs on `hidden_size × batch` values — but every value along the hidden_size axis is identical (it's `variance[b,0] + eps` repeated). We compute the same rsqrt 2048 times per batch row.
+
+**Fix.** Replace with a scalar broadcast:
+
+```python
+variance = x.pow(2).mean(dim=-1, keepdim=True)   # shape [batch, 1], unchanged
+x = x * torch.rsqrt(variance + variance_epsilon)   # scalar broadcasts; rsqrt runs on [batch, 1]
+```
+
+`variance_epsilon` is already a Python `float` parameter of `forward_spyre` (rms_norm.py:139). Adding a Python float to a tensor is a standard PyTorch scalar-broadcast operation. `rsqrt` then runs on the `[batch, 1]` intermediate — `batch` calls instead of `batch × hidden_size`. The final `x * rsqrt(...)` broadcasts `[batch, 1]` back to `[batch, hidden_size]` (implicit broadcast in element-wise multiply). Same numerical output as the pre-change path.
+
+**Concrete edits (all in `spyre_inference/custom_ops/rms_norm.py`, in the `forward_spyre` static method):**
+
+1. **Delete** the `variance_epsilon_t = torch.full(...)` allocation (currently lines 160-162).
+
+2. **Change** the rsqrt line (currently line 166):
+   - From: `x = x * torch.rsqrt(variance + variance_epsilon_t)`
+   - To:   `x = x * torch.rsqrt(variance + variance_epsilon)`
+
+3. **Update the module docstring** at rms_norm.py:33-40 that lists "Creates epsilon tensor via `torch.full()`" as a Spyre-specific characteristic. Reword to reflect the new behavior — e.g. remove that bullet, or say "Uses scalar broadcast for `variance + epsilon` (matches upstream)". Keep the tone terse.
+
+4. **Update the "Key differences from upstream" comment** at rms_norm.py:149-151 in `forward_spyre`'s own docstring. Same reasoning — reword the "Creates epsilon tensor via torch.full() instead of scalar" bullet since we're now using the scalar.
+
+5. Do NOT modify:
+   - `_forward_spyre_impl` (rms_norm.py:191-onward) — the input padding, device-transfer, dtype-conversion wrapping code is fine.
+   - `_get_device_weight` (r6/M6a) — weight caching preserved.
+   - `forward_oot` — dispatch logic unchanged.
+   - `__init__` — no new attributes needed.
+   - The custom op registration at `_op_func` / `register()`.
+   - Any file outside `spyre_inference/custom_ops/rms_norm.py`.
+
+**Correctness note for the implementer.** The comment "Creates epsilon tensor via torch.full() instead of scalar" flagged this as a deliberate workaround. Whether it was needed at all, or was speculative defensive coding, is unclear from the surrounding code. The empirical gate is:
+
+1. Numerical: `tests/test_rms_norm.py` compares Spyre-side output against a CPU reference at fp16 tolerance (atol=1e-2, rtol=1e-2). If Spyre's scalar-broadcast add + `.rsqrt()` on `[batch, 1]` produces incorrect values or a NaN, the test will fail.
+2. Fallback: `-W "error::torch_spyre.ops.fallbacks.FallbackWarning"` on the offline bench. If `.rsqrt()` on a shape other than `x.shape` silently falls back to CPU, we'd see a new FallbackWarning origin from `custom_ops/rms_norm.py`. Any new origin means revert.
+
+Either failure → revert the change and move M8 to Parked with the empirical reason. If the change is clean on both gates, keep.
+
+Note: **broadcast in add**. PyTorch's `Tensor + float` is standard; it converts the float to a same-dtype 0-d tensor and broadcasts. Spyre's op set should treat this the same way as any other broadcast add — same dispatch path as e.g. `x + 1.0` in existing kernels.
+
+**Verification steps the implementer must run:**
+
+1. `uv run --no-sync pytest -m "not upstream" -q` — must pass at 265 passed / 24 skipped / 4 xfailed. `tests/test_rms_norm.py` in particular must be green (this is the authoritative signal for M8).
+
+2. Same-session A/B (r5-r9 protocol):
+   - Checkout `round-9-end` plugin state.
+   - Run three sequential bench invocations. Record all three tok/s.
+   - Restore HEAD (M8 change).
+   - Run three more sequential bench invocations. Record all three tok/s.
+   - Repeat once more so we have two triplets each. Use the second triplet from each branch as the primary signal.
+   - Compute `median(M8 T2) / median(r9-end T2)`. Primary keep/revert signal.
+
+3. Independent primary bench: three sequential runs on final HEAD. Report all three tok/s and median.
+
+4. FallbackWarning gate: same bench, redirect stderr. Only the pre-existing `spyre_attn.py:252` (prefill kernel) and `vocab_parallel_embedding.py:78` should fire. **A new fallback origin from `custom_ops/rms_norm.py` is a REVERT signal** — likely means Spyre doesn't natively support the shape combination we chose.
+
+5. Do NOT invoke `--compare-with-cpu`.
+
+If ratio ≥ 1.02×: keep, mark M8 done.
+If ratio 0.98× to 1.02×: keep (mechanism is sound; reducing FLOPs and allocations is a defensible retention).
+If ratio ≤ 0.98× OR any new fallback: revert, move M8 to Parked.
+
+**Files touched (should be exactly one source file):**
+- `spyre_inference/custom_ops/rms_norm.py`
+
+**Non-goals for this round:**
+- Do NOT touch `_forward_spyre_impl` or `forward_oot`.
+- Do NOT re-work the M6a `_get_device_weight` cache.
+- Do NOT touch `platform.py`, `spyre_attn.py`, or other custom_ops.
+- Do NOT modify the example script.
+- Do NOT change `variance_size_override` handling or dtype promotion.
+
+### Pass criteria
+1. `uv run --no-sync pytest -m "not upstream" -q` passes with 265 passed (matching the pre-change baseline). No new failures. In particular `tests/test_rms_norm.py` is green. (A single flaky failure of `tests/test_spyre_comms_native_probes.py` that passes on re-run is acceptable per r4 judge precedent.)
+2. Only `spyre_inference/custom_ops/rms_norm.py` is source-modified (plus `roadmap.md` / `progress.md` for reporting). `git diff HEAD` scoped to `examples/`, `spyre_inference/platform.py`, `spyre_inference/v1/`, `spyre_inference/distributed/`, and every other file under `spyre_inference/custom_ops/` is empty.
+3. Depending on the same-session A/B and fallback-gate outcome, `spyre_inference/custom_ops/rms_norm.py` contains either:
+    - **Keep case:** No `torch.full(x.shape, variance_epsilon, ...)` call remains in `forward_spyre`; the `rsqrt(variance + ...)` call adds `variance_epsilon` (Python float) directly to `variance`. Verifiable via static grep: after the change, `grep "torch.full" spyre_inference/custom_ops/rms_norm.py` must return zero matches inside `forward_spyre`.
+    - **Revert case:** `spyre_inference/custom_ops/rms_norm.py` byte-identical to its `round-9-end` state (r9 M3a did not touch this file, so this equals HEAD at the start of the round).
+4. `spyre_inference/custom_ops/rms_norm.py` still contains `_get_device_weight`, `_weight_device_cache`, and `_weight_cache_src_id` (M6a preserved) regardless of keep/revert.
+5. `spyre_inference/v1/attention/backends/spyre_attn.py` is byte-identical to `round-9-end`. All r1/r2/r4/r5/r7/r9 machinery preserved: `_create_compilable_page_attn_decode`, `attention_mask_tiles_device`, the four M5 fields, `KV_LENGTH_ALIGNMENT = 512`, `QUERY_CHUNK_SIZE = 32`, the num_seqs==1 fast path in `_online_softmax_attention`.
+6. `spyre_inference/platform.py` is byte-identical to `round-9-end`; `SPYRE_MIN_BLOCK_SIZE = 128` (M7) preserved. No `torch.compile(...)` calls.
+7. Three sequential primary bench invocations on final HEAD each print exactly one `Time elapsed for 120 generated tokens is <T> sec` line and complete without runtime error.
+8. **Fallback-gate:** no new `FallbackWarning` origin surfaces vs `round-9-end`. In particular, `spyre_inference/custom_ops/rms_norm.py` must produce ZERO `FallbackWarning` origins in the primary bench run. Only pre-existing warnings from `_create_compilable_page_attn` at `spyre_attn.py:252` (prefill kernel) and `vocab_parallel_embedding.py:78` are permitted. **A new origin from `custom_ops/rms_norm.py` — either from the scalar-broadcast add or from `torch.rsqrt` on `[batch, 1]` — signals that Spyre lacks native support for the shape combination and MUST trigger a revert.**
+9. Same-session A/B ratio `median(M8 T2) / median(r9-end T2)` reported in `progress.md` alongside all six individual bench times. Either:
+    - **Keep case:** ratio ≥ 0.98× AND fallback-gate green AND (primary median ≥ 0.7315 baseline OR same-session A/B ≥ 1.02×).
+    - **Revert case:** ratio < 0.98× OR a new fallback origin from `rms_norm.py`; `rms_norm.py` restored to `round-9-end` state; `roadmap.md` moves M8 to "Parked" with the empirical reason.
+10. `roadmap.md` moves M8 out of "in_progress" — to "Done" if kept (with the measured ratio noted), or to "Parked" if reverted (with the empirical reason).
+

@@ -17,46 +17,45 @@ Conventions:
 ## Bottleneck model (single-prompt decode, `--num-prompts 1`)
 
 Decode steps have `max_query_len=1`, `num_seqs=1`, `num_blocks_needed=1`
-(post-M7). Post-r8 the remaining hot-path costs are:
+(post-M7). Post-r9 the remaining hot-path costs are:
 
-- **[M3a target] CPU staging buffer in `_online_softmax_attention`.**
-  `output_cpu = torch.zeros_like(output, device="cpu")` at
-  `spyre_attn.py:895` allocates a fresh CPU staging tensor every layer
-  per step. Result flows: Spyre-side `result` → CPU-side `result_cpu`
-  (reshape/transpose there — Spyre transpose+contiguous is broken) →
-  writes into `output_cpu[q_start:q_end]` → `output.copy_(convert(
-  output_cpu, ...))` bulk H2D at end. **For num_seqs=1 (bench case)**
-  the staging buffer holds one row (`q_start=0`, `q_end=1` == `query_len`
-  for decode), so `output_cpu` is literally a copy of `result_cpu`. The
-  staging + memcpy + push adds one CPU alloc + one CPU memcpy per layer
-  per step — 26 layers × 120 steps = 3,120 redundant allocations. Direct
-  H2D of `result_cpu[0, :query_len]` into `output` skips both.
+- **[M8 target] RMSNorm shape-matched epsilon buffer.** `forward_spyre`
+  (rms_norm.py:160-166) allocates `torch.full(x.shape, variance_epsilon,
+  dtype=torch.float16, device=x.device)` — a full `[batch, hidden_size]`
+  tensor filled with a single scalar constant, just so `variance +
+  variance_epsilon_t` "matches shape" before `rsqrt`. Downstream this
+  computes `hidden_size` copies of the same rsqrt value per batch row
+  (redundant), and the intermediate tensor is 2× larger than necessary.
+  Replacing with `variance + variance_epsilon` (Python float, or 0-d
+  tensor) computes only `batch` rsqrt values before broadcasting.
+  Same numerical result, less work per RMSNorm call. 52 calls/step ×
+  120 steps = 6,240 RMSNorm invocations per bench, each currently doing
+  hidden_size=2048 redundant rsqrts.
 - **[M6c candidate] QKV D→H at `custom_ops/linear.py:128`.** QKV output
-  pulled to CPU because downstream `.split()` on strided Spyre views is
-  broken. Structural change; requires rewriting the split or accepting
-  a torch-spyre limitation.
-- **[Minor] RMSNorm `torch.full(x.shape, ...)`** — size-matched broadcast
-  crutch; mechanism-level probe on Spyre scalar/0-d broadcast support.
-- **[Stale comment] spyre_attn.py:429** still says "rounded up to
-  KV_LENGTH_ALIGNMENT (256)"; alignment is 512 since r7. Cosmetic.
+  pulled to CPU. Structural: requires either splitting on Spyre with
+  contiguous materialization (comment says strided scatter breaks V) or
+  keeping QKV on Spyre and reshaping Q there. Higher risk.
+- **[M3 full] Multi-seq staging removal.** Not exercised by bench.
+- **RMSNorm `torch.full(...)`** — see M8 above.
 
 ## Meta-pattern observations
 
-Successful rounds have all fit one of two templates:
-1. **Cache-what's-redundant-across-N-invocations** (M2, M5, M6a).
+Successful rounds have fit two templates:
+1. **Cache-what's-redundant-across-N-invocations** (M2, M5, M6a, M3a).
 2. **Reduce compile-bucket variants materialized during a run** (M4, M7).
 
-M3a fits template 1: `output_cpu` is allocated fresh 3,120× per bench
-for identical purpose. Same pattern as M2/M6a — the fix is to short-
-circuit the staging when the general-varlen scaffolding isn't needed.
+M8 fits a new template: **shape-shrink of an intermediate tensor** so
+that a downstream elementwise op does less work. Not "caching redundant
+work" or "compile bucket reduction", but "eliminate FLOPs we didn't
+need in the first place". Small tensor, small op, but 6,240 invocations.
 
-## Measurement (fixed r3, sharpened r4-r7)
+## Measurement (fixed r3, sharpened r4-r9)
 
 Warmup + 120-token bench. Cross-session drift is real (~10-25% per
 triplet through the machine day). Same-session A/B (two triplets each,
-second-triplet ratio as primary signal per r5-r7 lessons) is the
-reliable verdict. Judge accepts "primary median ≥ 0.7315 baseline OR
-same-session A/B ≥ 1.02×" alternative-pathway rule.
+second-triplet ratio as primary signal) is the reliable verdict. Judge
+accepts "primary median ≥ 0.7315 baseline OR same-session A/B ≥ 1.02×"
+alternative-pathway rule.
 
 ## Learnings from previous rounds
 
@@ -69,13 +68,13 @@ same-session A/B ≥ 1.02×" alternative-pathway rule.
 - **r5 (M5, done):** precompute per-seq scalars + page_indices. +5-10%.
 - **r6 (M6a, done):** cache RMSNorm weight on Spyre. Clean, drift-
   dominated signal.
-- **r7 (M4, done):** `KV_LENGTH_ALIGNMENT` 256 → 512. Same-session
-  +17.9% (second-triplet), +5.9% (first-triplet).
-- **r8 (M7, done):** platform `block_size >= 128`. Same-session +15.2%
-  (second-triplet). Every decode step now hits the `num_blocks == 1`
-  fast path.
-- **Meta-learning:** compile-bucket count reduction is a real end-to-
-  end win invisible to per-op timing but shows up in wall-clock.
+- **r7 (M4, done):** `KV_LENGTH_ALIGNMENT` 256 → 512. +17.9% (T2).
+- **r8 (M7, done):** platform `block_size >= 128`. +15.2% (T2).
+- **r9 (M3a, done):** skip CPU staging for `num_seqs == 1`. +17.0% (T2).
+  Bundled comment fix.
+- **Meta-learning:** compile-bucket count reduction and per-invocation
+  redundant work are both real end-to-end wins invisible to per-op
+  timing but shows up in wall-clock.
 
 ## Major
 
@@ -87,36 +86,50 @@ same-session A/B ≥ 1.02×" alternative-pathway rule.
 - **[done] M6a: Cache RMSNorm weight on Spyre.**
 - **[done] M4: `KV_LENGTH_ALIGNMENT` 256 → 512.** +17.9% (T2).
 - **[done] M7: Force `block_size >= 128`.** +15.2% (T2).
+- **[done] M3a: Skip CPU staging when num_seqs==1.** +17.0% (T2).
 
-- **[done] M3a (r9): Skip CPU staging buffer in `_online_softmax_attention`
-  when num_seqs == 1.** Guarded the `torch.zeros_like(output, device="cpu")`
-  allocation, the `output_cpu[q_start:q_end] = ...` scatter, and the
-  trailing bulk-H2D behind `if num_seqs > 1:` blocks. Added a
-  `num_seqs == 1` branch that pushes `result_cpu[0, :query_len, :, :]`
-  directly into `output` via one H2D per attention layer per step.
-  Multi-seq path unchanged. Also bundled the stale comment fix at
-  spyre_attn.py:429 (`KV_LENGTH_ALIGNMENT (256)` → `(512)`).
-  Same-session A/B second-triplet ratio (primary signal):
-  M3a/r8-end = 0.8985/0.7679 = **1.170× (+17.0%)**. Primary bench
-  median on HEAD 0.8130 tok/s = 1.11× the 0.7315 methodology floor.
+- **[in_progress] M8: Replace RMSNorm shape-matched epsilon buffer with a
+  scalar broadcast.** *Removes 6,240 shape-matched-tensor allocations +
+  6,240 hidden_size-fold redundant rsqrts per bench.* In
+  `SpyreRMSNorm.forward_spyre` (rms_norm.py:136-173), replace:
 
-- **[todo] M3: Full CPU-staging-buffer removal.** Broader than M3a —
-  would eliminate the staging even for num_seqs > 1 by using an on-
-  Spyre write primitive. Blocked on `torch.ops.spyre.overwrite`
-  reliability probe. M3a captures the bench-case win without the
-  mechanism risk.
-- **[todo] M6b: Sweep remaining custom_ops.** Low expected value.
-- **[todo] M6c: QKV `.split()` on Spyre.** Structural, requires torch-
-  spyre op-support probe.
+  ```
+  variance_epsilon_t = torch.full(
+      x.shape, variance_epsilon, dtype=torch.float16, device=x.device
+  )
+  variance = x.pow(2).mean(dim=-1, keepdim=True)
+  x = x * torch.rsqrt(variance + variance_epsilon_t)
+  ```
+
+  with:
+
+  ```
+  variance = x.pow(2).mean(dim=-1, keepdim=True)
+  x = x * torch.rsqrt(variance + variance_epsilon)
+  ```
+
+  Where `variance_epsilon` is the Python float already passed in as a
+  parameter. `variance` has shape `[batch, 1]`, adding a scalar
+  broadcasts trivially, `rsqrt` now runs on a `[batch, 1]` tensor
+  (batch reciprocal-sqrts instead of `batch × hidden_size`), and the
+  final `x * rsqrt(...)` broadcasts `[batch, 1]` back to
+  `[batch, hidden_size]` — same numerical result as the old code.
+
+  Risks: the `torch.full` was a workaround per the module docstring
+  ("Creates epsilon tensor via `torch.full()`" is listed as one of the
+  key differences from upstream). If Spyre lacks scalar broadcast in
+  add or `.rsqrt` on `[batch, 1]` triggers a fallback, pytest will
+  catch it (numerical) or the FallbackWarning gate will (silent CPU
+  routing). Revert if either fires.
+
+- **[todo] M3: Full CPU-staging-buffer removal.**
+- **[todo] M6b: Sweep remaining custom_ops.**
+- **[todo] M6c: QKV `.split()` on Spyre.**
 
 ## Minor
 
-- **[done] Fix stale comment at spyre_attn.py:429** — bundled into
-  r9/M3a. `KV_LENGTH_ALIGNMENT (256)` → `(512)`.
-- **[todo] Prefill `reshape_and_cache` Python-unrolled loop** —
-  bench doesn't spend meaningful time in prefill.
-- **[todo] RMSNorm `torch.full(x.shape, ...)` epsilon buffer** —
-  size-matched broadcast crutch. Mechanism-level probe needed.
+- **[done] Fix stale comment at spyre_attn.py:429** — bundled into r9/M3a.
+- **[todo] Prefill `reshape_and_cache` Python-unrolled loop.**
 
 ## Done
 
@@ -125,16 +138,11 @@ same-session A/B ≥ 1.02×" alternative-pathway rule.
 - M1' (r2): Q=1 decode kernel (single global softmax, no per-block max).
 - M2 (r4): mask-tile H2D caching across L layers per step (+9.8%).
 - M5 (r5): metadata-builder precompute for CPU-tensor scalars (+5-10%).
-- M6a (r6): RMSNorm weight caching on Spyre (mechanically clean; drift-
-  dominated signal).
-- M4 (r7): `KV_LENGTH_ALIGNMENT` 256 → 512. Same-session +17.9%
-  (second-triplet), +5.9% (first-triplet).
-- M7 (r8): platform-level `block_size >= 128` bump. Same-session
-  second-triplet +15.2%; primary bench median 0.9670 tok/s.
-- M3a (r9): skip CPU staging buffer in `_online_softmax_attention`
-  when num_seqs == 1. Same-session second-triplet +17.0%; primary
-  bench median 0.8130 tok/s. Also fixed stale KV_LENGTH_ALIGNMENT
-  (256) → (512) comment.
+- M6a (r6): RMSNorm weight caching on Spyre.
+- M4 (r7): `KV_LENGTH_ALIGNMENT` 256 → 512 (+17.9% T2).
+- M7 (r8): platform `block_size >= 128` (+15.2% T2).
+- M3a (r9): skip CPU staging when num_seqs==1 (+17.0% T2). Bundled
+  stale-comment fix.
 
 ## Parked
 
