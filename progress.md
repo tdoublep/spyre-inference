@@ -726,3 +726,57 @@ M2 median (0.8092 tok/s) is above criterion 10's fixed 0.7315 threshold by 10.6%
 ### Summary
 The M2 mask-tile H2D caching code from round-4-r1-impl remains in place (byte-identical) — the r1 code correctly satisfies all static criteria and the task spec. Judge feedback flagged criterion 10 as failed at 0.663 tok/s vs 0.7315 threshold but attributed the shortfall to cross-session measurement drift on the shared host, not a real code regression, and explicitly recommended Option A (same-session A/B re-baseline) before iterating on the caching logic. This round performs that same-session A/B: checkout r3-end plugin code → 3 bench runs → checkout HEAD (M2 code) → 3 bench runs. Only `progress.md` is modified this round (source unchanged from r1).
 
+## Round 4 — Judge (attempt 2)
+- **verdict**: pass
+- **tok_per_sec**: 0.8193
+
+### Analysis
+## r2 change scope
+No source changes vs r1 (round-4-r1-impl) — the M2 mask-tile H2D caching code at spyre_attn.py:420 (`attention_mask_tiles_device` field) and lines 852-862 (`_online_softmax_attention` cache gate) is byte-identical. Only `progress.md` is modified, documenting a same-session A/B re-baseline (Option A from r1 judge feedback) that the implementer executed to disambiguate the r1 regression apparent-vs-real question.
+
+## Correctness (pytest)
+`uv run --no-sync pytest -m "not upstream" -q` → **264 passed, 1 failed, 24 skipped, 4 xfailed** in 1369s. Initial failure: `tests/test_spyre_comms_native_probes.py::test_native_all_gather_list_works` — a distributed TP=2 test that spawns subprocesses on 2 Spyre cards to probe libspyre_comms collective primitives. Standalone re-run of the same test passed immediately (17.74s). This test is entirely unrelated to the r4 mask-caching change: (a) it exercises `spyre_inference/distributed/spyre_communicator` and torch-spyre comms probes, not attention; (b) there is no code path from `_online_softmax_attention` or `SpyreAttentionMetadata` to any TP-comms primitive; (c) the test spawns real subprocesses on TP=2 hardware, which is a well-known source of ephemeral flakes. Effective baseline is preserved (265 passing on re-run). Correctness gate PASS.
+
+## Performance — three primary bench runs
+`uv run --no-sync python examples/offline_inference/torch_spyre_inference.py --num-prompts 1`, three sequential process invocations:
+- Run 1: `Time elapsed for 120 generated tokens is 171.64 sec` → **0.6991 tok/s**
+- Run 2: `Time elapsed for 120 generated tokens is 146.46 sec` → **0.8193 tok/s**
+- Run 3: `Time elapsed for 120 generated tokens is 118.40 sec` → **1.0135 tok/s**
+
+Mean: 0.8440 tok/s. **Median: 0.8193 tok/s**. Sample stdev: 0.1573. CoV: 18.6% (wider than r3's 10.78% but the median-based gate is unaffected).
+
+Threshold (criterion 10): ≥ 0.7315 tok/s. **0.8193 ≥ 0.7315** — passes by 12.0%. Also 1.99× baseline (0.411 tok/s).
+
+## Same-session A/B (from implementer's progress.md)
+The implementer executed my r1-judge Option A recommendation. They report:
+- r3-end code (mask cache stashed), three runs: 128.35s / 162.78s / 164.34s → median 0.7371 tok/s
+- M2 code (this round), three runs: 148.29s / 158.81s / 147.02s → median 0.8092 tok/s
+- Same-session ratio: 1.098× (+9.8% speedup)
+
+My own three-run median (0.8193) lands very close to their reported M2 median (0.8092), which validates the finding. Together with today's r3-end reference of 0.7371 (from their same-session run) versus the fixed 0.7315 threshold, this establishes that the r1 apparent regression was cross-session drift on the shared host, not a real code-caused slowdown. This session (evening) is faster than r1's session (~4× faster on some individual runs), confirming the drift is large in absolute terms.
+
+## FallbackWarning gate
+`uv run --no-sync python -W "error::torch_spyre.ops.fallbacks.FallbackWarning" …` completed with `Time elapsed for 120 generated tokens is 161.37 sec`. As in all prior rounds, Python rejects the `-W` filter itself (`Invalid -W option ignored: invalid module name: 'torch_spyre.ops.fallbacks'`) — module isn't importable at Python startup. Unique `FallbackWarning` origins:
+- `vllm/.../vocab_parallel_embedding.py:78` (pre-existing baseline, unscored per criterion 9)
+- `spyre_inference/v1/attention/backends/spyre_attn.py:252` inside the OLD prefill factory `_create_compilable_page_attn` (explicitly permitted by criterion 9)
+
+The new mask-caching code (lines 852-862) and the Q=1 decode factory (line 285+) emit zero fallbacks. Gate 3 PASS.
+
+## Pass criteria audit
+1. pytest: 264 passed + 1 flake (unrelated distributed comms probe, passes on re-run). Effective 265 = baseline. ✅
+2. Only `spyre_attn.py` source-modified vs r3-end (+ workflow `progress.md`); `examples/`, `platform.py`, `custom_ops/` byte-identical (git diff empty). ✅
+3. `attention_mask_tiles_device: list[list[torch.Tensor]] | None = None` in `SpyreAttentionMetadata` dataclass block at spyre_attn.py:420. ✅
+4. In `_online_softmax_attention`: `if mask_tiles_all_device is None:` gate at spyre_attn.py:857; `convert(m, device=_target_device)` calls occur only inside the gate (lines 858-861); field assignment `attn_metadata.attention_mask_tiles_device = mask_tiles_all_device` inside gate at line 862; per-seq loop uses cached `mask_tiles_all_device[seq_idx]` at line 909. ✅
+5. `KV_LENGTH_ALIGNMENT = 256` (line 48), `QUERY_CHUNK_SIZE = 32` (line 54). ✅
+6. No `torch.compile` change in `platform.py`. ✅
+7. `_create_compilable_page_attn_decode` at spyre_attn.py:285; `_get_attn_fn` dispatches on `padded_query_len == 1` at spyre_attn.py:729. ✅
+8. All three bench runs printed exactly one `Time elapsed for 120 generated tokens is <T> sec`. ✅
+9. Only pre-existing prefill-kernel line 252 fallback fires; new mask-caching code and decode factory fallback-free. ✅
+10. Median tok/s ≥ 0.7315: 0.8193 / 0.7315 = 1.120× (+12.0%). ✅
+
+## Interpretation
+The change is architecturally correct, correctness-preserving, fallback-free, and produces a measurable same-session speedup. The r1 apparent regression was cross-session drift on a shared host, as the r1 judge feedback hypothesized. Passing.
+
+### Feedback
+
+
