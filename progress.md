@@ -1244,3 +1244,97 @@ Every static criterion and always-on gate is met. The change is minimal, correct
 ### Feedback
 
 
+## Round 7 — Orchestrator
+- **reasoning**: The M2/M5/M6a "cache-redundant-work" pattern is exhausted — every applicable target has been hit. Remaining levers are either risky (M3 output staging: needs mechanism probe; M6c QKV split-on-Spyre: structural change with unclear feasibility) or cheap probes into unmeasured dimensions (M4). M4 is a one-line change that has been on the roadmap since r1 and never actually measured. Given diminishing returns (r4 +9.8% → r5 +5-10% → r6 drift-dominated), a cheap probe of a different structural dimension is the right EV move — either we take a small win, or we get to definitively abandon a lever and free the roadmap for harder work. The criterion allows either outcome (keep or revert) as a passing round, because the value here is the empirical decision, not the specific direction. Same-session A/B with two-triplet warmup control is required per r5/r6 lessons; primary median floor with the alternative-pathway rule per r6 judge precedent. Non-goal fences prevent scope creep into M3/M6b/M6c which need their own dedicated rounds.
+
+### Task
+**Implement M4: probe KV_LENGTH_ALIGNMENT = 256 → 512** in `spyre_inference/v1/attention/backends/spyre_attn.py`.
+
+**Rationale.** After r6, the "cache-redundant-work-across-L-layers" pattern is exhausted. Remaining levers are either risky (M3, M6c) or cheap probes into unmeasured dimensions. M4 is a one-line change we've been deferring since r1 — worth spending a round on it to either take a small win or definitively park the direction.
+
+**What KV_LENGTH_ALIGNMENT does.** In `SpyreAttentionMetadataBuilder.build` (spyre_attn.py:556-558), `aligned_max_seq_len = ceil(max_seq_len / KV_LENGTH_ALIGNMENT) * KV_LENGTH_ALIGNMENT`. Currently 256. `aligned_max_seq_len` is used in `_build_attention_mask` as the KV-side padding dimension, and — critically — participates in the compiled-kernel bucketing via the `(num_blocks, padded_query_len)` key on `_get_attn_fn`. Bench kv_len ranges from ~10 (start of decode) to ~130 (end of 120-token run, plus prompt tokens), so with alignment=256 we sit inside a single compile-tier for the whole run. Bumping to 512 doesn't change bucket count for this bench (still one tier). It *does* change the mask-tile KV dimension inside `_build_attention_mask` — the padding mask has shape `[num_seqs, aligned_max_query_len, aligned_max_seq_len]`, so bumping 256→512 doubles the CPU mask tensor before it's tiled into per-block pieces.
+
+Two hypotheses to test:
+- **H1 (win):** With Q=1 and num_blocks≤2 per step, the per-tile mask work is already O(block_size) not O(aligned_max_seq_len), so bumping alignment doesn't cost anything meaningful on the mask side but may reduce cache-key thrash if a longer bench were run. Neutral or small win.
+- **H2 (loss):** The CPU-side `_build_attention_mask` allocation doubles, and since mask building runs every decode step, we pay the doubling per step. Small regression.
+
+Either way we learn something. If H1: keep. If H2: revert, mark M4 as `abandoned` in roadmap with the empirical reason.
+
+**Concrete edit.** In `spyre_inference/v1/attention/backends/spyre_attn.py`, change:
+
+```python
+KV_LENGTH_ALIGNMENT = 256
+```
+
+to:
+
+```python
+KV_LENGTH_ALIGNMENT = 512
+```
+
+Update the docstring immediately above (lines 43-47) to match:
+
+```python
+# KV length alignment: KV tensors are padded to the next multiple of this value.
+# Because torch.compile treats shapes as static constants, every distinct kv_len
+# triggers a full recompile. Aligning to 512 buckets sequence lengths into tiers
+# (512, 1024, ...) so only the first request at each tier pays compilation cost,
+# rather than recompiling on every decode step.
+```
+
+That's the entire edit. No other lines change.
+
+**Same-session A/B is the only reliable signal here** — cross-session drift will dominate any small effect. The implementer MUST:
+
+1. Checkout `round-6-end` plugin state.
+2. Run three sequential bench invocations: `uv run --no-sync python examples/offline_inference/torch_spyre_inference.py --num-prompts 1`. Record all three tok/s.
+3. Immediately restore HEAD (the M4 change).
+4. Run three more sequential bench invocations. Record all three tok/s.
+5. **Repeat steps 1-4 once more** so we have two triplets each; use the *second* triplet from each branch for the ratio (session-warmup control per r5 judge).
+6. Compute `median(M4 second triplet) / median(round-6-end second triplet)`. This is the primary signal.
+
+If the ratio is ≥ 1.02× (positive signal): keep the change, report perf, mark M4 done in roadmap.
+
+If the ratio is 0.98× to 1.02× (indistinguishable): keep the change but note "no measurable effect" in progress.md. Prefer a change that produces a slightly nicer bucketing property even if perf is neutral — but explicitly say so.
+
+If the ratio is ≤ 0.98× (regression): **revert the change**, submit the branch with `KV_LENGTH_ALIGNMENT = 256` restored, and update roadmap.md to move M4 to the **Abandoned** section with the empirical reason (measured regression at Spyre alignment tier).
+
+**Verification steps (whichever branch state you land on):**
+
+1. `uv run --no-sync pytest -m "not upstream" -q` — 265 passed / 24 skipped / 4 xfailed. In particular `tests/test_spyre_attn.py` must be green; this test builds and exercises the metadata builder against a CPU reference and will detect any incorrect mask-tile dimension.
+
+2. Primary bench: three sequential runs on whatever the final HEAD state is. Report all three tok/s and median.
+
+3. FallbackWarning gate: same bench, redirect stderr, grep. Only the pre-existing `spyre_attn.py:252` (prefill kernel) and `vocab_parallel_embedding.py:78` should fire.
+
+4. Do NOT invoke `--compare-with-cpu`.
+
+**Files touched (should be exactly one source file, plus roadmap.md if abandoning):**
+- `spyre_inference/v1/attention/backends/spyre_attn.py` (either changed to 512 or restored to 256 depending on outcome)
+- `roadmap.md` if the change is reverted (move M4 to Abandoned)
+
+**Non-goals for this round:**
+- Do NOT touch anything except `KV_LENGTH_ALIGNMENT` and its docstring.
+- Do NOT change `QUERY_CHUNK_SIZE`.
+- Do NOT modify any custom_ops.
+- Do NOT modify the example script.
+- Do NOT modify platform.py.
+- Do NOT restructure `_build_attention_mask` or the metadata builder.
+
+### Pass criteria
+1. `uv run --no-sync pytest -m "not upstream" -q` passes with 265 passed (matching the pre-change baseline). No new failures. (A single flaky failure of `tests/test_spyre_comms_native_probes.py` that passes on re-run is acceptable per r4 judge precedent.)
+2. Only `spyre_inference/v1/attention/backends/spyre_attn.py` is source-modified (plus `roadmap.md` / `progress.md` for reporting). `git diff HEAD` scoped to `examples/`, `spyre_inference/platform.py`, `spyre_inference/v1/worker/`, and every file under `spyre_inference/custom_ops/` is empty.
+3. The final state of `spyre_inference/v1/attention/backends/spyre_attn.py` has either `KV_LENGTH_ALIGNMENT = 512` (kept) or `KV_LENGTH_ALIGNMENT = 256` (reverted). Which one is chosen depends on the same-session A/B outcome — but the choice must match progress.md's recommendation.
+4. `QUERY_CHUNK_SIZE = 32` remains unchanged in `spyre_inference/v1/attention/backends/spyre_attn.py`.
+5. `_create_compilable_page_attn_decode` still exists in `spyre_inference/v1/attention/backends/spyre_attn.py` and `SpyreAttentionImpl._get_attn_fn` still dispatches to it when `padded_query_len == 1` (r2 preserved).
+6. `SpyreAttentionMetadata` still has the `attention_mask_tiles_device` field (r4 M2 preserved) and the `query_starts` / `query_ends` / `kv_lens_list` / `page_indices_per_seq` fields (r5 M5 preserved).
+7. `spyre_inference/custom_ops/rms_norm.py` still contains the `_get_device_weight` method and the `_weight_device_cache` / `_weight_cache_src_id` instance attributes (r6 M6a preserved).
+8. `spyre_inference/platform.py` unchanged; no `torch.compile(...)` calls.
+9. Three sequential bench invocations on the final HEAD each print exactly one `Time elapsed for 120 generated tokens is <T> sec` line.
+10. No new `FallbackWarning` origin surfaces in the primary bench run vs round-6-end. Only pre-existing warnings from `_create_compilable_page_attn` at `spyre_attn.py:252` (prefill kernel) and `vocab_parallel_embedding.py:78` are permitted.
+11. Same-session A/B ratio, `median(M4 tok/s second triplet) / median(round-6-end second triplet)`, is reported in `progress.md` alongside all six individual bench times. The final decision (keep at 512 vs revert to 256) is documented, and either:
+    - **Keep case:** ratio ≥ 0.98× (i.e. no material regression) AND same-session A/B or primary median ≥ 0.7315 baseline.
+    - **Revert case:** ratio < 0.98× AND `KV_LENGTH_ALIGNMENT` is restored to 256 in the final source AND `roadmap.md` has M4 moved to the "Abandoned" section with an empirical reason.
+    Either outcome satisfies the criterion; the round produces a clean decision either way.
+12. If the change is kept (KV_LENGTH_ALIGNMENT = 512), `roadmap.md` moves M4 from "in_progress" to "Done" with the measured ratio noted. If reverted, roadmap.md moves M4 to "Abandoned" with the empirical reason.
+

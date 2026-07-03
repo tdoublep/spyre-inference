@@ -16,53 +16,60 @@ Conventions:
 
 ## Bottleneck model (single-prompt decode, `--num-prompts 1`)
 
-Decode steps have `max_query_len=1`. After r1-r5, query padding, per-block
+Decode steps have `max_query_len=1`. After r1-r6, query padding, per-block
 argmax fallback, per-layer mask-tile H2D, per-layer scalar `.item()` sync,
-and measurement noise are all gone. Remaining hot-path costs, ranked by
-expected EV under the "cache-what's-redundant-across-decode-steps" heuristic:
+per-forward RMSNorm weight H2D, and measurement noise are all handled.
+Remaining hot-path costs:
 
-- **[M6a target] Per-forward-call RMSNorm weight H2D.** In
-  `custom_ops/rms_norm.py:201`, every RMSNorm forward transfers
-  `self.weight.data` from CPU to Spyre via `convert()`. The weight is a
-  frozen model Parameter — the transfer produces an identical Spyre-side
-  tensor every call. A 26-layer model with 2 RMSNorms per layer (pre-attn,
-  pre-mlp) executes 52 RMSNorm forwards per decode step; over a 120-token
-  bench that's **6,240 redundant weight H2D transfers per bench**. Same
-  cache-once-reuse-forever pattern that landed M2 (+9.8%). Weight is a
-  Parameter so it's a valid class-attribute lifetime; not per-step
-  metadata like M2, but per-layer-instance lifetime.
-- **[Potential M6b] Same pattern for other model-weight custom ops** —
-  need to audit `custom_ops/rotary_embedding.py`, `custom_ops/silu_and_mul.py`,
-  `custom_ops/vocab_parallel_embedding.py`, `custom_ops/parallel_lm_head.py`
-  for parameters that are re-transferred to Spyre every forward. Defer
-  audit until M6a lands (want the M6a lift measurement clean before
-  bundling further custom-op work).
+- **[M6b/M6c candidates]** RMSNorm `torch.full(x.shape, variance_epsilon, ...)`
+  at rms_norm.py:160 allocates a full x-shaped fp16 buffer every forward
+  call. This is a shape-matched broadcast crutch (comment says "instead of
+  scalar"). If Spyre supports 0-d or scalar broadcast for that add, a
+  size-1 tensor or plain scalar would eliminate the allocation. Needs
+  mechanism-level probe of Spyre add-broadcast semantics.
+- **QKV D→H at custom_ops/linear.py:128.** `SpyreQKVParallelLinear.forward`
+  always pulls the merged QKV result to CPU so downstream `.split()` and
+  `.view()` can run on CPU (Spyre `.split()` on strided views is broken).
+  Every attention layer per decode step → D→H per layer per step.
+  Downstream attention `_online_softmax_attention` then re-transfers Q
+  back to Spyre (`q_dev = convert(q, ...)` at spyre_attn.py:932). Two
+  crossings that could plausibly become zero if the split ran on Spyre.
+  Structural change (M6c).
 - **`output_cpu = zeros_like(output, device="cpu")` staging round-trip**
   in `_online_softmax_attention` (spyre_attn.py:895). Per-layer per-step
   D→H+H→D round-trip on a small tensor. Code comment at 885-894 warns
-  prior scattering attempts corrupted data — needs mechanism-level probe
-  first, so M3 stays parked as risky.
+  prior scattering attempts corrupted data — needs mechanism-level probe.
+  Marked M3, higher risk than the "cache-across-L-layers" class.
 - Compile bucket tiers at every 256-token `kv_len` boundary — post-M0
-  warmup, negligible.
+  warmup, negligible on the timed run. **M4 probes the compile-tier
+  dimension by bumping alignment 256→512.** Cheap one-line probe.
 - Per-token `reshape_and_cache` unrolls a Python loop of length `num_tokens`;
-  fine for decode (num_tokens=1), wasteful in prefill.
+  fine for decode (num_tokens=1), wasteful in prefill. Prefill runs once
+  in warmup + once in the timed run's prompt processing — small relative
+  weight vs 120 decode steps.
 
-## Measurement (fixed r3, sharpened r4-r5)
+## Diminishing returns
 
-Warmup + 120-token bench. CoV 9-19% cross-session but the shared host has
-strong **session-warmup drift** (~10-25% acceleration per triplet through
-the day). Same-session A/B comparison is the reliable signal — the
-implementer must checkout the *previous round's plugin state*, run
-three bench triplets, restore HEAD, and run three more. r5 judge's data:
-- M5 cold triplet 1 (session start): median 0.7135
-- r4-end mid-session triplet: median 0.8226
-- M5 warm triplet 2 (session late): median 0.9017
-Same monotonic drift, so raw first-triplet numbers under-report warm code.
-r5 same-session A/B: 1.096× (+9.6%) confirmed the improvement.
+The M2/M5/M6a series has landed the obvious "redundant work across L
+layers × N steps" targets. Each successive round has smaller signal:
+- M2: +9.8% same-session (mask tiles: ~6,240 H2D avoided, ~5-15KB each)
+- M5: +5-10% same-session (CPU scalar syncs: ~15,600 GIL round-trips)
+- M6a: drift-dominated (RMSNorm weights: ~6,240 H2D, but tensors small
+  ~4KB, and shared-host drift envelope covers the win)
 
-For strict-floor criteria that survive cold-triplet warmup, either
-require a **run-of-warmups** (throw away the first triplet, use the
-second) or lean on the same-session A/B ratio as primary signal.
+Remaining levers are either (a) risky mechanism-level probes (M3,
+attention output staging; M6c, QKV split-on-Spyre), (b) cheap probes
+of unlikely value (M4, KV alignment), or (c) audit-and-sweep passes
+(M6b, other custom_ops).
+
+## Measurement (fixed r3, sharpened r4-r6)
+
+Warmup + 120-token bench. Cross-session drift is real (~10-25% per
+triplet through the machine day). Same-session A/B is the reliable
+signal. For strict-floor criteria that survive cold-triplet warmup:
+either use a run-of-warmups (throw away the first triplet) or lean on
+same-session A/B ratio as primary signal. r6 judge accepted the
+"primary median ≥ baseline OR A/B ≥ 1.02×" alternative-pathway rule.
 
 ## Learnings from previous rounds
 
@@ -74,12 +81,10 @@ second) or lean on the same-session A/B ratio as primary signal.
 - **r4 (M2, done):** cache mask-tile H2D across layers within a step.
   Same-session +9.8%. Established the "cache-across-L-layers" pattern.
 - **r5 (M5, done):** precompute per-seq scalars + page_indices in
-  metadata builder. Same-session +5-10%. Extended the cache pattern to
-  CPU-tensor `.item()` GIL round-trips.
-- **General pattern:** every high-EV win so far has been *removing work
-  that runs L layers × N steps times for identical result*. RMSNorm
-  weight H2D fits that exact template (52 forwards/step × 120 steps =
-  6,240 redundant transfers).
+  metadata builder. Same-session +5-10%.
+- **r6 (M6a, done):** cache RMSNorm weight on Spyre across forward
+  calls. Primary median 0.8477 tok/s (1.159× baseline); same-session
+  A/B drift-dominated but the change is mechanistically clean.
 
 ## Major
 
@@ -90,41 +95,40 @@ second) or lean on the same-session A/B ratio as primary signal.
   +9.8% same-session.
 - **[done] M5: Precompute per-seq scalars and page_indices in the metadata
   builder.** +5-10% same-session.
+- **[done] M6a: Cache RMSNorm weight on Spyre across forward calls.**
 
-- **[in_progress] M6a: Cache RMSNorm weight on Spyre across forward calls.**
-  *Removes ~6,240 redundant per-step weight H2D transfers per bench.*
-  In `SpyreRMSNorm._forward_spyre_impl` (custom_ops/rms_norm.py:167),
-  the `convert(self.weight.data, self._target_device, self._target_dtype)`
-  at line 201 runs every forward call. Weight is a frozen Parameter, so
-  the Spyre-side copy is invariant across calls. Store a Spyre-cached
-  version as an instance attribute (populated lazily on first forward
-  or eagerly in `__init__`); every subsequent forward reads the cached
-  tensor. Include a defensive check that the underlying Parameter
-  hasn't been re-assigned (compare `id(self.weight.data)`).
+- **[in_progress] M4: Try `KV_LENGTH_ALIGNMENT=512`.** *Cheap probe of a
+  dimension we haven't measured.* One-line change:
+  `spyre_attn.py:48` `KV_LENGTH_ALIGNMENT = 256` → `512`. Halves
+  compile-bucket count over kv_len (bench spans kv_len ~8 → 128, one
+  compile tier at 256 currently, would still be one tier at 512).
+  Also changes the mask-tile dimension along the KV axis (256 → 512
+  elements padded) — that's actually a *cost* increase per mask tile,
+  offset only by having fewer distinct tile shapes. For num_seqs=1,
+  the tiles are already per-seq per-num_blocks — the alignment mostly
+  affects `aligned_max_seq_len` used inside `_build_attention_mask`
+  which builds the CPU-side mask. Net effect unknown; that's why it
+  needs empirical probing. If it regresses, revert and mark abandoned.
 
 - **[todo] M3: Eliminate the CPU staging buffer in attention output.**
-  *Removes one Spyre → CPU → Spyre round-trip per attention layer.*
-  Blocked on mechanism-level probing of `torch.ops.spyre.overwrite` per
-  spyre_attn.py:885-894. Higher risk than M2/M5/M6a.
-
-- **[todo] M4: Try `KV_LENGTH_ALIGNMENT=512`.** *Fewer compile buckets.*
-  One-line probe. Lower priority now that warmup absorbs compile cost.
-
+  Blocked on mechanism-level probing of `torch.ops.spyre.overwrite`.
 - **[todo] M6b: Sweep remaining custom_ops for weight/parameter re-transfer
-  patterns.** Candidates: `rotary_embedding.py` (cos/sin caches),
-  `silu_and_mul.py`, `vocab_parallel_embedding.py`,
-  `parallel_lm_head.py`. Do this after M6a to avoid bundling.
-
-- **[todo] M6c: Attention `SpyreQKVParallelLinear` D→H at line 128 of
-  `custom_ops/linear.py`.** QKV output is pulled to CPU because
-  "downstream `.split()` cannot handle strided views on Spyre". If we
-  could do the split on Spyre (or avoid the strided view), the QKV
-  output could stay on device. Investigate — likely a bigger structural
-  change than the M2/M5/M6a class.
+  patterns.** Audit rotary/silu/embedding/lm_head. Rotary is CPU-native
+  (no target). Silu has no weights. Embedding runs once/step. LM head
+  runs once/step with weight already on Spyre. **Low expected value
+  from this sweep on TP=1 single-seq bench.**
+- **[todo] M6c: QKV `.split()` on Spyre.** Structural change to avoid
+  D→H in `SpyreQKVParallelLinear.forward`. Requires torch-spyre op
+  support for strided splits, or a rewrite to do the split before the
+  matmul (splitting weights, not activations).
 
 ## Minor
 
-(none yet)
+- **[todo] Prefill `reshape_and_cache` Python-unrolled loop** —
+  bench doesn't spend meaningful time in prefill.
+- **[todo] RMSNorm `torch.full(x.shape, ...)` epsilon buffer** —
+  size-matched broadcast crutch; scalar or 0-d tensor may work if
+  Spyre semantics allow. Mechanism-level probe needed.
 
 ## Done
 
@@ -133,6 +137,8 @@ second) or lean on the same-session A/B ratio as primary signal.
 - M1' (r2): Q=1 decode kernel (single global softmax, no per-block max).
 - M2 (r4): mask-tile H2D caching across L layers per step (+9.8%).
 - M5 (r5): metadata-builder precompute for CPU-tensor scalars (+5-10%).
+- M6a (r6): RMSNorm weight caching on Spyre (mechanically clean; drift-
+  dominated signal).
 
 ## Parked
 
