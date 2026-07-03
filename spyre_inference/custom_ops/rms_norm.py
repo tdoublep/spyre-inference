@@ -76,6 +76,14 @@ class SpyreRMSNorm(RMSNorm):
 
         self._target_device = torch.device("spyre")
         self._target_dtype = torch.float16
+        # Lazy-populated cache of the RMSNorm weight on the Spyre device.
+        # The weight is a frozen nn.Parameter loaded at model-init and reused
+        # across all forwards; caching the H2D-converted view removes a
+        # per-forward `convert()` (52 RMSNorms × 120 decode steps per bench).
+        # `_weight_cache_src_id` tracks the underlying Parameter identity so
+        # the cache is invalidated if `self.weight` is ever re-assigned.
+        self._weight_device_cache: torch.Tensor | None = None
+        self._weight_cache_src_id: int | None = None
         self.maybe_compiled_forward_spyre = self.maybe_compile(self.forward_spyre)
 
         self._layer_name = register_layer(self, "spyre_rmsnorm")
@@ -164,6 +172,22 @@ class SpyreRMSNorm(RMSNorm):
         else:
             return x, residual
 
+    def _get_device_weight(self) -> torch.Tensor | None:
+        """Return the RMSNorm weight on the Spyre target device, caching it.
+
+        The weight tensor is invariant across forward calls, so the H2D
+        conversion is safe to memoize on the layer instance. `id()` on the
+        underlying `Parameter.data` is used as an identity guard so the
+        cache is refreshed if the parameter is ever swapped out.
+        """
+        if not self.has_weight:
+            return None
+        src = self.weight.data
+        if self._weight_device_cache is None or self._weight_cache_src_id != id(src):
+            self._weight_device_cache = convert(src, self._target_device, self._target_dtype)
+            self._weight_cache_src_id = id(src)
+        return self._weight_device_cache
+
     def _forward_spyre_impl(
         self,
         x: torch.Tensor,
@@ -198,9 +222,7 @@ class SpyreRMSNorm(RMSNorm):
             convert(x, self._target_device, self._target_dtype),
             self.variance_epsilon,
             self.hidden_size,
-            convert(self.weight.data, self._target_device, self._target_dtype)
-            if self.has_weight
-            else None,
+            self._get_device_weight(),
             convert(residual, self._target_device, self._target_dtype)
             if residual is not None
             else None,
