@@ -780,3 +780,121 @@ The change is architecturally correct, correctness-preserving, fallback-free, an
 ### Feedback
 
 
+## Round 5 — Orchestrator
+- **reasoning**: M2 (+9.8% same-session) proved the "hoist redundant per-layer CPU work into the metadata builder" pattern works and is measurable. M5 is the same pattern applied to the next-most-obvious redundant work: four `.item()` / int-of-tensor call sites in the seq loop, each executing L=26 times per decode step for identical results. ~15,600 unnecessary GIL round-trips per bench. Same low-risk profile as M2: no numerics touched, no compile boundaries crossed, no Spyre op behavior depended on. The metadata builder already does one `int(seq_lens[s].item())` for mask tiling, so this consolidates existing patterns rather than introducing new ones. Same-session A/B is required (per r4 lessons about cross-session drift on the shared host) as the reliable verdict signal. M3 (CPU staging buffer) is the other high-EV option but the code comments document prior scattering corruption issues — that needs mechanism-level probing before a change round. M4 (KV alignment) is one-line but low-value post-M0. M5 is the right next step.
+
+### Task
+**Implement M5: precompute per-seq scalars and page_indices in the metadata builder** in `spyre_inference/v1/attention/backends/spyre_attn.py`.
+
+**Bottleneck being addressed.** In `SpyreAttentionImpl._online_softmax_attention` the seq loop (spyre_attn.py:876-914) currently executes these CPU-tensor `.item()` / `int(tensor[i])` calls **per layer per decode step**:
+
+- Line 879: `q_start = int(query_start_loc[seq_idx].item())`
+- Line 880: `q_end = int(query_start_loc[seq_idx + 1].item())`
+- Line 882: `kv_len = int(seq_lens[seq_idx].item())`
+- Line 908: `page_indices = [int(block_table[seq_idx, i]) for i in range(num_blocks_needed)]`
+
+For a 26-layer model with 120 decode steps × num_seqs=1 × ~2 blocks/seq, that's roughly 15,600 `.item()` calls per bench. Every call reads a CPU-tensor header, drops the GIL, and reboxes to a Python int. All are recomputed identically across the L attention layers within one step, because `attn_metadata` is the same shared object per step.
+
+The pattern that landed M2 (+9.8% same-session) applies here: precompute the per-seq scalars once in `SpyreAttentionMetadataBuilder.build` and stash them as plain-Python fields on the metadata. Per-layer forward then reads them via list indexing — no GIL work, no tensor access.
+
+**Concrete edits (all in `spyre_inference/v1/attention/backends/spyre_attn.py`):**
+
+1. Extend the `SpyreAttentionMetadata` dataclass (around spyre_attn.py:286-437) with four new fields, all defaulting to empty lists:
+
+   ```
+   # Precomputed per-seq scalars — populated once by the metadata builder
+   # so each layer's forward pass avoids CPU-tensor `.item()` round-trips.
+   # Shared across all L attention layers within a step.
+   query_starts: list[int] = field(default_factory=list)   # length num_seqs
+   query_ends: list[int] = field(default_factory=list)     # length num_seqs
+   kv_lens_list: list[int] = field(default_factory=list)   # length num_seqs
+   # One list per sequence — page_indices_per_seq[s] has length
+   # ceil(kv_lens_list[s] / block_size).
+   page_indices_per_seq: list[list[int]] = field(default_factory=list)
+   ```
+
+   Note the dataclass currently uses simple defaults (like `attention_mask_tiles: list[list[torch.Tensor]] | None = None`) — you'll need to import `field` from `dataclasses` if it isn't already. `default_factory=list` avoids the mutable-default trap.
+
+2. In `SpyreAttentionMetadataBuilder.build` (around spyre_attn.py:533-612), compute the four new lists before constructing the `SpyreAttentionMetadata`:
+
+   ```
+   # Bulk .tolist() calls: one CPU-tensor materialization each,
+   # amortized over the whole step's L layers.
+   qsl_cpu = query_start_loc.detach().cpu().tolist()
+   query_starts = qsl_cpu[:-1]
+   query_ends = qsl_cpu[1:]
+   kv_lens_list = seq_lens.detach().cpu().tolist()
+   block_table_cpu = block_table.detach().cpu()
+   page_indices_per_seq: list[list[int]] = []
+   for s in range(num_seqs):
+       kv_len_s = kv_lens_list[s]
+       num_blocks_s = (kv_len_s + block_size - 1) // block_size
+       page_indices_per_seq.append(block_table_cpu[s, :num_blocks_s].tolist())
+   ```
+
+   Then pass them into the `SpyreAttentionMetadata(...)` constructor call (the block currently ending at spyre_attn.py:612). Note that the existing mask-tile-building loop at lines 576-585 already calls `int(seq_lens[s].item())` — you can reuse `kv_lens_list[s]` there too, eliminating those `.item()` calls as well.
+
+3. In `SpyreAttentionImpl._online_softmax_attention` (spyre_attn.py:812-935), replace the four call sites:
+
+   - Lines 879-882 become:
+     ```
+     q_start = attn_metadata.query_starts[seq_idx]
+     q_end = attn_metadata.query_ends[seq_idx]
+     query_len = q_end - q_start
+     kv_len = attn_metadata.kv_lens_list[seq_idx]
+     ```
+   - Line 908 becomes:
+     ```
+     page_indices = attn_metadata.page_indices_per_seq[seq_idx]
+     num_blocks_needed = len(page_indices)
+     ```
+     (Note: `num_blocks_needed` derivation moves from `(kv_len + block_size - 1) // block_size` on line 907 to `len(page_indices)` — mathematically equivalent because the builder computes `num_blocks_s = ceil(kv_len_s / block_size)` and slices `block_table[s, :num_blocks_s]`.)
+
+4. Do NOT change any other logic:
+   - Do NOT modify the decode kernel factory `_create_compilable_page_attn_decode` (r2).
+   - Do NOT modify the mask-tile caching from M2.
+   - Do NOT touch `KV_LENGTH_ALIGNMENT`, `QUERY_CHUNK_SIZE`, `_reshape_and_cache`, `SpyrePagedKVCache`, or any factory.
+   - Do NOT touch `platform.py`, `custom_ops/`, or `examples/`.
+
+**Correctness note.** These are all CPU-side scalar computations — the tensors `query_start_loc`, `seq_lens`, and `block_table` are already on CPU (per builder comment at spyre_attn.py:592-593: "since the outer loop of the paged attention implementation runs on the CPU (list-based), most meta-data also remains on CPU"). `.tolist()` is a value-preserving conversion. Existing pytest coverage in `tests/test_spyre_attn.py` exercises the attention path against a CPU reference and will catch any indexing mistake immediately.
+
+**Verification steps the implementer must run:**
+
+1. `uv run --no-sync pytest -m "not upstream" -q` — must pass at 265 passed / 24 skipped / 4 xfailed. No new failures.
+
+2. Same-session A/B (this was the crucial move in r4 to resolve cross-session drift):
+   - Stash the change, or checkout `round-4-end` plugin state.
+   - Run three sequential bench invocations: `uv run --no-sync python examples/offline_inference/torch_spyre_inference.py --num-prompts 1`. Record all three tok/s.
+   - Restore the M5 change (or checkout HEAD).
+   - Run three more sequential bench invocations. Record all three tok/s.
+   - Compute the median of each triplet. Report M5-median / r4-median as the same-session ratio in `progress.md`.
+
+3. Independent primary bench for the judge (three sequential runs on HEAD):
+   `uv run --no-sync python examples/offline_inference/torch_spyre_inference.py --num-prompts 1` × 3. Report all three tok/s and the median.
+
+4. Fallback probe: same bench, redirect stderr, grep for `FallbackWarning` origins. Should be unchanged from r4-end: only `spyre_attn.py:252` (prefill kernel) and `vocab_parallel_embedding.py:78` (pre-existing baseline). The new precompute code must not introduce any new fallback origin.
+
+5. Do NOT invoke `--compare-with-cpu`. Correctness is covered by pytest.
+
+**Files touched (should be exactly one source file):**
+- `spyre_inference/v1/attention/backends/spyre_attn.py`
+
+**Non-goals for this round:**
+- Do NOT touch the CPU staging buffer (M3) — comment at spyre_attn.py:864-873 documents known scattering corruption issues; separate round required.
+- Do NOT change `KV_LENGTH_ALIGNMENT` (M4).
+- Do NOT touch platform.py, custom_ops/, or the example script.
+- Do NOT rewrite `_reshape_and_cache` or either attention factory.
+
+### Pass criteria
+1. `uv run --no-sync pytest -m "not upstream" -q` passes with 265 passed (matching the pre-change baseline). No new failures. (A single flaky failure of `tests/test_spyre_comms_native_probes.py` that passes on re-run is acceptable, per the r4 judge precedent — it's unrelated to attention.)
+2. Only `spyre_inference/v1/attention/backends/spyre_attn.py` is source-modified. `git diff HEAD` scoped to `examples/`, `spyre_inference/platform.py`, and `spyre_inference/custom_ops/` is empty.
+3. `SpyreAttentionMetadata` dataclass in `spyre_inference/v1/attention/backends/spyre_attn.py` declares four new fields for precomputed per-seq data: fields typed roughly as `list[int]` (or equivalent Python-int-list) holding query starts, query ends, and kv lengths, plus a `list[list[int]]`-typed field holding per-sequence page indices. Verifiable by static grep for the field names inside the dataclass block.
+4. `SpyreAttentionMetadataBuilder.build` in `spyre_inference/v1/attention/backends/spyre_attn.py` populates all four new fields before returning the `SpyreAttentionMetadata` instance. Verifiable by static inspection.
+5. In `SpyreAttentionImpl._online_softmax_attention` in `spyre_inference/v1/attention/backends/spyre_attn.py`, the seq loop no longer contains `.item()` calls on `query_start_loc` or `seq_lens`, and no longer contains a list comprehension of the form `[int(block_table[seq_idx, i]) for i in range(...)]`. Verifiable by static grep: after the change, `_online_softmax_attention` must contain zero occurrences of `.item()` and zero occurrences of `int(block_table[`.
+6. `KV_LENGTH_ALIGNMENT = 256` and `QUERY_CHUNK_SIZE = 32` remain unchanged in `spyre_inference/v1/attention/backends/spyre_attn.py`.
+7. `_create_compilable_page_attn_decode` still exists in `spyre_inference/v1/attention/backends/spyre_attn.py` and `SpyreAttentionImpl._get_attn_fn` still dispatches to it when `padded_query_len == 1`.
+8. `SpyreAttentionMetadata` still has the `attention_mask_tiles_device` field introduced in M2, and `_online_softmax_attention` still uses the lazy-populate cache pattern (M2 preserved).
+9. No new `FallbackWarning` origin surfaces in the primary bench run vs round-4-end. Only pre-existing warnings from `_create_compilable_page_attn` at `spyre_attn.py:252` and `vocab_parallel_embedding.py:78` are permitted.
+10. Same-session A/B ratio: `median(M5 tok/s) / median(round-4-end tok/s)` ≥ 1.00 across three-vs-three same-session runs, verifying no regression. A ratio ≥ 1.02× would confirm real signal but is not required. Additionally the median of the three primary un-filtered bench runs on HEAD must be ≥ 0.7315 tok/s (the r3 fixed methodology-baseline floor) — a hard "no regression against the reproducible baseline" gate.
+11. No `torch.compile(...)` calls in `spyre_inference/platform.py`.
+
