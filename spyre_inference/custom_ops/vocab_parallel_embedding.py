@@ -12,11 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre OOT replacement for VocabParallelEmbedding."""
+"""Spyre OOT replacement for VocabParallelEmbedding.
+
+`aten.embedding.default` has no Spyre kernel. torch-spyre's fallback
+(torch_spyre/ops/fallbacks.py) would copy the [vocab, hidden] weight Spyre→CPU
+on every decode step (~955 ms per step for a 384 MiB fp16 vocab-4096 embedding).
+
+To avoid that, `weight` is pinned to CPU, the lookup runs on CPU, and only the
+small input/output tensors cross the device boundary. Both the CPU lookup and
+the mask compute are wrapped in `direct_register_custom_op` (same pattern as
+rotary_embedding) so torch.compile / Dynamo never sees the CPU weight in the
+traced graph — otherwise the torch-spyre inductor pass rejects graph inputs
+that lack a `device_tensor_layout`.
+"""
 
 from functools import lru_cache
 
 import torch
+import torch.nn.functional as F
 
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
@@ -27,6 +40,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     get_masked_input_and_mask,
 )
 from vllm.utils.torch_utils import direct_register_custom_op
+
+from .utils import get_layer, register_layer
 
 logger = init_logger(__name__)
 
@@ -42,8 +57,19 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"SpyreVocabParallelEmbedding does not support quantized "
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
+        # Custom op receives only strings across the torch.compile boundary;
+        # look `self` up via the layer registry inside _vocab_embed_cpu_op_func.
+        self._spyre_layer_name = register_layer(self, "spyre_vocab_embedding")
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
+        # `weight` is pinned to CPU by the model runner after `model.to("spyre")`
+        # (see spyre_model_runner.load_model). Unit tests that call
+        # `layer.to("spyre")` directly don't hit that path — bounce lazily here,
+        # only outside torch.compile (Parameter reassignment isn't traceable).
+        if not torch.compiler.is_compiling() and self.weight.device.type == "spyre":
+            self.weight = torch.nn.Parameter(
+                self.weight.data.to("cpu"), requires_grad=False
+            )
         if self.tp_size > 1:
             masked_input, keep = torch.ops.vllm.spyre_vocab_mask(
                 input_,  # ty: ignore[invalid-argument-type]
@@ -58,12 +84,38 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
             masked_input = input_
             keep = None
 
-        output = self.quant_method.embedding(self, masked_input.long())
+        output = torch.ops.vllm.spyre_vocab_embedding_cpu(
+            masked_input,  # ty: ignore[invalid-argument-type]
+            self._spyre_layer_name,  # ty: ignore[invalid-argument-type]
+        )
 
         if self.tp_size > 1 and keep is not None:
             output = output * keep
             output = tensor_model_parallel_all_reduce(output)
         return output
+
+
+def _vocab_embed_cpu_op_func(
+    input_: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    layer = get_layer(layer_name)
+    target_device = input_.device
+    cpu_input = input_.to("cpu").long()
+    out = F.embedding(cpu_input, layer.weight)
+    return out.to(target_device)
+
+
+def _vocab_embed_cpu_op_fake(
+    input_: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    layer = get_layer(layer_name)
+    return torch.empty(
+        (*input_.shape, layer.weight.shape[1]),
+        dtype=layer.weight.dtype,
+        device=input_.device,
+    )
 
 
 def _vocab_mask_op_func(
@@ -104,7 +156,7 @@ def _vocab_mask_op_fake(
 
 @lru_cache(maxsize=1)
 def register():
-    """Register the spyre_vocab_mask custom op with vLLM."""
+    """Register the vocab-embedding custom ops with vLLM."""
     direct_register_custom_op(
         op_name="spyre_vocab_mask",
         op_func=_vocab_mask_op_func,
@@ -112,4 +164,11 @@ def register():
         mutates_args=[],
         dispatch_key=current_platform.dispatch_key,
     )
-    logger.debug_once("Registered custom op: spyre_vocab_mask")
+    direct_register_custom_op(
+        op_name="spyre_vocab_embedding_cpu",
+        op_func=_vocab_embed_cpu_op_func,
+        fake_impl=_vocab_embed_cpu_op_fake,
+        mutates_args=[],
+        dispatch_key=current_platform.dispatch_key,
+    )
+    logger.debug_once("Registered custom ops: spyre_vocab_mask, spyre_vocab_embedding_cpu")

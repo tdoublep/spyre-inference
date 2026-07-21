@@ -57,6 +57,9 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference.custom_ops.unfuse import analyze_and_unfuse
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.custom_ops.vocab_parallel_embedding import (
+    SpyreVocabParallelEmbedding,
+)
 
 logger = init_logger(__name__)
 
@@ -338,6 +341,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # module (linear, embedding, RMSNorm, SiluAndMul, ParallelLMHead)
         # has its weights moved to Spyre.
         self.model.to(device=self._spyre_device)
+
+        # Pin SpyreVocabParallelEmbedding.weight back to CPU. F.embedding has
+        # no Spyre kernel; torch-spyre's fallback (torch_spyre/ops/fallbacks.py)
+        # would copy the [vocab, hidden] weight Spyre→CPU on every decode step.
+        # Move happens once here, outside torch.compile — the compiled forward
+        # sees a CPU weight and only bounces the small input/output tensors.
+        for module in self.model.modules():
+            if isinstance(module, SpyreVocabParallelEmbedding):
+                module.weight = nn.Parameter(
+                    module.weight.data.to("cpu"), requires_grad=False
+                )
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
