@@ -232,8 +232,8 @@ def _alibi_slopes(num_heads: int) -> list[float]:
 
 def ref_attn(
     query: torch.Tensor,
-    key_cache: list[torch.Tensor],
-    value_cache: list[torch.Tensor],
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
     query_lens: list[int],
     kv_lens: list[int],
     block_tables: torch.Tensor,
@@ -343,12 +343,8 @@ def _run_spyre_attn_test(
     value = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
 
     cache_device = torch.device(configure_device)
-    k_pages_cpu: list[torch.Tensor] = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
-    ]
-    v_pages_cpu: list[torch.Tensor] = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
-    ]
+    k_pages_cpu = torch.zeros(num_blocks, num_kv_heads, block_size, head_size, dtype=dtype)
+    v_pages_cpu = torch.zeros(num_blocks, num_kv_heads, block_size, head_size, dtype=dtype)
 
     cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
         dim=0, dtype=torch.int32
@@ -388,8 +384,8 @@ def _run_spyre_attn_test(
         q_offset += query_len
     slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
-    k_pages: list[torch.Tensor] = [p.to(cache_device) for p in k_pages_cpu]
-    v_pages: list[torch.Tensor] = [p.to(cache_device) for p in v_pages_cpu]
+    k_pages = k_pages_cpu.to(cache_device)
+    v_pages = v_pages_cpu.to(cache_device)
 
     attn_metadata = _build_metadata(
         num_query_heads=num_query_heads,
@@ -912,12 +908,8 @@ def test_sliding_window_none_equivalence(default_vllm_config):
     # Single sequence: query_len=32, kv_len=256
     query_len, kv_len = 32, 256
 
-    k_pages_cpu = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
-    ]
-    v_pages_cpu = [
-        torch.zeros(num_kv_heads, block_size, head_size, dtype=dtype) for _ in range(num_blocks)
-    ]
+    k_pages_cpu = torch.zeros(num_blocks, num_kv_heads, block_size, head_size, dtype=dtype)
+    v_pages_cpu = torch.zeros(num_blocks, num_kv_heads, block_size, head_size, dtype=dtype)
 
     # Pre-populate KV cache
     for i in range(kv_len):

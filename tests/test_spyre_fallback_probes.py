@@ -285,23 +285,21 @@ def test_spyre_fancy_index_tensor(spyre_device):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "Indirectly indexing a dense Spyre tensor by a device index, then "
-        "transposing and using it in torch.matmul, silently produces wrong "
-        "results (layout-propagation bug). The attention backend therefore "
-        "keeps _indirect_matmul_mock, which gathers pages from a Python list "
-        "of per-page tensors. When true indirect access works on Spyre, "
-        "_indirect_matmul_mock can be replaced by direct indexing in "
-        "_create_compilable_page_attn."
+        "A ZERO-DIM scalar device index silently produces wrong results: "
+        "k_pages[torch.tensor(2)] fed through transpose into torch.matmul "
+        "diverges from CPU. A ONE-ELEMENT index tensor works and is what the "
+        "attention backend uses -- see "
+        "test_spyre_indirect_page_gather_one_element_index below. Only this "
+        "0-dim form remains broken."
     ),
 )
 def test_spyre_indirect_matmul_tensor_index(spyre_device):
-    """Index a dense tensor by a device index before matmul (attention gather).
+    """Index a dense tensor by a 0-dim device index before matmul.
 
-    This is the primitive _indirect_matmul_mock emulates with a Python list
-    inside the compiled attention loop:
+    Mirrors the page gather in _create_compilable_page_attn, but with a 0-dim
+    index instead of the one-element index the kernel actually passes:
       k_page = k_pages[page_idx].unsqueeze(1).transpose(-2, -1)
       scores = torch.matmul(q, k_page)
-    where page_idx lives on the Spyre device.
     """
     num_kv_heads = 2
     block_size = 64
@@ -331,6 +329,98 @@ def test_spyre_indirect_matmul_tensor_index(spyre_device):
         q.cpu(),
         k_pages.cpu()[2].unsqueeze(1).transpose(-2, -1),
     )
+    torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
+
+
+@pytest.mark.parametrize("mode", ["eager", "compile"])
+@pytest.mark.parametrize("head_size", [64, 128])
+def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, mode):
+    """Guard the page gather used by SpyreAttentionImpl.
+
+    The index must be a one-element tensor taken as a row slice of a stick-wide
+    table (`table[b, 0:1]`), which is what SpyreAttentionMetadata.page_index_tables
+    provides. Two nearby index forms do NOT work and are deliberately not used:
+      - a 0-dim scalar index (see test_spyre_indirect_matmul_tensor_index), and
+      - a slice of a plain 1-D index tensor, or of a shared table row, which
+        fails to compile rather than returning wrong values.
+
+    index_select works in both modes, so it guards the shape of the gather here.
+    The subscript spelling the kernel uses when compiled is covered by
+    test_spyre_indirect_page_gather_subscript_needs_compile.
+    """
+    num_kv_heads, block_size, num_blocks, query_len = 8, 64, 16, 32
+    int32_elems_per_stick = 32
+    page = 5
+
+    q = torch.randn(num_kv_heads, 1, query_len, head_size, dtype=torch.float16, device=spyre_device)
+    k_pages_cpu = torch.randn(num_blocks, num_kv_heads, block_size, head_size, dtype=torch.float16)
+    k_pages = k_pages_cpu.to(spyre_device)
+
+    table_cpu = torch.zeros(num_blocks, int32_elems_per_stick, dtype=torch.int32)
+    table_cpu[0, 0] = page
+    table = table_cpu.to(spyre_device)
+
+    def page_attn(q, k_pages, table):
+        k_page = k_pages.index_select(0, table[0, 0:1]).squeeze(0).unsqueeze(1)
+        return torch.matmul(q, k_page.transpose(-2, -1))
+
+    if mode == "compile":
+        page_attn = torch.compile(page_attn, dynamic=False)
+
+    scores = page_attn(q, k_pages, table)
+    expected = torch.matmul(q.cpu(), k_pages_cpu[page].unsqueeze(1).transpose(-2, -1))
+    torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "compile",
+        pytest.param(
+            "eager",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "Subscripting a dense Spyre tensor with an int32 index lowers "
+                    "to aten.index, which upcasts to int64: eager fails with "
+                    "'type conversion from torch.int32 to torch.int64'. Inductor "
+                    "folds the conversion away, so the compiled path is fine. "
+                    "_create_compilable_page_attn therefore picks the spelling "
+                    "from its `compiled` flag; if this starts passing, that split "
+                    "can collapse to plain subscripting."
+                ),
+            ),
+        ),
+    ],
+)
+def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
+    """`k_pages[idx]` for the page gather: works compiled, fails eager.
+
+    This asymmetry is why _create_compilable_page_attn takes a `compiled` flag
+    and switches between subscripting and index_select. A compile-only probe
+    would miss it, which is exactly how the eager breakage slipped through once.
+    """
+    num_kv_heads, block_size, head_size, num_blocks, query_len = 8, 64, 128, 16, 32
+    int32_elems_per_stick = 32
+    page = 5
+
+    q = torch.randn(num_kv_heads, 1, query_len, head_size, dtype=torch.float16, device=spyre_device)
+    k_pages_cpu = torch.randn(num_blocks, num_kv_heads, block_size, head_size, dtype=torch.float16)
+    k_pages = k_pages_cpu.to(spyre_device)
+
+    table_cpu = torch.zeros(num_blocks, int32_elems_per_stick, dtype=torch.int32)
+    table_cpu[0, 0] = page
+    table = table_cpu.to(spyre_device)
+
+    def page_attn(q, k_pages, table):
+        k_page = k_pages[table[0, 0:1]].squeeze(0).unsqueeze(1)
+        return torch.matmul(q, k_page.transpose(-2, -1))
+
+    if mode == "compile":
+        page_attn = torch.compile(page_attn, dynamic=False)
+
+    scores = page_attn(q, k_pages, table)
+    expected = torch.matmul(q.cpu(), k_pages_cpu[page].unsqueeze(1).transpose(-2, -1))
     torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
 
 
