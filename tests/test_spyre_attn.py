@@ -456,16 +456,10 @@ def _run_spyre_attn_test(
     else:
         atol, rtol = 0.2, 0.2
 
-    # Raised from 5 with the slot-major cache: a Spyre transfer perturbs fp16 by
-    # up to an ulp either way, but the slot gather and the scatter perturb a
-    # different set of elements than the head-major page slice and the per-run
-    # narrow().copy_() did, and batch_prefill(2seqs) lands 6 elements past the
-    # base tolerance instead of 5. Outliers are still held to the 2x bound below,
-    # so this loosens which elements may be outliers, not by how much.
     assert_close_outliers(
         output.to("cpu"),
         ref_output,
-        max_outliers=8,
+        max_outliers=5,
         atol=atol,
         rtol=rtol,
         outlier_atol=atol * 2,
