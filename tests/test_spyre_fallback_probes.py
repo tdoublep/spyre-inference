@@ -388,11 +388,7 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
                     "Subscripting a dense Spyre tensor with an int32 index lowers "
                     "to aten.index, which upcasts to int64: eager fails with "
                     "'type conversion from torch.int32 to torch.int64'. Inductor "
-                    "folds the conversion away, so the compiled path is fine. "
-                    "_create_compilable_page_attn therefore selects subscript vs "
-                    "index_select from its `compiled` flag; if this starts passing, "
-                    "that split "
-                    "can collapse to plain subscripting."
+                    "folds the conversion away, so the compiled path is fine."
                 ),
             ),
         ),
@@ -401,9 +397,8 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
 def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
     """`k_pages[idx]` for the page gather: works compiled, fails eager.
 
-    This asymmetry is why _create_compilable_page_attn takes a `compiled` flag
-    and switches between subscripting and index_select. A compile-only probe
-    would miss it, which is exactly how the eager breakage slipped through once.
+    This asymmetry is why _create_compilable_page_attn gathers with index_select,
+    which works in both modes.
     """
     num_kv_heads, block_size, head_size, num_blocks, query_len = 8, 64, 128, 16, 32
     int32_elems_per_stick = 32
@@ -429,6 +424,37 @@ def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
         q.cpu(), k_pages_cpu[page].permute(1, 0, 2).unsqueeze(1).transpose(-2, -1)
     )
     torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "A core's share of a gather operand may span at most 256 MB, and the work "
+        "divider splits this shape 4 ways along dim 0, so a 1 GB cache leaves a "
+        "256 MB span and is rejected. This caps one layer's dense KV cache below "
+        "1 GB (~7168 blocks here), which is why test_long_context_model_load is "
+        "skipped. Lifted by chunking the cache or by multi-core indirect access "
+        "(torch-spyre#2725, torch-spyre#3499)."
+    ),
+)
+def test_spyre_dense_cache_gather_per_core_span(spyre_device):
+    """Gather a page from a 1 GB dense KV cache — the long-context cache size.
+
+    The allocation and the host-to-device transfer both succeed; only the gather
+    is rejected, so the limit is on the operand of the page read, not on the
+    cache itself.
+    """
+    num_blocks, block_size, num_kv_heads, head_size = 8192, 64, 8, 128
+
+    k_pages = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=torch.float16).to(
+        spyre_device
+    )
+    table = torch.zeros(1, 32, dtype=torch.int32)
+    table[0, 0] = 3
+    table = table.to(spyre_device)
+
+    k_page = k_pages.index_select(0, table[0, 0:1])
+    assert k_page.cpu().shape == (1, block_size, num_kv_heads, head_size)
 
 
 # ---------------------------------------------------------------------------

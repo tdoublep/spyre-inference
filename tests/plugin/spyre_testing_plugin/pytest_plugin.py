@@ -958,9 +958,11 @@ def patch_backend_list(request, monkeypatch):
 
     monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
 
-    # The upstream helper builds its cache token-major, then transposes to
-    # [num_blocks, num_kv_heads, block_size, 2 * head_size] on the way out.
-    # SpyreAttentionImpl wants token-major (k_pages, v_pages), so undo it.
+    # The upstream helper returns the logical [num_blocks, num_kv_heads, block_size,
+    # 2 * head_size] view that upstream's get_kv_cache_shape advertises; the physical
+    # layout underneath is token-major, which upstream expresses separately via
+    # get_kv_cache_stride_order (NHD). SpyreAttentionBackend advertises the physical
+    # layout directly, so undo the helper's transpose and split K from V.
     orig_run_attention_backend = test_module.run_attention_backend
 
     def patched_run_attention_backend(
