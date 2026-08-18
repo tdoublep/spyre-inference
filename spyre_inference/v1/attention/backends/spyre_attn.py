@@ -230,8 +230,12 @@ def _create_compilable_page_attn(
         tile_output = None
 
         for i in range(num_blocks):
-            # .clone(), not .contiguous(): a table view at storage offset 0 reads
-            # back garbage as a gather index (torch-spyre#3826 family).
+            # .clone(), not .contiguous(): index_select reads only the first
+            # stick (32 int32s) of an index that is a row of a 2-D table, and a
+            # row at storage offset 0 is already contiguous, so .contiguous()
+            # returns the same view (torch-spyre#3851). The clone only fixes it
+            # in eager -- under SPYRE_FORCE_COMPILE_ATTN=1 the gather is still
+            # short.
             slot_ids = slot_index_table[i].clone()
             # index_select, not subscripting: subscripting lowers to aten.index,
             # which upcasts the int32 index to int64 and fails eager.
