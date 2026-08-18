@@ -301,8 +301,7 @@ def test_spyre_indirect_matmul_tensor_index(spyre_device):
       k_page = k_pages[page_idx].unsqueeze(1).transpose(-2, -1)
       scores = torch.matmul(q, k_page)
 
-    Only the index form is under test, so the pages here are already head-major
-    and there is no permute — unlike the real cache, which is token-major.
+    Pages here are head-major, so no permute: only the index form is under test.
     """
     num_kv_heads = 2
     block_size = 64
@@ -364,8 +363,6 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
     table = table_cpu.to(spyre_device)
 
     def page_attn(q, k_pages, table):
-        # Pages are token-major, so the gather is followed by a permute to
-        # head-major, exactly as in _create_compilable_page_attn.
         k_page = k_pages.index_select(0, table[0, 0:1]).squeeze(0).permute(1, 0, 2).unsqueeze(1)
         return torch.matmul(q, k_page.transpose(-2, -1))
 

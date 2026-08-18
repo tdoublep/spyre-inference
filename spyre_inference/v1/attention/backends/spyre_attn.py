@@ -198,9 +198,7 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         target_device,
     ):
         for page_idx, offset, start, stop in slot_runs(block_indices, block_offsets, num_tokens):
-            # A page is [block_size, num_kv_heads, head_size], so a run of tokens is
-            # already in page layout: the slice goes over as-is, one transfer per run.
-            # key/value arrive on CPU because Spyre slicing corrupts memory.
+            # Token-major pages take the run as-is, so no host-side transpose.
             k_run = convert(key[start:stop], target_device)
             v_run = convert(value[start:stop], target_device)
             _overwrite(k_run, k_pages[page_idx], [0], [offset])
@@ -279,9 +277,7 @@ def _create_compilable_page_attn(
             else:
                 k_page = k_pages.index_select(0, page_idx)
                 v_page = v_pages.index_select(0, page_idx)
-            # The gathered page is token-major, [1, block_size, num_kv_heads,
-            # head_size]; bring the head axis to the front for the batched matmuls
-            # below. The permute runs on device without a fallback.
+            # Token-major page to head-major for the matmuls; permutes on device.
             k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
             v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
 

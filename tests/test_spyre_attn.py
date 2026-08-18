@@ -258,8 +258,7 @@ def ref_attn(
         num_kv_blocks = (kv_len + block_size - 1) // block_size
         block_indices = block_tables_np[i, :num_kv_blocks]
 
-        # Gather the sequence's pages. Each block: [block_size, num_kv_heads, head_size],
-        # so concatenating along dim 0 gives [total_tokens, num_kv_heads, head_size].
+        # Pages are token-major, so dim 0 of the concat is the token axis.
         k_blocks = [key_cache[idx] for idx in block_indices]
         v_blocks = [value_cache[idx] for idx in block_indices]
         k = torch.cat(k_blocks, dim=0)[:kv_len]  # [kv_len, num_kv_heads, head_size]

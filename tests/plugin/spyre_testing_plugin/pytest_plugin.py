@@ -958,12 +958,9 @@ def patch_backend_list(request, monkeypatch):
 
     monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
 
-    # The upstream test hands over one kv_cache tensor of
-    # [num_blocks, num_kv_heads, block_size, 2 * head_size] (it builds it
-    # token-major, then transposes to that "logical" layout); SpyreAttentionImpl
-    # wants (k_pages, v_pages), each a dense token-major
-    # [num_blocks, block_size, num_kv_heads, head_size] tensor. So undo that
-    # transpose and split K/V on the last dim.
+    # The upstream helper builds its cache token-major, then transposes to
+    # [num_blocks, num_kv_heads, block_size, 2 * head_size] on the way out.
+    # SpyreAttentionImpl wants token-major (k_pages, v_pages), so undo it.
     orig_run_attention_backend = test_module.run_attention_backend
 
     def patched_run_attention_backend(
