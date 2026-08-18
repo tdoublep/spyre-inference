@@ -156,7 +156,10 @@ def _indirect_matmul_mock(
     is_a_list = isinstance(a, (list, tuple))
     is_b_list = isinstance(b, (list, tuple))
 
-    current_device = a[0].device.type if is_a_list else a.device.type
+    if isinstance(a, (list, tuple)):
+        current_device = a[0].device.type
+    else:
+        current_device = a.device.type
     if current_device == "spyre":
         # constraints for now -> this should change with true indirect access
         # on the cpu, it also works with "true" indirect access, meaning a/b being tensors

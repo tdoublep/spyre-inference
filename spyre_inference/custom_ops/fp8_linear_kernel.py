@@ -27,6 +27,7 @@ tile rows and split fused QKV/gate_up columns. Tile slices are ``clone()``'d
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import cast
 
 import torch
 from torch.nn.parameter import Parameter
@@ -91,15 +92,21 @@ def _compiled_fp8_scaled_mm(
     bias: torch.Tensor | None,
 ) -> torch.Tensor:
     # qfp8wt layout is assigned in this graph; do not pre-quantize weights.
-    x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(x, scale_a)
-    w_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(weight, weight_scale)
+    x_fp8 = torch.ops.spyre.quantize_fp8_with_scale(
+        x,  # ty: ignore[invalid-argument-type]
+        scale_a,  # ty: ignore[invalid-argument-type]
+    )
+    w_fp8 = torch.ops.spyre.quantize_weight_fp8_with_scale(
+        weight,  # ty: ignore[invalid-argument-type]
+        weight_scale,  # ty: ignore[invalid-argument-type]
+    )
     return torch.ops.aten._scaled_mm(
-        x_fp8,
-        w_fp8,
-        scale_a=scale_a,
-        scale_b=weight_scale,
-        bias=bias,
-        out_dtype=torch.float16,
+        x_fp8,  # ty: ignore[invalid-argument-type]
+        w_fp8,  # ty: ignore[invalid-argument-type]
+        scale_a=scale_a,  # ty: ignore[invalid-argument-type]
+        scale_b=weight_scale,  # ty: ignore[invalid-argument-type]
+        bias=bias,  # ty: ignore[invalid-argument-type]
+        out_dtype=torch.float16,  # ty: ignore[invalid-argument-type]
     )
 
 
@@ -192,8 +199,10 @@ if FP8ScaledMMLinearKernel is not None:
             ScaledMMLinearKernel.__init__(self, c, layer_param_names)
 
         def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-            scale = _normalize_weight_scale(layer.weight, layer.weight_scale)
-            layer.weight = Parameter(layer.weight.contiguous(), requires_grad=False)
+            weight = cast(torch.Tensor, layer.weight)
+            weight_scale = cast(torch.Tensor, layer.weight_scale)
+            scale = _normalize_weight_scale(weight, weight_scale)
+            layer.weight = Parameter(weight.contiguous(), requires_grad=False)
             layer.weight_scale = Parameter(scale, requires_grad=False)
 
         def _weight_splits(
@@ -202,7 +211,7 @@ if FP8ScaledMMLinearKernel is not None:
             n_parts = _n_tiles(int(w.shape[1]))
             splits = getattr(layer, "_fp8_n_weight_splits", None)
             if splits is None or len(splits) != len(n_parts):
-                splits = _n_weight_splits(w, layer.weight_scale, n_parts)
+                splits = _n_weight_splits(w, cast(torch.Tensor, layer.weight_scale), n_parts)
                 layer._fp8_n_weight_splits = splits
             return splits
 
@@ -219,7 +228,11 @@ if FP8ScaledMMLinearKernel is not None:
 
             w = getattr(layer, "_fp16_for_qfp8wt", None)
             if w is None or w.device != x2d.device:
-                w = _fp16_weight_for_qfp8wt(layer.weight, layer.weight_scale, x2d.device)
+                w = _fp16_weight_for_qfp8wt(
+                    cast(torch.Tensor, layer.weight),
+                    cast(torch.Tensor, layer.weight_scale),
+                    x2d.device,
+                )
                 layer._fp16_for_qfp8wt = w
 
             k, n = int(w.shape[0]), int(w.shape[1])
@@ -264,20 +277,20 @@ if FP8ScaledMMLinearKernel is not None:
             output_shape: list,
         ) -> torch.Tensor:
             out = torch.ops.aten._scaled_mm(
-                A,
-                B,
-                scale_a=As,
-                scale_b=Bs,
-                bias=bias,
-                out_dtype=out_dtype or torch.float16,
+                A,  # ty: ignore[invalid-argument-type]
+                B,  # ty: ignore[invalid-argument-type]
+                scale_a=As,  # ty: ignore[invalid-argument-type]
+                scale_b=Bs,  # ty: ignore[invalid-argument-type]
+                bias=bias,  # ty: ignore[invalid-argument-type]
+                out_dtype=out_dtype or torch.float16,  # ty: ignore[invalid-argument-type]
             )
             return out.reshape(*output_shape) if output_shape else out
 
     SpyreFp8DequantLinearKernel = SpyreFp8LinearKernel
 
 else:
-    SpyreFp8LinearKernel = None  # type: ignore[misc, assignment]
-    SpyreFp8DequantLinearKernel = None  # type: ignore[misc, assignment]
+    SpyreFp8LinearKernel = None
+    SpyreFp8DequantLinearKernel = None
 
 
 def register_spyre_fp8_linear_kernel() -> bool:

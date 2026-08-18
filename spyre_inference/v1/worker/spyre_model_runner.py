@@ -370,7 +370,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Deliberately swap the Triton JITFunction for the grid-launch-compatible
         # _FuncWrapper; the type mismatch is the point of the patch.
-        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel  # ty: ignore[invalid-assignment]
+        block_table._compute_slot_mapping_kernel = _compute_slot_mapping_kernel
 
     @staticmethod
     def _install_pooling_model_patches(model_config) -> None:
@@ -497,7 +497,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # FP8 apply is dynamo-disabled so the torch-spyre scaled_mm graph
         # stays isolated. fullgraph=True cannot graph-break.
-        uses_fp8 = self._model_has_spyre_fp8(self.model)
+        uses_fp8 = self._model_has_spyre_fp8(cast(nn.Module, self.model))
         t0 = time.time()
         self.model = torch.compile(
             self.model,
