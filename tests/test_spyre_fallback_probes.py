@@ -422,7 +422,7 @@ def test_spyre_inplace_mul_noncontiguous(spyre_device):
 # 7. Attention-result reshape + on-device scatter into output (issue #400)
 # ---------------------------------------------------------------------------
 #
-# These two probes guard the on-device path in
+# These probes guard the on-device path in
 # SpyreAttentionImpl._online_softmax_attention: the attention kernel returns
 # [num_kv_heads, num_queries_per_kv, aligned_q, D] and must become
 # [query_len, num_heads, D] written into the caller's output buffer. The
@@ -486,4 +486,52 @@ def test_spyre_ondevice_scatter_into_output_at_offset(spyre_device):
 
     expected = torch.zeros(num_tokens, num_heads, head_size, dtype=torch.float16)
     expected[q_start : q_start + query_len] = src.cpu()
+    torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "clone",
+        pytest.param(
+            "view",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "A device-to-device slice write copies the source's whole "
+                    "underlying extent instead of the view's size, so a prefix view "
+                    "overwrites rows past the destination slice — corrupting the next "
+                    "sequence in the batch (torch-spyre#3826). .contiguous() does not "
+                    "help: a prefix slice is already contiguous and keeps the same "
+                    "storage. This is why the write-back in "
+                    "SpyreAttentionImpl._online_softmax_attention clones the unpadded "
+                    "result. Once this probe XPASSes, drop that .clone()."
+                ),
+            ),
+        ),
+    ],
+)
+def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
+    """Slice-assign whose source is a prefix view of a longer tensor.
+
+    The attention kernel returns aligned_max_query_len rows and the write-back
+    slices off the padding, so for any sequence shorter than the batch maximum
+    the source is a prefix view rather than an exact-size tensor. Shapes mirror
+    the batch that first exposed this: a 64-token sequence followed by a
+    32-token one, so the short write lands at row 64 of the output.
+    """
+    num_heads, head_size = 32, 128
+    aligned_q, query_len, q_start = 64, 32, 32
+    num_tokens = 96
+
+    output = torch.zeros(num_tokens, num_heads, head_size, dtype=torch.float16, device=spyre_device)
+    result = torch.randn(aligned_q, num_heads, head_size, dtype=torch.float16, device=spyre_device)
+
+    src = result[:query_len]
+    if source == "clone":
+        src = src.clone()
+    output[q_start : q_start + query_len] = src
+
+    expected = torch.zeros(num_tokens, num_heads, head_size, dtype=torch.float16)
+    expected[q_start : q_start + query_len] = result.cpu()[:query_len]
     torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
