@@ -237,7 +237,7 @@ def _create_compilable_page_attn(
         q,
         k_pages,
         v_pages,
-        page_indices,
+        page_index_table,
         mask_tiles,
         scale,
         alibi_bias_tiles=None,
@@ -248,11 +248,14 @@ def _create_compilable_page_attn(
         Expected shapes:
             k_pages: [num_blocks_total, num_kv_heads, block_size, head_size]
             v_pages: [num_blocks_total, num_kv_heads, block_size, head_size]
-            page_indices: list of num_blocks one-element int32 device tensors.
-                Each must be its own allocation at storage_offset 0 — slicing a
-                single index tensor per block (e.g. narrow(0, i, 1)) is rejected
-                on Spyre because an int32 stick is 32 elements, so a one-element
-                slice at offset i is not stick-aligned.
+            page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
+                tensor. Row i holds the i-th active block's absolute page index
+                at column 0, and the loop slices `page_index_table[i, 0:1]` as
+                its gather index. The index must be a one-element slice of a
+                stick-wide row: slicing a plain 1-D index tensor per block (e.g.
+                narrow(0, i, 1)) is rejected on Spyre because an int32 stick is
+                32 elements, so a one-element slice at offset i is not
+                stick-aligned.
             mask_tiles: [num_blocks]
             alibi_bias_tiles: list of [num_kv_heads, num_queries_per_kv, 1, block_size]
                 (only when has_alibi=True; None otherwise). The query-axis dim
@@ -266,16 +269,17 @@ def _create_compilable_page_attn(
         tile_output = None
 
         for i in range(num_blocks):
-            page_idx = page_indices[i]
+            page_idx = page_index_table[i, 0:1]
             # Indirect access: page_idx is a device tensor, so the page read is a
             # real gather (the compiled bundle carries an index tensor) rather
             # than a trace-time constant slice.
             #
-            # The two spellings are not interchangeable. Subscripting lowers to
-            # aten.index, which upcasts the int32 index to int64 — fine once
-            # Inductor has folded the conversion away, but eager hits
-            # "type conversion from torch.int32 to torch.int64" on Spyre.
-            # index_select takes the int32 index as-is in both modes.
+            # Subscripting and index_select are not interchangeable here.
+            # Subscripting lowers to aten.index, which upcasts the int32 index to
+            # int64 — fine once Inductor has folded the conversion away, but eager
+            # hits "type conversion from torch.int32 to torch.int64" on Spyre.
+            # index_select takes the int32 index as-is in both modes, so the
+            # compiled path subscripts and the eager path uses index_select.
             if compiled:
                 k_page = k_pages[page_idx]
                 v_page = v_pages[page_idx]
@@ -459,7 +463,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # torch.compile.
         if self.block_size % 64 != 0:
             raise ValueError(
-                f"block_size must be a multiple of 64 for the list-based attention "
+                f"block_size must be a multiple of 64 for the Spyre paged attention "
                 f"backend. Got block_size={self.block_size}, head_size={self.head_size}. "
             )
 
@@ -886,8 +890,8 @@ class SpyreAttentionBackend(AttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         return [  # ty: ignore[invalid-return-type]
-            (num_blocks, block_size, num_kv_heads, head_size),
-            (num_blocks, block_size, num_kv_heads, head_size),
+            (num_blocks, num_kv_heads, block_size, head_size),
+            (num_blocks, num_kv_heads, block_size, head_size),
         ]
 
     @classmethod
@@ -906,9 +910,12 @@ class SpyreAttentionBackend(AttentionBackend):
 class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     """Online-softmax paged attention iterating over KV pages.
 
-    KV cache is a tuple (k_pages, v_pages) where each is a list of tensors
-    of shape [num_kv_heads, block_size, head_size] on Spyre. No monolithic
-    cache tensor, no gather masks.
+    KV cache is a tuple (k_pages, v_pages) where each is one dense tensor of
+    shape [num_blocks, num_kv_heads, block_size, head_size] on Spyre. The
+    per-page read is an indirect access: the loop indexes the dense tensor with
+    a one-element int32 device tensor from
+    SpyreAttentionMetadata.page_index_tables, so the compiled bundle carries a
+    real index tensor rather than a trace-time constant slice. No gather masks.
 
     On Spyre, the per-page attention loop and reshape_and_cache are compiled
     via torch.compile with fixed iteration counts. A dict
@@ -962,7 +969,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._reshape_fns: dict[int, object] = {}
         self._attn_fns: dict[tuple[int, int], object] = {}
 
-        logger.debug_once("Using SpyreAttentionBackend with LIST-BASED online softmax")
+        logger.debug_once(
+            "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
+        )
 
     def _get_reshape_fn(self, num_tokens: int):
         if num_tokens not in self._reshape_fns:
@@ -983,7 +992,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     has_alibi=self.alibi_slopes is not None,
                     logits_soft_cap=self.logits_soft_cap,
                     # Must track _maybe_compile: it decides whether this kernel is
-                    # compiled, and that decides which page-gather spelling works.
+                    # compiled, and that decides whether the page gather can
+                    # subscript or must use index_select.
                     compiled=_FORCE_COMPILE_ATTN,
                 )
             )
@@ -1111,8 +1121,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """FlashAttention-style online softmax iterating over KV pages (varlen).
 
         Handles multiple sequences using query_start_loc for the varlen layout.
-        Each k_page/v_page is [num_kv_heads, block_size, head_size] — a complete
-        tensor on Spyre, passed to bmm directly without slicing.
+        k_pages/v_pages are dense [num_blocks, num_kv_heads, block_size,
+        head_size] tensors on Spyre; each iteration gathers one page with a
+        one-element int32 device index, then feeds it to bmm without slicing.
 
         Writes results directly into the caller's output buffer in-place.
 
@@ -1209,12 +1220,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 output[q_start:q_end] = 0.0
                 continue
 
-            # Row slices of the per-sequence page-index table, which was built on
-            # the host once per step and transferred once per step. A row slice is
-            # what the kernel's gather accepts: slicing a plain 1-D index tensor
-            # per block is rejected, even at a stick-aligned offset.
+            # The per-sequence page-index table, built on the host once per step
+            # and transferred once per step. The kernel takes the whole table and
+            # slices row i itself, so the row slices stay inside the compiled
+            # graph instead of becoming num_blocks separate graph inputs.
             page_index_table = page_index_tables[seq_idx]
-            page_indices = [page_index_table[i, 0:1] for i in range(len(active_bs))]
             # mask_tiles_all[seq_idx] is indexed by position within active_bs.
             mask_tiles = [
                 convert(mask_tiles_all[seq_idx][i], device=_target_device)
@@ -1256,7 +1266,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 q_dev,
                 k_pages,
                 v_pages,
-                page_indices,
+                page_index_table,
                 mask_tiles,
                 self.scale,
                 alibi_bias_tiles=alibi_bias_tiles,

@@ -345,7 +345,7 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
         fails to compile rather than returning wrong values.
 
     index_select works in both modes, so it guards the shape of the gather here.
-    The subscript spelling the kernel uses when compiled is covered by
+    The subscript form the kernel uses when compiled is covered by
     test_spyre_indirect_page_gather_subscript_needs_compile.
     """
     num_kv_heads, block_size, num_blocks, query_len = 8, 64, 16, 32
@@ -385,8 +385,9 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
                     "to aten.index, which upcasts to int64: eager fails with "
                     "'type conversion from torch.int32 to torch.int64'. Inductor "
                     "folds the conversion away, so the compiled path is fine. "
-                    "_create_compilable_page_attn therefore picks the spelling "
-                    "from its `compiled` flag; if this starts passing, that split "
+                    "_create_compilable_page_attn therefore selects subscript vs "
+                    "index_select from its `compiled` flag; if this starts passing, "
+                    "that split "
                     "can collapse to plain subscripting."
                 ),
             ),

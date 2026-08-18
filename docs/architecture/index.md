@@ -94,15 +94,17 @@ in the attention backend, where offset > 0 views still corrupt on transfer (see
 ## Attention Backend
 
 The `SpyreAttentionBackend` implements paged attention using pure PyTorch operations
-(no custom CUDA kernels). The KV cache is a list of per-page tensors on Spyre — each
-page is `[num_kv_heads, block_size, head_size]` — rather than a monolithic tensor. It
-runs a FlashAttention-style online softmax that iterates over pages without any
-compact-gather step:
+(no custom CUDA kernels). The KV cache is one dense tensor per layer on Spyre,
+`[num_blocks, num_kv_heads, block_size, head_size]` — the shape
+`SpyreAttentionBackend.get_kv_cache_shape` advertises. It runs a FlashAttention-style
+online softmax that iterates over pages without any compact-gather step, reading each
+page by indexing the dense tensor with a one-element int32 device tensor (an indirect
+access, so the compiled bundle carries a real index rather than a constant slice):
 
 | Step | Device | Operation |
 |---|---|---|
 | 1. q/k/v → CPU | CPU | Bring `q`, `k`, `v` to CPU once (Spyre slicing corrupts strided views) |
-| 2. Reshape & cache | Spyre | Per-token overwrite of new K/V into the list-of-pages cache |
+| 2. Reshape & cache | Spyre | Per-token overwrite of new K/V into the dense paged cache |
 | 3. Per-sequence varlen loop | CPU | Iterate sequences via `query_start_loc`, pad `query_len` to 32 |
 | 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, padded_query_len)` kernel: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 5. Write-back | CPU → Spyre | Stage each sequence's result into a CPU buffer, then one bulk copy into the Spyre output (per-token `spyre.overwrite` scatter doesn't scale) |
