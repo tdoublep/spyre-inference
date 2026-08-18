@@ -338,7 +338,7 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
     """Guard the page gather used by SpyreAttentionImpl.
 
     The index must be a one-element tensor taken as a row slice of a stick-wide
-    table (`table[b, 0:1]`), which is what SpyreAttentionMetadata.page_index_tables
+    table (`table[b, 0:1]`), which is what SpyreAttentionMetadata.page_index_table
     provides. Two nearby index forms do NOT work and are deliberately not used:
       - a 0-dim scalar index (see test_spyre_indirect_matmul_tensor_index), and
       - a slice of a plain 1-D index tensor, or of a shared table row, which

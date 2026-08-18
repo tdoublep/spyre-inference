@@ -88,7 +88,7 @@ ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE = 128
 
 # Elements per stick for int32 (128-byte stick / 4 bytes). Page-index rows are
 # padded to this width so each row starts on a stick boundary; see
-# SpyreAttentionMetadata.page_index_tables.
+# SpyreAttentionMetadata.page_index_table.
 INT32_ELEMS_PER_STICK = 32
 
 
@@ -416,22 +416,30 @@ class SpyreAttentionMetadata(AttentionMetadata):
     aligned_max_seq_len: int = 0
 
     # Per-sequence page-index table, one row per active block:
-    # [num_active_blocks, INT32_ELEMS_PER_STICK] int32, column 0 holding that
-    # block's absolute page index (row order matches attention_mask_tiles[s]).
+    # [num_seqs, max_active_blocks, INT32_ELEMS_PER_STICK] int32, with
+    # [s, b, 0] holding sequence s's b-th active block's absolute page index
+    # (row order matches attention_mask_tiles[s]). Sequences with fewer active
+    # blocks than the max leave their trailing rows zero; the kernel only reads
+    # rows 0..num_blocks-1 for the sequence it was given, so they are never
+    # touched.
     #
     # The kernel takes its gather index as the row slice `table[b, 0:1]`. Each
     # index has to sit alone at column 0 of a stick-wide row: sharing a row
     # across blocks does not compile, which is also why the canonical
     # `block_table_tensor` cannot be indexed directly even when device-resident.
+    # Padding rows to a full stick also keeps each sequence's sub-table
+    # stick-aligned, since its offset is a whole number of stick-wide rows.
     #
-    # `page_index_tables_cpu` is built once per step by the metadata builder;
-    # `page_index_tables` is its device mirror, filled by the first layer's
+    # One dense tensor rather than a list of per-sequence tables so the mirror
+    # below is a single transfer per step instead of one per sequence.
+    #
+    # `page_index_table_cpu` is built once per step by the metadata builder;
+    # `page_index_table` is its device mirror, filled by the first layer's
     # forward() and reused by the rest (every layer in a step shares this
-    # instance), so the tables cost one transfer per sequence per step. The
-    # builder cannot fill it: it is constructed with the runner's device, which
-    # is CPU, while the KV pages live on Spyre.
-    page_index_tables_cpu: list[torch.Tensor] | None = None
-    page_index_tables: list[torch.Tensor] | None = None
+    # instance). The builder cannot fill it: it is constructed with the runner's
+    # device, which is CPU, while the KV pages live on Spyre.
+    page_index_table_cpu: torch.Tensor | None = None
+    page_index_table: torch.Tensor | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:
@@ -806,24 +814,29 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         slot_block_indices = (sm_cpu // self.block_size).tolist()
         slot_block_offsets = (sm_cpu % self.block_size).tolist()
 
-        # Page-index table per sequence, built once here so the per-layer forward
-        # neither reads block_table element-by-element on the host nor transfers a
-        # tensor per block. Row b holds the absolute page index of the b-th active
-        # block; the row width pads each row onto a stick boundary so the kernel can
-        # slice `table[b, 0:1]` as its gather index.
+        # Page-index table, built once here so the per-layer forward neither reads
+        # block_table element-by-element on the host nor transfers a tensor per
+        # block. [s, b, 0] holds the absolute page index of sequence s's b-th
+        # active block; the row width pads each row onto a stick boundary so the
+        # kernel can slice `table[b, 0:1]` as its gather index.
         bt_cpu = block_table.detach().cpu()
-        page_index_tables_cpu: list[torch.Tensor] = []
+        blocks_per_seq: list[list[int]] = []
         for s in range(num_seqs):
-            kv_len_s = int(seq_lens[s].item())
-            num_blocks_s = (kv_len_s + block_size - 1) // block_size
             if active_block_indices is not None:
-                blocks_s = active_block_indices[s]
+                blocks_per_seq.append(active_block_indices[s])
             else:
-                blocks_s = list(range(num_blocks_s))
-            table = torch.zeros(max(len(blocks_s), 1), INT32_ELEMS_PER_STICK, dtype=torch.int32)
-            for pos, b in enumerate(blocks_s):
-                table[pos, 0] = int(bt_cpu[s, b])
-            page_index_tables_cpu.append(table)
+                kv_len_s = int(seq_lens[s].item())
+                blocks_per_seq.append(list(range((kv_len_s + block_size - 1) // block_size)))
+        max_active_blocks = max((len(b) for b in blocks_per_seq), default=0)
+        page_index_table_cpu = torch.zeros(
+            max(num_seqs, 1),
+            max(max_active_blocks, 1),
+            INT32_ELEMS_PER_STICK,
+            dtype=torch.int32,
+        )
+        for s, blocks_s in enumerate(blocks_per_seq):
+            if blocks_s:
+                page_index_table_cpu[s, : len(blocks_s), 0] = bt_cpu[s, blocks_s].to(torch.int32)
 
         # NOTE: the per-sequence/per-block outer loop of the paged attention
         #  implementation is driven from the host, so most metadata stays on CPU
@@ -844,7 +857,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             num_heads=self.num_heads,
             attention_mask_tiles=attention_mask_tiles,
             active_block_indices=active_block_indices,
-            page_index_tables_cpu=page_index_tables_cpu,
+            page_index_table_cpu=page_index_table_cpu,
             aligned_max_query_len=aligned_max_query_len,
             aligned_max_seq_len=aligned_max_seq_len,
         )
@@ -914,7 +927,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     shape [num_blocks, num_kv_heads, block_size, head_size] on Spyre. The
     per-page read is an indirect access: the loop indexes the dense tensor with
     a one-element int32 device tensor from
-    SpyreAttentionMetadata.page_index_tables, so the compiled bundle carries a
+    SpyreAttentionMetadata.page_index_table, so the compiled bundle carries a
     real index tensor rather than a trace-time constant slice. No gather masks.
 
     On Spyre, the per-page attention loop and reshape_and_cache are compiled
@@ -1026,13 +1039,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _target_device = k_pages.device
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Mirror the page-index tables onto the device. Only the first layer of a
+        # Mirror the page-index table onto the device. Only the first layer of a
         # step pays this; the rest see the field already populated.
-        if attn_metadata.page_index_tables is None:
-            assert attn_metadata.page_index_tables_cpu is not None
-            attn_metadata.page_index_tables = [
-                convert(t, device=_target_device) for t in attn_metadata.page_index_tables_cpu
-            ]
+        if attn_metadata.page_index_table is None:
+            assert attn_metadata.page_index_table_cpu is not None
+            attn_metadata.page_index_table = convert(
+                attn_metadata.page_index_table_cpu, device=_target_device
+            )
 
         # Spyre slicing corrupts memory, so bring k/v to CPU for slicing.
         # Query handling depends on whether we can stay on device:
@@ -1149,11 +1162,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         mask_tiles_all = attn_metadata.attention_mask_tiles
         active_block_indices_all = attn_metadata.active_block_indices
         aligned_max_query_len = attn_metadata.aligned_max_query_len
-        page_index_tables = attn_metadata.page_index_tables
+        page_index_table_all = attn_metadata.page_index_table
         assert mask_tiles_all is not None, (
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
-        assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
+        assert page_index_table_all is not None, "page_index_table must be mirrored by forward()"
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
@@ -1220,11 +1233,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 output[q_start:q_end] = 0.0
                 continue
 
-            # The per-sequence page-index table, built on the host once per step
-            # and transferred once per step. The kernel takes the whole table and
-            # slices row i itself, so the row slices stay inside the compiled
-            # graph instead of becoming num_blocks separate graph inputs.
-            page_index_table = page_index_tables[seq_idx]
+            # This sequence's sub-table of the one dense page-index table, built
+            # on the host and transferred once per step. The kernel takes the
+            # whole sub-table and slices row i itself, so the row slices stay
+            # inside the compiled graph instead of becoming num_blocks separate
+            # graph inputs.
+            page_index_table = page_index_table_all[seq_idx]
             # mask_tiles_all[seq_idx] is indexed by position within active_bs.
             mask_tiles = [
                 convert(mask_tiles_all[seq_idx][i], device=_target_device)
