@@ -67,8 +67,8 @@ def configure_compilation(request, monkeypatch):
     original_limit = torch._dynamo.config.accumulated_recompile_limit
 
     cfg.mode = compilation_mode
-    # Increase recompilation limit to handle list-based page_indices
-    # which trigger recompilation on each unique block index value
+    # Increase recompilation limit: the page-attention kernel is specialized
+    # (and so recompiled) per unique (num_blocks, padded_query_len)
     torch._dynamo.config.accumulated_recompile_limit = 1024
 
     yield mode_name
@@ -820,7 +820,7 @@ def test_spyre_attn_mqa(
 def test_block_size_validation():
     """Test that SpyreAttentionMetadataBuilder validates block_size alignment.
 
-    The list-based attention backend requires block_size to be a multiple of 64
+    The Spyre paged attention backend requires block_size to be a multiple of 64
     for proper stick alignment during torch.compile. This test verifies the
     validation raises ValueError for invalid block sizes and accepts valid ones.
     """

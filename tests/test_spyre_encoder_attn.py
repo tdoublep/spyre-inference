@@ -66,8 +66,8 @@ def configure_compilation(request, monkeypatch):
     original_limit = torch._dynamo.config.accumulated_recompile_limit
 
     cfg.mode = compilation_mode
-    # Increase recompilation limit to handle list-based page_indices
-    # which trigger recompilation on each unique block index value
+    # Increase recompilation limit: the page-attention kernel is specialized
+    # (and so recompiled) per unique (num_blocks, padded_query_len)
     torch._dynamo.config.accumulated_recompile_limit = 1024
 
     yield mode_name
