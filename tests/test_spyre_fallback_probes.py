@@ -340,8 +340,9 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
     """Guard the page gather used by SpyreAttentionImpl.
 
     The index must be a one-element tensor taken as a row slice of a stick-wide
-    table (`table[b, 0:1]`), which is what SpyreAttentionMetadata.page_index_table
-    provides. Two nearby index forms do NOT work and are deliberately not used:
+    table (`table[b, 0:1]`). The attention kernel now gathers a whole row of slot
+    ids instead, but the constraint still holds for any single-page index.
+    Two nearby index forms do NOT work:
       - a 0-dim scalar index (see test_spyre_indirect_matmul_tensor_index), and
       - a slice of a plain 1-D index tensor, or of a shared table row, which
         fails to compile rather than returning wrong values.
@@ -675,3 +676,104 @@ def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
     expected = torch.zeros(num_tokens, num_heads, head_size, dtype=torch.float16)
     expected[q_start : q_start + query_len] = result.cpu()[:query_len]
     torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# 8. Slot-major KV cache: the indirect scatter write
+# ---------------------------------------------------------------------------
+
+
+def _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device, pinned):
+    """A zeroed slot-major KV cache, with or without the slot-outermost pin."""
+    from spyre_inference.v1.attention.backends.spyre_attn import slot_major_kv_layout
+
+    base = torch.zeros(num_slots, num_kv_heads, head_size, dtype=torch.float16)
+    if not pinned:
+        return base.to(spyre_device)
+    # Prime torch-spyre autoload: .to(device_layout=) needs a live RuntimeContext,
+    # which a plain .to() would set up for us.
+    torch.empty(1, device=spyre_device)
+    layout = slot_major_kv_layout(num_slots, num_kv_heads, head_size, torch.float16)
+    return base.to(spyre_device, device_layout=layout)
+
+
+@pytest.mark.parametrize(
+    "pinned",
+    [
+        True,
+        pytest.param(
+            False,
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "On the default device layout index_copy_ writes to the wrong "
+                    "rows and raises nothing (torch-spyre#3705, fixed by #3409 but "
+                    "not yet in our pin). Negative control for slot_major_kv_layout: "
+                    "this XPASSes once the pin includes the fix, at which point the "
+                    "pinned layout and the host allocate-then-transfer can both go."
+                ),
+            ),
+        ),
+    ],
+)
+def test_spyre_slot_major_scatter_needs_pinned_layout(spyre_device, pinned):
+    """The reshape_and_cache scatter hits exactly slot_mapping, and only when
+    the cache is slot-outermost."""
+    num_blocks, block_size, num_kv_heads, head_size = 8, 64, 8, 128
+    num_slots = num_blocks * block_size
+
+    # Spanning pages and out of order, as a real slot_mapping can be.
+    slots = torch.tensor([5, 70, 71, 300, 200, 201, 202, 511], dtype=torch.int32)
+    kv_cpu = torch.randn(slots.numel(), num_kv_heads, head_size, dtype=torch.float16)
+
+    def scatter(pages, index, src):
+        pages.index_copy_(0, index, src)
+
+    pages = _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device, pinned)
+    torch.compile(scatter, dynamic=False)(pages, slots.to(spyre_device), kv_cpu.to(spyre_device))
+
+    expected = torch.zeros(num_slots, num_kv_heads, head_size, dtype=torch.float16)
+    expected[slots.long()] = kv_cpu
+    got = pages.cpu()
+
+    written = got.ne(0).any(-1).any(-1).nonzero().flatten().tolist()
+    assert written == sorted(slots.tolist()), f"scatter hit the wrong rows: {written}"
+    torch.testing.assert_close(got, expected, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "compile",
+        pytest.param(
+            "eager",
+            marks=pytest.mark.xfail(
+                strict=True,
+                reason=(
+                    "index_copy_ has no eager on-device path: an int32 index is "
+                    "rejected, an int64 one falls back to CPU. This is why "
+                    "_get_reshape_fn compiles unconditionally."
+                ),
+            ),
+        ),
+    ],
+)
+def test_spyre_slot_major_scatter_needs_compile(spyre_device, mode):
+    """The write kernel must be compiled; eager either raises or leaves the device."""
+    num_slots, num_kv_heads, head_size = 512, 8, 128
+    slots = torch.arange(64, 96, dtype=torch.int32)
+    kv_cpu = torch.randn(slots.numel(), num_kv_heads, head_size, dtype=torch.float16)
+
+    def scatter(pages, index, src):
+        pages.index_copy_(0, index, src)
+
+    if mode == "compile":
+        scatter = torch.compile(scatter, dynamic=False)
+
+    pages = _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device, pinned=True)
+    scatter(pages, slots.to(spyre_device), kv_cpu.to(spyre_device))
+
+    assert pages.device.type == "spyre", "scatter left the device"
+    expected = torch.zeros(num_slots, num_kv_heads, head_size, dtype=torch.float16)
+    expected[slots.long()] = kv_cpu
+    torch.testing.assert_close(pages.cpu(), expected, atol=1e-2, rtol=1e-2)
