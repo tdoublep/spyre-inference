@@ -962,7 +962,8 @@ def patch_backend_list(request, monkeypatch):
     # 2 * head_size] view that upstream's get_kv_cache_shape advertises; the physical
     # layout underneath is token-major, which upstream expresses separately via
     # get_kv_cache_stride_order (NHD). SpyreAttentionBackend advertises the physical
-    # layout directly, so undo the helper's transpose and split K from V.
+    # layout directly, so undo the helper's transpose and split K from V into
+    # slot-major pages.
     orig_run_attention_backend = test_module.run_attention_backend
 
     def patched_run_attention_backend(
@@ -981,12 +982,32 @@ def patch_backend_list(request, monkeypatch):
         kv_cache_dtype="auto",
     ):
         if backend == AttentionBackendEnum.CUSTOM:
+            from spyre_inference.v1.attention.backends.spyre_attn import (
+                slot_major_kv_layout,
+            )
+
             # K and V are concatenated on the last dim.
-            head_size = kv_cache.shape[-1] // 2
-            kv_cache = kv_cache.transpose(1, 2)
-            k_blocks = kv_cache[..., :head_size].contiguous()
-            v_blocks = kv_cache[..., head_size:].contiguous()
-            kv_cache = (k_blocks, v_blocks)
+            num_blocks, num_kv_heads, block_size, twice_head = kv_cache.shape
+            head_size = twice_head // 2
+            num_slots = num_blocks * block_size
+
+            def to_slot_major(blocks):
+                # block_size next to num_blocks so the two flatten into the slot axis.
+                flat = blocks.permute(0, 2, 1, 3).contiguous()
+                flat = flat.reshape(num_slots, num_kv_heads, head_size)
+                if flat.device.type != "spyre":
+                    return flat
+                return flat.cpu().to(
+                    flat.device,
+                    device_layout=slot_major_kv_layout(
+                        num_slots, num_kv_heads, head_size, flat.dtype
+                    ),
+                )
+
+            kv_cache = (
+                to_slot_major(kv_cache[..., :head_size]),
+                to_slot_major(kv_cache[..., head_size:]),
+            )
         return orig_run_attention_backend(
             backend,
             kv_cache_spec,
