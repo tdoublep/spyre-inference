@@ -958,11 +958,12 @@ def patch_backend_list(request, monkeypatch):
 
     monkeypatch.setattr(test_module, "_test_backend_correctness", tbc_wrapper)
 
-    # The upstream test allocates one kv_cache tensor of
-    # [num_blocks, num_kv_heads, block_size, 2 * head_size]; SpyreAttentionImpl
-    # wants (k_pages, v_pages), each a dense
-    # [num_blocks, num_kv_heads, block_size, head_size] tensor. Only the K/V
-    # split on the last dim is needed — the leading dims already match.
+    # The upstream test hands over one kv_cache tensor of
+    # [num_blocks, num_kv_heads, block_size, 2 * head_size] (it builds it
+    # token-major, then transposes to that "logical" layout); SpyreAttentionImpl
+    # wants (k_pages, v_pages), each a dense token-major
+    # [num_blocks, block_size, num_kv_heads, head_size] tensor. So undo that
+    # transpose and split K/V on the last dim.
     orig_run_attention_backend = test_module.run_attention_backend
 
     def patched_run_attention_backend(
@@ -983,6 +984,7 @@ def patch_backend_list(request, monkeypatch):
         if backend == AttentionBackendEnum.CUSTOM:
             # K and V are concatenated on the last dim.
             head_size = kv_cache.shape[-1] // 2
+            kv_cache = kv_cache.transpose(1, 2)
             k_blocks = kv_cache[..., :head_size].contiguous()
             v_blocks = kv_cache[..., head_size:].contiguous()
             kv_cache = (k_blocks, v_blocks)

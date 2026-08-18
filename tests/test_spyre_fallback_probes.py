@@ -353,7 +353,7 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
     page = 5
 
     q = torch.randn(num_kv_heads, 1, query_len, head_size, dtype=torch.float16, device=spyre_device)
-    k_pages_cpu = torch.randn(num_blocks, num_kv_heads, block_size, head_size, dtype=torch.float16)
+    k_pages_cpu = torch.randn(num_blocks, block_size, num_kv_heads, head_size, dtype=torch.float16)
     k_pages = k_pages_cpu.to(spyre_device)
 
     table_cpu = torch.zeros(num_blocks, int32_elems_per_stick, dtype=torch.int32)
@@ -361,14 +361,18 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
     table = table_cpu.to(spyre_device)
 
     def page_attn(q, k_pages, table):
-        k_page = k_pages.index_select(0, table[0, 0:1]).squeeze(0).unsqueeze(1)
+        # Pages are token-major, so the gather is followed by a permute to
+        # head-major, exactly as in _create_compilable_page_attn.
+        k_page = k_pages.index_select(0, table[0, 0:1]).squeeze(0).permute(1, 0, 2).unsqueeze(1)
         return torch.matmul(q, k_page.transpose(-2, -1))
 
     if mode == "compile":
         page_attn = torch.compile(page_attn, dynamic=False)
 
     scores = page_attn(q, k_pages, table)
-    expected = torch.matmul(q.cpu(), k_pages_cpu[page].unsqueeze(1).transpose(-2, -1))
+    expected = torch.matmul(
+        q.cpu(), k_pages_cpu[page].permute(1, 0, 2).unsqueeze(1).transpose(-2, -1)
+    )
     torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
 
 
@@ -406,7 +410,7 @@ def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
     page = 5
 
     q = torch.randn(num_kv_heads, 1, query_len, head_size, dtype=torch.float16, device=spyre_device)
-    k_pages_cpu = torch.randn(num_blocks, num_kv_heads, block_size, head_size, dtype=torch.float16)
+    k_pages_cpu = torch.randn(num_blocks, block_size, num_kv_heads, head_size, dtype=torch.float16)
     k_pages = k_pages_cpu.to(spyre_device)
 
     table_cpu = torch.zeros(num_blocks, int32_elems_per_stick, dtype=torch.int32)
@@ -414,14 +418,16 @@ def test_spyre_indirect_page_gather_subscript_needs_compile(spyre_device, mode):
     table = table_cpu.to(spyre_device)
 
     def page_attn(q, k_pages, table):
-        k_page = k_pages[table[0, 0:1]].squeeze(0).unsqueeze(1)
+        k_page = k_pages[table[0, 0:1]].squeeze(0).permute(1, 0, 2).unsqueeze(1)
         return torch.matmul(q, k_page.transpose(-2, -1))
 
     if mode == "compile":
         page_attn = torch.compile(page_attn, dynamic=False)
 
     scores = page_attn(q, k_pages, table)
-    expected = torch.matmul(q.cpu(), k_pages_cpu[page].unsqueeze(1).transpose(-2, -1))
+    expected = torch.matmul(
+        q.cpu(), k_pages_cpu[page].permute(1, 0, 2).unsqueeze(1).transpose(-2, -1)
+    )
     torch.testing.assert_close(scores.cpu(), expected, atol=1e-1, rtol=5e-2)
 
 

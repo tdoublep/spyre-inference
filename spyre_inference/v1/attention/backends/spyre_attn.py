@@ -96,7 +96,7 @@ class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
 
     Each field is one dense tensor of shape
-    [num_blocks, num_kv_heads, block_size, head_size] on the Spyre device,
+    [num_blocks, block_size, num_kv_heads, head_size] on the Spyre device,
     matching `SpyreAttentionBackend.get_kv_cache_shape`.
 
     NamedTuple (not dataclass) because it is a tuple at runtime, so unpacking
@@ -198,20 +198,13 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
         target_device,
     ):
         for page_idx, offset, start, stop in slot_runs(block_indices, block_offsets, num_tokens):
-            # Transpose to the pages' [num_kv_heads, slots, head_size] layout on the
-            # host -- Spyre slicing corrupts memory, which is why key/value arrive
-            # on CPU -- then one transfer per run carries the whole thing over.
-            # A run of one keeps the per-token indexing instead: batching buys
-            # nothing there, and the transposed slice is a different layout for the
-            # runtime, which showed up as an ITL regression on decode steps.
-            if stop - start == 1:
-                k_run = convert(key[start].unsqueeze(1).contiguous(), target_device)
-                v_run = convert(value[start].unsqueeze(1).contiguous(), target_device)
-            else:
-                k_run = convert(key[start:stop].transpose(0, 1).contiguous(), target_device)
-                v_run = convert(value[start:stop].transpose(0, 1).contiguous(), target_device)
-            _overwrite(k_run, k_pages[page_idx], [1], [offset])
-            _overwrite(v_run, v_pages[page_idx], [1], [offset])
+            # A page is [block_size, num_kv_heads, head_size], so a run of tokens is
+            # already in page layout: the slice goes over as-is, one transfer per run.
+            # key/value arrive on CPU because Spyre slicing corrupts memory.
+            k_run = convert(key[start:stop], target_device)
+            v_run = convert(value[start:stop], target_device)
+            _overwrite(k_run, k_pages[page_idx], [0], [offset])
+            _overwrite(v_run, v_pages[page_idx], [0], [offset])
 
     return specialized_reshape_and_cache_kernel
 
@@ -246,8 +239,8 @@ def _create_compilable_page_attn(
         This kernels specializes for num_blocks and padded_query_len.
 
         Expected shapes:
-            k_pages: [num_blocks_total, num_kv_heads, block_size, head_size]
-            v_pages: [num_blocks_total, num_kv_heads, block_size, head_size]
+            k_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
+            v_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
             page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
                 tensor. Row i holds the i-th active block's absolute page index
                 at column 0, and the loop slices `page_index_table[i, 0:1]` as
@@ -286,8 +279,11 @@ def _create_compilable_page_attn(
             else:
                 k_page = k_pages.index_select(0, page_idx)
                 v_page = v_pages.index_select(0, page_idx)
-            k_page_4d = k_page.squeeze(0).unsqueeze(1)
-            v_page_4d = v_page.squeeze(0).unsqueeze(1)
+            # The gathered page is token-major, [1, block_size, num_kv_heads,
+            # head_size]; bring the head axis to the front for the batched matmuls
+            # below. The permute runs on device without a fallback.
+            k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+            v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
 
             mask_tile = mask_tiles[i]
 
@@ -903,8 +899,8 @@ class SpyreAttentionBackend(AttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         return [  # ty: ignore[invalid-return-type]
-            (num_blocks, num_kv_heads, block_size, head_size),
-            (num_blocks, num_kv_heads, block_size, head_size),
+            (num_blocks, block_size, num_kv_heads, head_size),
+            (num_blocks, block_size, num_kv_heads, head_size),
         ]
 
     @classmethod
@@ -924,7 +920,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     """Online-softmax paged attention iterating over KV pages.
 
     KV cache is a tuple (k_pages, v_pages) where each is one dense tensor of
-    shape [num_blocks, num_kv_heads, block_size, head_size] on Spyre. The
+    shape [num_blocks, block_size, num_kv_heads, head_size] on Spyre. The
     per-page read is an indirect access: the loop indexes the dense tensor with
     a one-element int32 device tensor from
     SpyreAttentionMetadata.page_index_table, so the compiled bundle carries a
@@ -1106,7 +1102,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Write new K/V tokens into their respective pages.
 
         key, value: [num_tokens, num_kv_heads, head_size]
-        k_pages, v_pages: [num_blocks, num_kv_heads, block_size, head_size]
+        k_pages, v_pages: [num_blocks, block_size, num_kv_heads, head_size]
         block_indices, block_offsets: precomputed from slot_mapping in metadata builder
         """
         num_tokens = key_cpu.shape[0]
@@ -1134,7 +1130,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """FlashAttention-style online softmax iterating over KV pages (varlen).
 
         Handles multiple sequences using query_start_loc for the varlen layout.
-        k_pages/v_pages are dense [num_blocks, num_kv_heads, block_size,
+        k_pages/v_pages are dense [num_blocks, block_size, num_kv_heads,
         head_size] tensors on Spyre; each iteration gathers one page with a
         one-element int32 device index, then feeds it to bmm without slicing.
 
