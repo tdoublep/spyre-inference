@@ -505,7 +505,10 @@ def test_spyre_ondevice_scatter_into_output_at_offset(spyre_device):
                     "help: a prefix slice is already contiguous and keeps the same "
                     "storage. This is why the write-back in "
                     "SpyreAttentionImpl._online_softmax_attention clones the unpadded "
-                    "result. Once this probe XPASSes, drop that .clone()."
+                    "result. Once this probe XPASSes, drop that .clone(). NB: the "
+                    "overrun only appears once another prefix-view slice write at a "
+                    "different view length has already run in the process, so this "
+                    "test arms it itself — see the warm-up in the body."
                 ),
             ),
         ),
@@ -518,11 +521,25 @@ def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
     slices off the padding, so for any sequence shorter than the batch maximum
     the source is a prefix view rather than an exact-size tensor. Shapes mirror
     the batch that first exposed this: a 64-token sequence followed by a
-    32-token one, so the short write lands at row 64 of the output.
+    32-token one, so the short write starts at row 32 and the overrun runs to
+    row 96 (q_start + aligned_q) instead of stopping at row 64.
+
+    A single prefix-view slice write in a fresh process is always correct; the
+    overrun only shows up once one at a *different* view length has already
+    run. The warm-up below arms it, so the verdict does not depend on which
+    other tests happened to run first in this process.
     """
     num_heads, head_size = 32, 128
     aligned_q, query_len, q_start = 64, 32, 32
     num_tokens = 96
+
+    warm_dst = torch.zeros(
+        num_tokens, num_heads, head_size, dtype=torch.float16, device=spyre_device
+    )
+    warm_src = torch.randn(
+        aligned_q, num_heads, head_size, dtype=torch.float16, device=spyre_device
+    )
+    warm_dst[q_start : q_start + 16] = warm_src[:16]
 
     output = torch.zeros(num_tokens, num_heads, head_size, dtype=torch.float16, device=spyre_device)
     result = torch.randn(aligned_q, num_heads, head_size, dtype=torch.float16, device=spyre_device)
