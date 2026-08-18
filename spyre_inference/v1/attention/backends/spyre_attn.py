@@ -1284,16 +1284,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             result = convert(result, dtype=output.dtype)
             result = result.reshape(1, num_heads, aligned_max_query_len, head_size)
             result = result.transpose(1, 2).contiguous()
-            # .clone() is load-bearing, not defensive. A Spyre slice-write whose
-            # source is a prefix *view* copies the source's underlying extent
-            # (aligned_max_query_len rows) instead of the view's length, so
-            # dropping the padded query rows by slicing alone writes past
-            # q_end. When q_start + aligned_max_query_len exceeds the output
-            # length that write runs off the end of the tensor and corrupts
-            # other sequences' rows -- which is why a batch whose longer
-            # sequence comes first produced NaN. .contiguous() does not help:
-            # a prefix slice is already contiguous, so it returns the same
-            # storage. Only a real allocation shrinks the extent.
+            # Do not drop the .clone(). A Spyre slice write copies the source's
+            # whole underlying extent, not the length of the view, so slicing
+            # off the padded rows here would write aligned_max_query_len rows
+            # instead of query_len and overwrite other sequences. .contiguous()
+            # is not enough: a prefix slice is already contiguous, so it keeps
+            # the same storage.
             output[q_start:q_end] = result[0, :query_len, :, :].clone()
 
         return output
