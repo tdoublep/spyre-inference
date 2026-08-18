@@ -300,6 +300,9 @@ def test_spyre_indirect_matmul_tensor_index(spyre_device):
     index instead of the one-element index the kernel actually passes:
       k_page = k_pages[page_idx].unsqueeze(1).transpose(-2, -1)
       scores = torch.matmul(q, k_page)
+
+    Only the index form is under test, so the pages here are already head-major
+    and there is no permute — unlike the real cache, which is token-major.
     """
     num_kv_heads = 2
     block_size = 64
