@@ -709,10 +709,12 @@ def _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device, pinned):
                 strict=True,
                 reason=(
                     "On the default device layout index_copy_ writes to the wrong "
-                    "rows and raises nothing (torch-spyre#3705, fixed by #3409 but "
-                    "not yet in our pin). Negative control for slot_major_kv_layout: "
-                    "this XPASSes once the pin includes the fix, at which point the "
-                    "pinned layout and the host allocate-then-transfer can both go."
+                    "rows and raises nothing (torch-spyre#3705). Negative control for "
+                    "slot_major_kv_layout. Upstream #3409 added scatter destination "
+                    "enforcement, but it rewrites a producer buffer's layout or copies "
+                    "the destination in and back, and a KV cache arrives as a mutated "
+                    "graph input; our pin predates it either way. If this XPASSes after "
+                    "a bump, the pinned layout and the host allocate-then-transfer go."
                 ),
             ),
         ),

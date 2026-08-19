@@ -117,9 +117,8 @@ class SpyrePagedKVCache(NamedTuple):
 def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtype: torch.dtype):
     """Device layout for a KV cache tensor with the slot axis outermost.
 
-    An indirect store is only correct when the indexed dim is outermost in the
-    device layout; on the default layout it writes to the wrong rows and raises
-    nothing (torch-spyre#3705, fixed by #3409 but not yet in our pin).
+    Without it the indirect store writes to the wrong rows and raises nothing
+    (torch-spyre#3705); test_spyre_slot_major_scatter_needs_pinned_layout pins that.
     """
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
 
@@ -230,12 +229,8 @@ def _create_compilable_page_attn(
         tile_output = None
 
         for i in range(num_blocks):
-            # .clone(), not .contiguous(): index_select reads only the first
-            # stick (32 int32s) of an index that is a row of a 2-D table, and a
-            # row at storage offset 0 is already contiguous, so .contiguous()
-            # returns the same view (torch-spyre#3851). The clone only fixes it
-            # in eager -- under SPYRE_FORCE_COMPILE_ATTN=1 the gather is still
-            # short.
+            # .clone(), not .contiguous(): torch-spyre#3851. Eager only; the
+            # gather is still short under SPYRE_FORCE_COMPILE_ATTN=1.
             slot_ids = slot_index_table[i].clone()
             # index_select, not subscripting: subscripting lowers to aten.index,
             # which upcasts the int32 index to int64 and fails eager.
