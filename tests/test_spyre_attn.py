@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import math
+import warnings
 from unittest.mock import Mock
 
 import pytest
@@ -1321,12 +1322,22 @@ def test_reshape_and_cache_scatter(
         scale=head_size**-0.5,
         num_kv_heads=num_kv_heads,
     )
-    attn_impl._reshape_and_cache(
-        key_src,
-        value_src,
-        k_actual,
-        v_actual,
-        convert(torch.tensor(slots, dtype=torch.int32), cache_device),
+    from torch_spyre.ops.fallbacks import FallbackWarning
+
+    with warnings.catch_warnings(record=True) as caught:
+        # "always": torch-spyre shows each fallback warning only once per session.
+        warnings.simplefilter("always", FallbackWarning)
+        attn_impl._reshape_and_cache(
+            key_src,
+            value_src,
+            k_actual,
+            v_actual,
+            convert(torch.tensor(slots, dtype=torch.int64), cache_device),
+        )
+
+    fallback_msgs = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]
+    assert not any("index_copy" in m for m in fallback_msgs), (
+        f"the KV scatter fell back to CPU: {fallback_msgs}"
     )
 
     # A Spyre round trip perturbs fp16 by up to an ulp, so this is not bit-exact.
