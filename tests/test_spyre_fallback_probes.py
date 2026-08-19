@@ -675,3 +675,40 @@ def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
     expected = torch.zeros(num_tokens, num_heads, head_size, dtype=torch.float16)
     expected[q_start : q_start + query_len] = result.cpu()[:query_len]
     torch.testing.assert_close(output.cpu(), expected, atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# 7. storage_offset on compiled-graph inputs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch-spyre#3770: a device view with storage_offset != 0 passed as an "
+        "input to a compiled region is read from offset 0, silently returning "
+        "the data at offset 0. This is why SpyreAttentionMetadata.page_index_table "
+        "is mirrored as one offset-0 tensor per sequence instead of a single "
+        "[num_seqs, ...] tensor sliced per sequence in _online_softmax_attention."
+    ),
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.int32])
+def test_spyre_compile_input_honors_storage_offset(spyre_device, dtype):
+    """A compiled kernel must read a device input from its own storage offset.
+
+    Note these views report is_contiguous() == True (standard strides, non-zero
+    offset), so .contiguous() is a no-op and cannot work around the defect —
+    only a real copy (.clone(), or slicing on the host before the transfer) can.
+    """
+    rows, width = 4, 64
+    base_cpu = torch.stack([torch.full((rows, width), float(s)) for s in range(3)]).to(dtype)
+    base = base_cpu.to(spyre_device)
+
+    @torch.compile(dynamic=False)
+    def fn(x):
+        return x + x
+
+    for s in range(3):
+        view = base[s]
+        assert view.is_contiguous() and view.storage_offset() == s * rows * width
+        torch.testing.assert_close(fn(view).cpu(), (base_cpu[s] + base_cpu[s]), atol=0, rtol=0)

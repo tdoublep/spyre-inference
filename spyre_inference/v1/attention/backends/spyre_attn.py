@@ -387,8 +387,14 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # index at [s, b, 0]. Each index needs its own stick-wide row to compile,
     # which is why block_table cannot serve as the index. The device mirror is
     # filled by the first forward(), since the builder's device is CPU.
+    #
+    # The device side is one tensor per sequence, not a single [num_seqs, ...]
+    # tensor: a compiled kernel ignores the storage_offset of its inputs, so
+    # feeding it the view `table[s]` would make every sequence gather with
+    # sequence 0's page indices. Each per-sequence tensor is transferred
+    # separately so all of them start at offset 0.
     page_index_table_cpu: torch.Tensor | None = None
-    page_index_table: torch.Tensor | None = None
+    page_index_table: list[torch.Tensor] | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:
@@ -967,10 +973,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Only the first layer of a step pays for the device mirror.
         if attn_metadata.page_index_table is None:
-            assert attn_metadata.page_index_table_cpu is not None
-            attn_metadata.page_index_table = convert(
-                attn_metadata.page_index_table_cpu, device=_target_device
-            )
+            table_cpu = attn_metadata.page_index_table_cpu
+            assert table_cpu is not None
+            attn_metadata.page_index_table = [
+                convert(table_cpu[s].contiguous(), device=_target_device)
+                for s in range(table_cpu.shape[0])
+            ]
 
         # Spyre slicing corrupts memory, so bring k/v to CPU for slicing.
         # Query handling depends on whether we can stay on device:
