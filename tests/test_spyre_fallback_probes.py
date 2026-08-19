@@ -746,7 +746,7 @@ def test_spyre_slot_major_scatter_needs_pinned_layout(spyre_device, pinned):
                 reason=(
                     "index_copy_ has no eager on-device path: an int32 index is "
                     "rejected, an int64 one falls back to CPU. This is why "
-                    "_get_reshape_fn compiles unconditionally."
+                    "SpyreAttentionImpl compiles the write kernel unconditionally."
                 ),
             ),
         ),

@@ -119,16 +119,10 @@ def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtyp
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
 
     eps = get_elem_in_stick(dtype)
-    device_size = [num_slots, num_kv_heads, (head_size + eps - 1) // eps, eps]
-    strides: list[int] = []
-    acc = 1
-    for size in reversed(device_size):
-        strides.append(acc)
-        acc *= size
-    strides.reverse()
+    sticks = (head_size + eps - 1) // eps
     return SpyreTensorLayout(
-        device_size=device_size,
-        stride_map=strides,
+        device_size=[num_slots, num_kv_heads, sticks, eps],
+        stride_map=[num_kv_heads * sticks * eps, sticks * eps, eps, 1],
         device_dtype=get_device_dtype(dtype),
     )
 
@@ -154,30 +148,21 @@ def _maybe_compile(fn):
     """Triggers compilation when SPYRE_FORCE_COMPILE_ATTN=1.
 
     Used only for the online-softmax attention kernel; the reshape/cache
-    kernel is compiled unconditionally instead (see _get_reshape_fn).
+    kernel is compiled unconditionally instead (see _reshape_and_cache).
     """
     if _FORCE_COMPILE_ATTN:
         return torch.compile(fn, dynamic=False)
     return fn
 
 
+def _reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
+    k_slots.index_copy_(0, slot_mapping, key)
+    v_slots.index_copy_(0, slot_mapping, value)
+
+
 # ---------------------------------------------------------------------------
 # Compilable factory functions
 # ---------------------------------------------------------------------------
-
-
-def _create_compilable_reshape_and_cache(num_tokens: int):
-    """Create a reshape_and_cache with fixed token count for torch.compile.
-
-    ``num_tokens`` is unused in the body but keys the cache of compiled
-    variants, since the store specializes on it under dynamic=False.
-    """
-
-    def specialized_reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
-        k_slots.index_copy_(0, slot_mapping, key)
-        v_slots.index_copy_(0, slot_mapping, value)
-
-    return specialized_reshape_and_cache_kernel
 
 
 def _create_compilable_page_attn(
@@ -869,23 +854,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # soft-capping (kernel takes the same path as upstream).
         self.logits_soft_cap: float = 0.0 if logits_soft_cap is None else float(logits_soft_cap)
 
-        # Compiled function caches (keyed by iteration count for reshape, and
-        # by (num_blocks, padded_query_len) for the per-page attention loop)
-        self._reshape_fns: dict[int, object] = {}
+        # Always compiled: eager index_copy_ rejects an int32 index and falls
+        # back to CPU with an int64 one.
+        self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
+
+        # Compiled attention loops, keyed by (num_blocks, padded_query_len)
         self._attn_fns: dict[tuple[int, int], object] = {}
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
         )
-
-    def _get_reshape_fn(self, num_tokens: int):
-        if num_tokens not in self._reshape_fns:
-            # Always compiled: eager index_copy_ raises or falls back to CPU.
-            self._reshape_fns[num_tokens] = torch.compile(
-                _create_compilable_reshape_and_cache(num_tokens), dynamic=False
-            )
-
-        return self._reshape_fns[num_tokens]
 
     def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
         # self.alibi_slopes and self.logits_soft_cap are fixed per instance, so
@@ -1003,8 +981,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Valid because a view keeps the slot-outermost device layout.
         slots = (-1, k_pages.shape[2], k_pages.shape[3])
-        fn = self._get_reshape_fn(key.shape[0])
-        fn(key, value, k_pages.view(slots), v_pages.view(slots), slot_mapping)
+        self._reshape_fn(key, value, k_pages.view(slots), v_pages.view(slots), slot_mapping)
 
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
