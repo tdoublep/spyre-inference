@@ -339,7 +339,8 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
     """Guard the page gather used by SpyreAttentionImpl.
 
     The index must be a one-element tensor taken as a row slice of a stick-wide
-    table (`table[b, 0:1]`). Two nearby index forms do NOT work:
+    table (`table[b, 0:1]`), which is what SpyreAttentionMetadata.page_index_tables
+    provides. Two nearby index forms do NOT work and are deliberately not used:
       - a 0-dim scalar index (see test_spyre_indirect_matmul_tensor_index), and
       - a slice of a plain 1-D index tensor, or of a shared table row, which
         fails to compile rather than returning wrong values.
@@ -676,7 +677,39 @@ def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
 
 
 # ---------------------------------------------------------------------------
-# 8. Slot-major KV cache: the indirect scatter write
+# 8. storage_offset on compiled-graph inputs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "torch-spyre#3770: a device view with storage_offset != 0 is read from offset 0 "
+        "when passed into a compiled region; hence the per-sequence page_index_tables."
+    ),
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.int32])
+def test_spyre_compile_input_honors_storage_offset(spyre_device, dtype):
+    """A compiled kernel must read a device input from its own storage offset.
+
+    These views are is_contiguous(), so .contiguous() is a no-op; only a real copy works.
+    """
+    rows, width = 4, 64
+    base_cpu = torch.stack([torch.full((rows, width), float(s)) for s in range(3)]).to(dtype)
+    base = base_cpu.to(spyre_device)
+
+    @torch.compile(dynamic=False)
+    def fn(x):
+        return x + x
+
+    for s in range(3):
+        view = base[s]
+        assert view.is_contiguous() and view.storage_offset() == s * rows * width
+        torch.testing.assert_close(fn(view).cpu(), (base_cpu[s] + base_cpu[s]), atol=0, rtol=0)
+
+
+# ---------------------------------------------------------------------------
+# 9. Slot-major KV cache: the indirect scatter write
 # ---------------------------------------------------------------------------
 
 
