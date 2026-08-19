@@ -387,14 +387,8 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # index at [s, b, 0]. Each index needs its own stick-wide row to compile,
     # which is why block_table cannot serve as the index. The device mirror is
     # filled by the first forward(), since the builder's device is CPU.
-    #
-    # The device side is one tensor per sequence, not a single [num_seqs, ...]
-    # tensor: a compiled kernel ignores the storage_offset of its inputs
-    # (torch-spyre#3770), so feeding it the view `table[s]` would make every
-    # sequence gather with sequence 0's page indices. Each per-sequence tensor
-    # is transferred separately so all of them start at offset 0. Materializing
-    # them once per step is why this is a cached list rather than a clone of
-    # `table[s]` in the per-layer read path.
+    # One tensor per sequence, materialized once per step: a compiled kernel reads
+    # its inputs from offset 0, ignoring storage_offset (torch-spyre#3770).
     page_index_table_cpu: torch.Tensor | None = None
     page_index_tables: list[torch.Tensor] | None = None
 

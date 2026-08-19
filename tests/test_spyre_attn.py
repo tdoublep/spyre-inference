@@ -50,12 +50,7 @@ def configure_device(request, monkeypatch):
 
 @pytest.fixture()
 def force_compile_attn(request, monkeypatch):
-    """Flip the SPYRE_FORCE_COMPILE_ATTN gate for one test.
-
-    The env var is only read at import time, but `_maybe_compile` reads the
-    module global each time `_get_attn_fn` builds a kernel, so patching the
-    attribute is enough to exercise the flag.
-    """
+    """Flip the SPYRE_FORCE_COMPILE_ATTN gate; the env var is only read at import."""
     monkeypatch.setattr(spyre_attn, "_FORCE_COMPILE_ATTN", request.param)
     return request.param
 
@@ -541,12 +536,10 @@ def test_spyre_attn_force_compile_attn_multi_seq(
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """SPYRE_FORCE_COMPILE_ATTN=1 over a batch with more than one sequence.
+    """SPYRE_FORCE_COMPILE_ATTN=1 over a multi-sequence batch.
 
-    Needs a real multi-sequence batch on device: every sequence past batch slot
-    0 reads its page indices from a tensor that used to be a view at a non-zero
-    storage offset, which a compiled kernel silently reads from offset 0
-    (torch-spyre#3770), so those sequences attended to slot 0's KV pages.
+    Sequences past batch slot 0 silently gathered slot 0's KV pages
+    (torch-spyre#3770); only a real batch on device catches it.
     """
     _run_spyre_attn_test(
         seq_lens=seq_lens,

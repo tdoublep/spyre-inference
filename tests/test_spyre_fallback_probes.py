@@ -685,20 +685,15 @@ def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "torch-spyre#3770: a device view with storage_offset != 0 passed as an "
-        "input to a compiled region is read from offset 0, silently returning "
-        "the data at offset 0. This is why SpyreAttentionMetadata.page_index_tables "
-        "is mirrored as one offset-0 tensor per sequence instead of a single "
-        "[num_seqs, ...] tensor sliced per sequence in _online_softmax_attention."
+        "torch-spyre#3770: a device view with storage_offset != 0 is read from offset 0 "
+        "when passed into a compiled region; hence the per-sequence page_index_tables."
     ),
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.int32])
 def test_spyre_compile_input_honors_storage_offset(spyre_device, dtype):
     """A compiled kernel must read a device input from its own storage offset.
 
-    Note these views report is_contiguous() == True (standard strides, non-zero
-    offset), so .contiguous() is a no-op and cannot work around the defect —
-    only a real copy (.clone(), or slicing on the host before the transfer) can.
+    These views are is_contiguous(), so .contiguous() is a no-op; only a real copy works.
     """
     rows, width = 4, 64
     base_cpu = torch.stack([torch.full((rows, width), float(s)) for s in range(3)]).to(dtype)
