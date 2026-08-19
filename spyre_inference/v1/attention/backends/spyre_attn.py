@@ -88,7 +88,7 @@ ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE = 128
 
 # Elements per stick for int32 (128-byte stick / 4 bytes). Page-index rows are
 # padded to this width so each row starts on a stick boundary; see
-# SpyreAttentionMetadata.page_index_table.
+# SpyreAttentionMetadata.page_index_tables.
 INT32_ELEMS_PER_STICK = 32
 
 
@@ -389,12 +389,14 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # filled by the first forward(), since the builder's device is CPU.
     #
     # The device side is one tensor per sequence, not a single [num_seqs, ...]
-    # tensor: a compiled kernel ignores the storage_offset of its inputs, so
-    # feeding it the view `table[s]` would make every sequence gather with
-    # sequence 0's page indices. Each per-sequence tensor is transferred
-    # separately so all of them start at offset 0.
+    # tensor: a compiled kernel ignores the storage_offset of its inputs
+    # (torch-spyre#3770), so feeding it the view `table[s]` would make every
+    # sequence gather with sequence 0's page indices. Each per-sequence tensor
+    # is transferred separately so all of them start at offset 0. Materializing
+    # them once per step is why this is a cached list rather than a clone of
+    # `table[s]` in the per-layer read path.
     page_index_table_cpu: torch.Tensor | None = None
-    page_index_table: list[torch.Tensor] | None = None
+    page_index_tables: list[torch.Tensor] | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:
@@ -972,10 +974,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_actual_tokens = attn_metadata.num_actual_tokens
 
         # Only the first layer of a step pays for the device mirror.
-        if attn_metadata.page_index_table is None:
+        if attn_metadata.page_index_tables is None:
             table_cpu = attn_metadata.page_index_table_cpu
             assert table_cpu is not None
-            attn_metadata.page_index_table = [
+            attn_metadata.page_index_tables = [
                 convert(table_cpu[s].contiguous(), device=_target_device)
                 for s in range(table_cpu.shape[0])
             ]
@@ -1095,11 +1097,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         mask_tiles_all = attn_metadata.attention_mask_tiles
         active_block_indices_all = attn_metadata.active_block_indices
         aligned_max_query_len = attn_metadata.aligned_max_query_len
-        page_index_table_all = attn_metadata.page_index_table
+        page_index_tables = attn_metadata.page_index_tables
         assert mask_tiles_all is not None, (
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
-        assert page_index_table_all is not None, "page_index_table must be mirrored by forward()"
+        assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
@@ -1166,7 +1168,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 output[q_start:q_end] = 0.0
                 continue
 
-            page_index_table = page_index_table_all[seq_idx]
+            page_index_table = page_index_tables[seq_idx]
             # mask_tiles_all[seq_idx] is indexed by position within active_bs.
             mask_tiles = [
                 convert(mask_tiles_all[seq_idx][i], device=_target_device)

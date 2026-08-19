@@ -340,7 +340,7 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
     """Guard the page gather used by SpyreAttentionImpl.
 
     The index must be a one-element tensor taken as a row slice of a stick-wide
-    table (`table[b, 0:1]`), which is what SpyreAttentionMetadata.page_index_table
+    table (`table[b, 0:1]`), which is what SpyreAttentionMetadata.page_index_tables
     provides. Two nearby index forms do NOT work and are deliberately not used:
       - a 0-dim scalar index (see test_spyre_indirect_matmul_tensor_index), and
       - a slice of a plain 1-D index tensor, or of a shared table row, which
@@ -687,7 +687,7 @@ def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
     reason=(
         "torch-spyre#3770: a device view with storage_offset != 0 passed as an "
         "input to a compiled region is read from offset 0, silently returning "
-        "the data at offset 0. This is why SpyreAttentionMetadata.page_index_table "
+        "the data at offset 0. This is why SpyreAttentionMetadata.page_index_tables "
         "is mirrored as one offset-0 tensor per sequence instead of a single "
         "[num_seqs, ...] tensor sliced per sequence in _online_softmax_attention."
     ),
