@@ -113,6 +113,26 @@ class SpyrePagedKVCache(NamedTuple):
     v_pages: torch.Tensor
 
 
+def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtype: torch.dtype):
+    """Slot-axis-outermost layout; without it the indirect store silently
+    writes to the wrong rows (torch-spyre#3705)."""
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+
+    eps = get_elem_in_stick(dtype)
+    device_size = [num_slots, num_kv_heads, (head_size + eps - 1) // eps, eps]
+    strides: list[int] = []
+    acc = 1
+    for size in reversed(device_size):
+        strides.append(acc)
+        acc *= size
+    strides.reverse()
+    return SpyreTensorLayout(
+        device_size=device_size,
+        stride_map=strides,
+        device_dtype=get_device_dtype(dtype),
+    )
+
+
 def _overwrite(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -133,11 +153,8 @@ def _overwrite(
 def _maybe_compile(fn):
     """Triggers compilation when SPYRE_FORCE_COMPILE_ATTN=1.
 
-    Used only for the online-softmax attention kernel — the reshape/cache
-    kernel is *not* covered, because forcing compile on it currently hits an
-    unsupported torch-spyre Inductor path (missing device_tensor_layout on
-    graph input). Flip _get_reshape_fn to call this helper too once that gap
-    is resolved.
+    Used only for the online-softmax attention kernel; the reshape/cache
+    kernel is compiled unconditionally instead (see _get_reshape_fn).
     """
     if _FORCE_COMPILE_ATTN:
         return torch.compile(fn, dynamic=False)
@@ -149,60 +166,16 @@ def _maybe_compile(fn):
 # ---------------------------------------------------------------------------
 
 
-def slot_runs(
-    block_indices: list[int],
-    block_offsets: list[int],
-    num_tokens: int,
-) -> list[tuple[int, int, int, int]]:
-    """Split ``[0, num_tokens)`` into maximal same-page consecutive-slot runs.
-
-    Returns ``(page_idx, first_offset, start, stop)`` tuples, each writable with a
-    single slice write. A prefill normally yields one run per page and a decode
-    step one run per sequence; a scattered slot mapping still writes correctly,
-    just with more runs.
-    """
-    runs: list[tuple[int, int, int, int]] = []
-    start = 0
-    while start < num_tokens:
-        page = block_indices[start]
-        offset = block_offsets[start]
-        stop = start + 1
-        while (
-            stop < num_tokens
-            and block_indices[stop] == page
-            and block_offsets[stop] == offset + (stop - start)
-        ):
-            stop += 1
-        runs.append((page, offset, start, stop))
-        start = stop
-    return runs
-
-
 def _create_compilable_reshape_and_cache(num_tokens: int):
     """Create a reshape_and_cache with fixed token count for torch.compile.
 
-    Writes are batched per slot run because the cost is dominated by dispatch
-    count, not bytes moved: each device round trip costs the same whether it
-    writes one slot or a whole page. The slicing / symbolic-offset support this
-    path is waiting on (issue #405) removes the per-offset recompile but not the
-    per-dispatch cost, so the batching is still needed once it lands.
+    ``num_tokens`` is unused in the body but keys the cache of compiled
+    variants, since the store specializes on it under dynamic=False.
     """
 
-    def specialized_reshape_and_cache_kernel(
-        key,
-        value,
-        k_pages,
-        v_pages,
-        block_indices,
-        block_offsets,
-        target_device,
-    ):
-        for page_idx, offset, start, stop in slot_runs(block_indices, block_offsets, num_tokens):
-            # Token-major pages take the run as-is, so no host-side transpose.
-            k_run = convert(key[start:stop], target_device)
-            v_run = convert(value[start:stop], target_device)
-            _overwrite(k_run, k_pages[page_idx], [0], [offset])
-            _overwrite(v_run, v_pages[page_idx], [0], [offset])
+    def specialized_reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
+        k_slots.index_copy_(0, slot_mapping, key)
+        v_slots.index_copy_(0, slot_mapping, value)
 
     return specialized_reshape_and_cache_kernel
 
@@ -337,13 +310,6 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # (physical_block_index * block_size + block_offset). [num_actual_tokens]
     slot_mapping: torch.Tensor
 
-    # Precomputed from slot_mapping to avoid CPU round-trips during forward:
-    # each entry is the physical page index for one token.
-    slot_block_indices: list[int]
-
-    # Precomputed from slot_mapping: offset within the page for each token.
-    slot_block_offsets: list[int]
-
     # True when causal masking is needed (prefill/mixed, i.e. max_query_len > 1).
     # Decode steps (max_query_len=1) don't need explicit causal masking because
     # the online softmax over KV pages naturally only attends to past tokens.
@@ -389,6 +355,9 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # filled by the first forward(), since the builder's device is CPU.
     page_index_table_cpu: torch.Tensor | None = None
     page_index_table: torch.Tensor | None = None
+
+    # Device mirror of slot_mapping, which vLLM hands us on the host.
+    slot_mapping_device: torch.Tensor | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:
@@ -758,11 +727,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 active_block_indices.append(active_bs)
                 attention_mask_tiles.append(tiles)
 
-        # Precompute slot indices on CPU to avoid CPU round-trip during forward
-        sm_cpu = slot_mapping.detach().cpu()
-        slot_block_indices = (sm_cpu // self.block_size).tolist()
-        slot_block_offsets = (sm_cpu % self.block_size).tolist()
-
         # Gather indices for the attention loop, one row per active block.
         num_active = [len(tiles) for tiles in attention_mask_tiles]
         page_index_table_cpu = torch.zeros(
@@ -782,8 +746,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             block_table=block_table,
             block_size=self.block_size,
             slot_mapping=slot_mapping,
-            slot_block_indices=slot_block_indices,
-            slot_block_offsets=slot_block_offsets,
             apply_causal_mask=apply_causal_mask,
             num_kv_heads=self.num_kv_heads,
             num_heads=self.num_heads,
@@ -918,8 +880,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def _get_reshape_fn(self, num_tokens: int):
         if num_tokens not in self._reshape_fns:
-            # Currently not compiled
-            self._reshape_fns[num_tokens] = _create_compilable_reshape_and_cache(num_tokens)
+            # Always compiled: eager index_copy_ raises or falls back to CPU.
+            self._reshape_fns[num_tokens] = torch.compile(
+                _create_compilable_reshape_and_cache(num_tokens), dynamic=False
+            )
 
         return self._reshape_fns[num_tokens]
 
@@ -971,8 +935,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.page_index_table = convert(
                 attn_metadata.page_index_table_cpu, device=_target_device
             )
+        if attn_metadata.slot_mapping_device is None:
+            attn_metadata.slot_mapping_device = convert(
+                attn_metadata.slot_mapping[:num_actual_tokens], device=_target_device
+            )
 
-        # Spyre slicing corrupts memory, so bring k/v to CPU for slicing.
         # Query handling depends on whether we can stay on device:
         #   - Single-sequence decode: on-device assembly works (offset 0), but
         #     only when the head_size keeps the overwrite layout representable
@@ -980,8 +947,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         #   - Batch decode / prefill: needs the CPU path because the per-seq
         #     query densification slices/transposes at offset > 0, which
         #     corrupts on Spyre.
-        key_cpu = convert(key, "cpu")
-        value_cpu = convert(value, "cpu")
         ondevice_overwrite_ok = self.head_size % ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE == 0
         needs_query_cpu = (
             attn_metadata.max_query_len > 1
@@ -990,15 +955,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
         query_cpu = convert(query, "cpu") if needs_query_cpu else None
 
-        # Step 1: Reshape and cache — write new tokens into pages
+        # Step 1: Reshape and cache — scatter new tokens into their slots
         self._reshape_and_cache(
-            key_cpu[:num_actual_tokens],
-            value_cpu[:num_actual_tokens],
+            key[:num_actual_tokens],
+            value[:num_actual_tokens],
             k_pages,
             v_pages,
-            attn_metadata.slot_block_indices[:num_actual_tokens],
-            attn_metadata.slot_block_offsets[:num_actual_tokens],
-            _target_device,
+            attn_metadata.slot_mapping_device,
         )
 
         # Step 2: Online softmax attention over pages (varlen).
@@ -1020,30 +983,28 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     @_record_function("spyre_attn::reshape_and_cache")
     def _reshape_and_cache(
         self,
-        key_cpu: torch.Tensor,
-        value_cpu: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
         k_pages: torch.Tensor,
         v_pages: torch.Tensor,
-        block_indices: list[int],
-        block_offsets: list[int],
-        _target_device: torch.device,
+        slot_mapping: torch.Tensor,
     ) -> None:
-        """Write new K/V tokens into their respective pages.
+        """Scatter new K/V tokens into their cache slots.
 
-        key, value: [num_tokens, num_kv_heads, head_size]
+        key, value: [num_tokens, num_kv_heads, head_size] on the pages' device,
+            strided last-dim views of the fused QKV output
         k_pages, v_pages: [num_blocks, block_size, num_kv_heads, head_size]
-        block_indices, block_offsets: precomputed from slot_mapping in metadata builder
+        slot_mapping: [num_tokens] on the pages' device
         """
-        num_tokens = key_cpu.shape[0]
+        # A source on the wrong device falls back to CPU silently, without raising.
+        assert key.device.type == k_pages.device.type, (
+            f"reshape_and_cache source is on {key.device.type}, pages on {k_pages.device.type}"
+        )
 
-        # Force CPU contiguous: value from QKV split-along-last-dim is
-        # non-contiguous; transferring a non-contiguous CPU tensor to Spyre
-        # silently corrupts data (see custom_ops/silu_and_mul.py).
-        key_cpu = key_cpu.contiguous()
-        value_cpu = value_cpu.contiguous()
-
-        fn = self._get_reshape_fn(num_tokens)
-        fn(key_cpu, value_cpu, k_pages, v_pages, block_indices, block_offsets, _target_device)
+        # Valid because a view keeps the slot-outermost device layout.
+        slots = (-1, k_pages.shape[2], k_pages.shape[3])
+        fn = self._get_reshape_fn(key.shape[0])
+        fn(key, value, k_pages.view(slots), v_pages.view(slots), slot_mapping)
 
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
