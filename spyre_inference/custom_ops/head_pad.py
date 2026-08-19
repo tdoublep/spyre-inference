@@ -36,7 +36,7 @@ from collections.abc import Iterable
 import torch
 
 from vllm.logger import init_logger
-from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT, get_rope
 
 logger = init_logger(__name__)
 
@@ -325,5 +325,10 @@ def fix_padded_rope(model, hf_config) -> None:
         module.cos_sin_cache = ref.cos_sin_cache.to(module.cos_sin_cache.dtype)
         module._rotation_cache = None
         module._device_rotation_cache = None
+        # Narrowed frequencies make this instance model-specific; unshare it so
+        # get_rope cannot hand it to a later model with a real head_dim of orig*2.
+        for cache_key, cached in list(_ROPE_DICT.items()):
+            if cached is module:
+                del _ROPE_DICT[cache_key]
         n += 1
     logger.info("Injected original head_dim=%d RoPE frequencies into %d modules.", orig, n)
