@@ -82,10 +82,6 @@ KV_LENGTH_ALIGNMENT = 256
 # a smaller alignment (e.g. QUERY_CHUNK_SIZE=1) for single-token decode steps.
 QUERY_CHUNK_SIZE = 32
 
-# On-device query overwrite only compiles for head_size multiples of 128; 64
-# yields an unsupported Mod(var, 32) stick coord. Otherwise fall back to CPU.
-ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE = 128
-
 # Elements per stick for int32 (128-byte stick / 4 bytes). Page-index rows are
 # padded to this width so each row starts on a stick boundary; see
 # SpyreAttentionMetadata.page_index_table.
@@ -940,21 +936,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 attn_metadata.slot_mapping[:num_actual_tokens], device=_target_device
             )
 
-        # Query handling depends on whether we can stay on device:
-        #   - Single-sequence decode: on-device assembly works (offset 0), but
-        #     only when the head_size keeps the overwrite layout representable
-        #     (see ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE); otherwise CPU path.
-        #   - Batch decode / prefill: needs the CPU path because the per-seq
-        #     query densification slices/transposes at offset > 0, which
-        #     corrupts on Spyre.
-        ondevice_overwrite_ok = self.head_size % ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE == 0
-        needs_query_cpu = (
-            attn_metadata.max_query_len > 1
-            or attn_metadata.num_seqs > 1
-            or not ondevice_overwrite_ok
-        )
-        query_cpu = convert(query, "cpu") if needs_query_cpu else None
-
         # Step 1: Reshape and cache — scatter new tokens into their slots
         self._reshape_and_cache(
             key[:num_actual_tokens],
@@ -964,13 +945,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.slot_mapping_device,
         )
 
-        # Step 2: Online softmax attention over pages (varlen).
-        # Pass on-device query for single-sequence decode (assembled at offset 0
-        # without a CPU round-trip); everything else goes through query_cpu.
-        query_dev = convert(query, _target_device) if not needs_query_cpu else None
+        # Step 2: Online softmax attention over pages (varlen)
         output = self._online_softmax_attention(
-            query_dev,
-            query_cpu[:num_actual_tokens] if query_cpu is not None else None,
+            convert(query, _target_device),
             k_pages,
             v_pages,
             attn_metadata,
@@ -1009,8 +986,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
         self,
-        query_dev: torch.Tensor | None,
-        query_cpu: torch.Tensor | None,
+        query_dev: torch.Tensor,
         k_pages: torch.Tensor,
         v_pages: torch.Tensor,
         attn_metadata: SpyreAttentionMetadata,
@@ -1026,15 +1002,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         Writes results directly into the caller's output buffer in-place.
 
-        Query assembly builds the same padded 4D tensor
+        Query assembly stays on device for every sequence: the rows are taken
+        as a dim-0 narrow of the varlen query and padded into the 4D tensor
         [num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size]
-        the kernel expects. Single-sequence decode assembles it directly on
-        device (offset 0 is a safe Spyre write, so no CPU round-trip); batch
-        decode / prefill build it on CPU and transfer.
+        the kernel expects.
 
-        Args:
-            query_dev: Query on target device (for single-seq decode), or None.
-            query_cpu: Query on CPU (for batch/prefill), or None.
+        Indirect access cannot serve here, unlike the KV page read: index_select
+        reads back near-zero garbage when the source holds a single row, which
+        is exactly single-sequence decode. A dim-0 narrow is correct for that
+        shape, so the query needs no gather index.
         """
         num_heads = self.num_heads
         head_size = self.head_size
@@ -1062,46 +1038,29 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
 
-            if query_dev is not None and query_len == 1:
-                # Single-sequence decode: assemble the padded 4D query on device.
-                # The one real token is written at offset 0 (a safe Spyre write);
-                # padded query rows are masked out and dropped from the result.
-                # Layout matches the CPU path: [KV, QPK, aligned_max_query_len, D].
-                q_row = query_dev.unbind(dim=0)[q_start].reshape(
-                    num_kv_heads, num_queries_per_kv, 1, head_size
+            q_rows = torch.narrow(query_dev, 0, q_start, query_len)
+
+            # Pad to the global aligned_max_query_len (uniform for all seqs).
+            # The padded rows must be zero: they are fully masked, and a masked
+            # row of non-zero scores overflows fp16 to -inf, whose softmax is NaN.
+            if aligned_max_query_len > query_len:
+                q_padded = torch.zeros(
+                    aligned_max_query_len,
+                    num_heads,
+                    head_size,
+                    dtype=q_rows.dtype,
+                    device=q_rows.device,
                 )
-                if aligned_max_query_len > 1:
-                    q = torch.zeros(
-                        num_kv_heads,
-                        num_queries_per_kv,
-                        aligned_max_query_len,
-                        head_size,
-                        dtype=q_row.dtype,
-                        device=q_row.device,
-                    )
-                    _overwrite(q_row, q, [2], [0])
-                else:
-                    q = q_row
-                q_dev = q
-            else:
-                # Batch decode / prefill: build on CPU, transfer to device.
-                assert query_cpu is not None
-                q_seq = query_cpu[q_start:q_end]
+                torch.narrow(q_padded, 0, 0, query_len).copy_(q_rows)
+                q_rows = q_padded
 
-                # Pad query to global aligned_max_query_len (uniform for all seqs)
-                if aligned_max_query_len > query_len:
-                    q_seq = torch.nn.functional.pad(
-                        q_seq,
-                        (0, 0, 0, 0, 0, aligned_max_query_len - query_len),
-                        mode="constant",
-                        value=0.0,
-                    )
-
-                # Reshape: [padded_query_len, num_heads, head_size]
-                #   → [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
-                q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
-                q = q.reshape(num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size)
-                q_dev = convert(q, device=_target_device)
+            # [aligned_max_query_len, num_heads, head_size]
+            #   → [num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size]
+            q_dev = (
+                q_rows.permute(1, 0, 2)
+                .contiguous()
+                .reshape(num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size)
+            )
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
 
