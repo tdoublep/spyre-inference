@@ -76,10 +76,9 @@ _FORCE_COMPILE_ATTN = os.environ.get("SPYRE_FORCE_COMPILE_ATTN", "0") == "1"
 # rather than recompiling on every decode step.
 KV_LENGTH_ALIGNMENT = 256
 
-# Query chunk size for padding - ensures consistent tensor sizes for Spyre compilation
-# TODO: decode tokens (max_query_len=1) are always padded to 32, which is wasteful.
-# Explore a separate decode kernel path that doesn't need query padding, or use
-# a smaller alignment (e.g. QUERY_CHUNK_SIZE=1) for single-token decode steps.
+# Query chunk size for padding - ensures consistent tensor sizes for Spyre compilation.
+# TODO: decode sequences in a mixed batch still pad to this; only decode-only
+# batches skip it.
 QUERY_CHUNK_SIZE = 32
 
 # Elements per stick for int32 (128-byte stick / 4 bytes). Page-index rows are
@@ -649,9 +648,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # the causal mask to them is a correct no-op.
         apply_causal_mask = causal and max_query_len > 1
 
-        aligned_max_query_len = (
-            (max_query_len + QUERY_CHUNK_SIZE - 1) // QUERY_CHUNK_SIZE * QUERY_CHUNK_SIZE
-        )
+        # Decode-only batches skip chunking: query_len is always 1, so the shape
+        # is already stable across steps.
+        chunk = 1 if max_query_len == 1 else QUERY_CHUNK_SIZE
+        aligned_max_query_len = (max_query_len + chunk - 1) // chunk * chunk
         aligned_max_seq_len = (
             (max_seq_len + KV_LENGTH_ALIGNMENT - 1) // KV_LENGTH_ALIGNMENT * KV_LENGTH_ALIGNMENT
         )
