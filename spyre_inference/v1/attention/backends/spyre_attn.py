@@ -980,7 +980,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             k_pages,
             v_pages,
             attn_metadata.slot_mapping_device,
-            _target_device,
         )
 
         # Step 2: Online softmax attention over pages (varlen).
@@ -1007,22 +1006,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         k_pages: torch.Tensor,
         v_pages: torch.Tensor,
         slot_mapping: torch.Tensor,
-        _target_device: torch.device,
     ) -> None:
         """Scatter new K/V tokens into their cache slots.
 
-        key, value: [num_tokens, num_kv_heads, head_size]
+        key, value: [num_tokens, num_kv_heads, head_size] on the pages' device,
+            strided last-dim views of the fused QKV output
         k_pages, v_pages: [num_blocks * block_size, num_kv_heads, head_size]
         slot_mapping: [num_tokens] int32 on the pages' device
         """
-        # Force CPU contiguous: value from QKV split-along-last-dim is
-        # non-contiguous; transferring a non-contiguous CPU tensor to Spyre
-        # silently corrupts data (see custom_ops/silu_and_mul.py).
-        key_dev = convert(convert(key, "cpu").contiguous(), _target_device)
-        value_dev = convert(convert(value, "cpu").contiguous(), _target_device)
+        # A source on the wrong device falls back to CPU silently, without raising.
+        assert key.device.type == k_pages.device.type, (
+            f"reshape_and_cache source is on {key.device.type}, pages on {k_pages.device.type}"
+        )
 
         fn = self._get_reshape_fn(key.shape[0])
-        fn(key_dev, value_dev, k_pages, v_pages, slot_mapping)
+        fn(key, value, k_pages, v_pages, slot_mapping)
 
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
