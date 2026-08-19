@@ -691,6 +691,38 @@ def test_spyre_attn_sliding_window(
 
 @pytest.mark.parametrize(
     "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("NONE", id="compilation_NONE")],
+    indirect=True,
+)
+@pytest.mark.parametrize("force_compile_attn", [True], indirect=True)
+def test_spyre_attn_force_compile_shared_mask_tiles(
+    default_vllm_config,
+    force_compile_attn: bool,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """Compiled attention over a window wide enough to leave interior blocks.
+
+    Interior blocks share one zero mask tile, which is mirrored to the device
+    once, so the same tensor reaches the kernel in several list positions. This
+    pins that those aliased inputs still compile and stay numerically correct.
+    """
+    _run_spyre_attn_test(
+        seq_lens=[(1, 512)],
+        block_size=64,
+        sliding_window=512,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
     [
         pytest.param("cpu", id="device_cpu"),
         pytest.param("spyre", id="device_spyre"),
@@ -1306,6 +1338,226 @@ def test_reshape_and_cache_batched(
     # Release Spyre DMA mappings eagerly (see _run_spyre_attn_test).
     if configure_device == "spyre":
         del k_actual, v_actual, k_expected, v_expected
+        import gc
+
+        gc.collect()
+
+
+def _decode_step_setup(
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    block_size: int,
+    kv_len: int,
+    num_blocks: int,
+    sliding_window: int | None,
+    cache_device: torch.device,
+):
+    """One decode token appended to a `kv_len`-long sequence.
+
+    The cache holds noise rather than a seeded history: the callers assert how
+    often the per-step tables are uploaded, not attention values.
+    """
+    dtype = torch.float16
+    query = torch.randn(1, num_query_heads, head_size, dtype=dtype)
+    key = torch.randn(1, num_kv_heads, head_size, dtype=dtype)
+    value = torch.randn(1, num_kv_heads, head_size, dtype=dtype)
+
+    blocks_per_seq = (kv_len + block_size - 1) // block_size
+    block_table = torch.arange(blocks_per_seq, dtype=torch.int32).view(1, -1)
+    last = kv_len - 1
+    slot_mapping = torch.tensor(
+        [int(block_table[0, last // block_size]) * block_size + last % block_size],
+        dtype=torch.int64,
+    )
+
+    attn_metadata = _build_metadata(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=torch.tensor([kv_len], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+        block_table=block_table,
+        slot_mapping=slot_mapping,
+        sliding_window=sliding_window,
+    )
+    kv_cache = SpyrePagedKVCache(
+        k_pages=torch.randn(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype).to(
+            cache_device
+        ),
+        v_pages=torch.randn(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype).to(
+            cache_device
+        ),
+    )
+    return query, key, value, kv_cache, attn_metadata
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("cpu", id="device_cpu"), pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize("sliding_window", [None, 512])
+@pytest.mark.parametrize("use_alibi", [False, True])
+def test_step_tables_uploaded_once_per_step(
+    default_vllm_config,
+    monkeypatch,
+    configure_device: str,
+    sliding_window: int | None,
+    use_alibi: bool,
+) -> None:
+    """The per-step device tables are uploaded by the first layer, not per layer.
+
+    forward() runs once per attention layer against a single shared metadata
+    object, so the page-index, mask and ALiBi tables — none of which depend on
+    the layer — must be mirrored once per step and reused afterwards.
+    """
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    num_query_heads, num_kv_heads, head_size, block_size = 8, 8, 128, 64
+    cache_device = torch.device(configure_device)
+    query, key, value, kv_cache, attn_metadata = _decode_step_setup(
+        num_query_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        kv_len=512,
+        num_blocks=64,
+        sliding_window=sliding_window,
+        cache_device=cache_device,
+    )
+    assert attn_metadata.attention_mask_tiles_device is None
+    assert attn_metadata.alibi_bias_tiles_device is None
+
+    converts = 0
+    real_convert = spyre_attn.convert
+
+    def counting_convert(tensor, device=None, dtype=None):
+        nonlocal converts
+        converts += 1
+        return real_convert(tensor, device=device, dtype=dtype)
+
+    monkeypatch.setattr(spyre_attn, "convert", counting_convert)
+
+    outputs = []
+    per_layer_converts = []
+    first_mirrors: tuple = ()
+    for layer_idx in range(2):
+        # A distinct impl per layer, as vLLM builds them.
+        attn_impl = SpyreAttentionImpl(
+            num_heads=num_query_heads,
+            head_size=head_size,
+            scale=head_size**-0.5,
+            num_kv_heads=num_kv_heads,
+            alibi_slopes=_alibi_slopes(num_query_heads) if use_alibi else None,
+            sliding_window=sliding_window,
+            kv_cache_dtype="auto",
+        )
+        output = torch.empty_like(query).to(cache_device)
+        before = converts
+        attn_impl.forward(
+            layer=None,
+            query=query,
+            key=key,
+            value=value,
+            kv_cache=kv_cache,
+            attn_metadata=attn_metadata,
+            output=output,
+        )
+        per_layer_converts.append(converts - before)
+        outputs.append(output.to("cpu"))
+
+        mirrors = (
+            attn_metadata.page_index_tables,
+            attn_metadata.attention_mask_tiles_device,
+            attn_metadata.alibi_bias_tiles_device,
+        )
+        if layer_idx == 0:
+            first_mirrors = mirrors
+        else:
+            # The second layer reuses the very objects the first one uploaded.
+            assert all(a is b for a, b in zip(mirrors, first_mirrors, strict=True))
+
+    # The second layer's only conversions are the per-layer q/k/v and result ones, so it
+    # skips exactly the page-index rows plus one upload per distinct tile.
+    assert attn_metadata.attention_mask_tiles is not None
+    distinct_tiles = len(
+        {id(tile) for tiles in attn_metadata.attention_mask_tiles for tile in tiles}
+    )
+    expected_saving = attn_metadata.num_seqs + distinct_tiles
+    if use_alibi:
+        expected_saving += sum(attn_metadata.num_active_blocks)
+    assert per_layer_converts[0] - per_layer_converts[1] == expected_saving
+
+    torch.testing.assert_close(outputs[0], outputs[1], atol=0, rtol=0)
+
+    if configure_device == "spyre":
+        del kv_cache
+        import gc
+
+        gc.collect()
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("cpu", id="device_cpu"), pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+def test_interior_mask_tiles_share_one_upload(default_vllm_config, configure_device: str) -> None:
+    """Blocks that share the builder's zero mask tile share one device copy.
+
+    Under a sliding window the interior blocks are all-zero and the builder
+    hands back the same tensor for each, so mirroring must upload it once
+    instead of once per block.
+    """
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    num_query_heads, num_kv_heads, head_size, block_size = 8, 8, 128, 64
+    cache_device = torch.device(configure_device)
+    query, key, value, kv_cache, attn_metadata = _decode_step_setup(
+        num_query_heads,
+        num_kv_heads,
+        head_size,
+        block_size,
+        kv_len=512,
+        num_blocks=64,
+        sliding_window=512,
+        cache_device=cache_device,
+    )
+
+    cpu_tiles = attn_metadata.attention_mask_tiles
+    assert cpu_tiles is not None
+    # Boundary blocks get real tiles; everything between them shares one.
+    assert len({id(tile) for tile in cpu_tiles[0]}) < len(cpu_tiles[0])
+
+    attn_impl = SpyreAttentionImpl(
+        num_heads=num_query_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+        sliding_window=512,
+        kv_cache_dtype="auto",
+    )
+    attn_impl.forward(
+        layer=None,
+        query=query,
+        key=key,
+        value=value,
+        kv_cache=kv_cache,
+        attn_metadata=attn_metadata,
+        output=torch.empty_like(query).to(cache_device),
+    )
+
+    device_tiles = attn_metadata.attention_mask_tiles_device
+    assert device_tiles is not None
+    assert len(device_tiles[0]) == len(cpu_tiles[0])
+    assert len({id(tile) for tile in device_tiles[0]}) == len({id(tile) for tile in cpu_tiles[0]})
+
+    if configure_device == "spyre":
+        del kv_cache
         import gc
 
         gc.collect()
