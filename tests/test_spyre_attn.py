@@ -68,7 +68,7 @@ def configure_compilation(request, monkeypatch):
 
     cfg.mode = compilation_mode
     # Increase recompilation limit: the page-attention kernel is specialized
-    # (and so recompiled) per unique (num_blocks, padded_query_len)
+    # (and so recompiled) per unique (num_blocks, query_len)
     torch._dynamo.config.accumulated_recompile_limit = 1024
 
     yield mode_name
@@ -438,7 +438,7 @@ def _run_spyre_attn_test(
     key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
     attn_impl.forward(
         layer=None,
-        query=query,
+        query=query.to(cache_device),
         key=key_src,
         value=value_src,
         kv_cache=kv_cache,

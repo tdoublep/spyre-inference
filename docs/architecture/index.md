@@ -109,7 +109,7 @@ the write can scatter through a slot-major view of it:
 | 1. q → CPU | CPU | Bring `q` to CPU when its layout cannot be assembled on device; `k`/`v` stay put |
 | 2. Reshape & cache | Spyre | Scatter new K/V into the cache through a slot-major view: a token's destination is one index, so it is a single `index_copy_` per tensor |
 | 3. Per-sequence varlen loop | CPU | Iterate sequences via `query_start_loc`, pad `query_len` to 32 |
-| 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, padded_query_len)` kernel: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
+| 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, query_len)` kernel: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 5. Write-back | CPU → Spyre | Stage each sequence's result into a CPU buffer, then one bulk copy into the Spyre output (per-token `spyre.overwrite` scatter doesn't scale) |
 
 Key constraints:
