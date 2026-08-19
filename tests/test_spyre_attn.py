@@ -33,44 +33,6 @@ from spyre_testing_plugin.pytest_plugin import spyre_available
 pytestmark = pytest.mark.attention
 
 
-def _to_cache_device(
-    cache_cpu: torch.Tensor, device: torch.device, block_size: int
-) -> torch.Tensor:
-    """Move a slot-major KV cache to ``device`` as the runner allocates it.
-
-    Takes the flat [num_slots, ...] form the reference math uses and returns the
-    blocked [num_blocks, block_size, ...] form the backend receives, with the slot
-    axis pinned outermost in the device layout.
-    """
-    num_slots, num_kv_heads, head_size = cache_cpu.shape
-    blocked = cache_cpu.view(num_slots // block_size, block_size, num_kv_heads, head_size)
-    if device.type != "spyre":
-        return blocked.to(device)
-    return blocked.to(
-        device,
-        device_layout=slot_major_kv_layout(num_slots, num_kv_heads, head_size, cache_cpu.dtype),
-    )
-
-
-def _fused_qkv_kv_views(
-    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, device: torch.device
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """K/V as the backend receives them: strided last-dim views on ``device``.
-
-    The model splits the fused QKV on-device, so contiguous k/v would not
-    exercise the scatter's real source layout.
-    """
-    num_tokens = query.shape[0]
-    slabs = [t.reshape(num_tokens, -1) for t in (query, key, value)]
-    qkv = convert(torch.cat(slabs, dim=-1), device)
-    _, k_view, v_view = qkv.split([s.shape[-1] for s in slabs], dim=-1)
-    num_kv_heads, head_size = key.shape[1], key.shape[2]
-    return (
-        k_view.view(num_tokens, num_kv_heads, head_size),
-        v_view.view(num_tokens, num_kv_heads, head_size),
-    )
-
-
 @pytest.fixture()
 def configure_device(request, monkeypatch):
     """Configure overwrite_f and cache device based on the device_mode parameter.
@@ -115,6 +77,40 @@ def configure_compilation(request, monkeypatch):
     cfg.mode = original_mode
     torch._dynamo.config.accumulated_recompile_limit = original_limit
     torch._dynamo.reset()
+
+
+def _to_cache_device(cache_cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Move a KV cache to ``device``, pinning the slot-major layout on Spyre.
+
+    Matches how the model runner allocates; the scatter write depends on it.
+    """
+    if device.type != "spyre":
+        return cache_cpu.to(device)
+    num_blocks, block_size, num_kv_heads, head_size = cache_cpu.shape
+    return cache_cpu.to(
+        device,
+        device_layout=slot_major_kv_layout(
+            num_blocks * block_size, num_kv_heads, head_size, cache_cpu.dtype
+        ),
+    )
+
+
+def _fused_qkv_kv_views(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """K/V as the backend receives them: strided last-dim views on ``device``.
+
+    The model splits the fused QKV on-device, so contiguous k/v would not
+    exercise the scatter's real source layout.
+    """
+    num_tokens = query.shape[0]
+    slabs = [t.reshape(num_tokens, -1) for t in (query, key, value)]
+    qkv = convert(torch.cat(slabs, dim=-1), device)
+    _, k_view, v_view = qkv.split([s.shape[-1] for s in slabs], dim=-1)
+    return (
+        k_view.view(num_tokens, key.shape[1], key.shape[2]),
+        v_view.view(num_tokens, value.shape[1], value.shape[2]),
+    )
 
 
 def _build_metadata(
@@ -296,9 +292,9 @@ def ref_attn(
         num_kv_blocks = (kv_len + block_size - 1) // block_size
         block_indices = block_tables_np[i, :num_kv_blocks]
 
-        # Each page is the slot range [idx * block_size, (idx + 1) * block_size).
-        k_blocks = [key_cache[idx * block_size : (idx + 1) * block_size] for idx in block_indices]
-        v_blocks = [value_cache[idx * block_size : (idx + 1) * block_size] for idx in block_indices]
+        # Pages are token-major, so dim 0 of the concat is the token axis.
+        k_blocks = [key_cache[idx] for idx in block_indices]
+        v_blocks = [value_cache[idx] for idx in block_indices]
         k = torch.cat(k_blocks, dim=0)[:kv_len]  # [kv_len, num_kv_heads, head_size]
         v = torch.cat(v_blocks, dim=0)[:kv_len]
 
@@ -379,8 +375,8 @@ def _run_spyre_attn_test(
     value = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
 
     cache_device = torch.device(configure_device)
-    k_pages_cpu = torch.zeros(num_blocks * block_size, num_kv_heads, head_size, dtype=dtype)
-    v_pages_cpu = torch.zeros(num_blocks * block_size, num_kv_heads, head_size, dtype=dtype)
+    k_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
+    v_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
 
     cu_query_lens = torch.tensor([0] + query_lens, dtype=torch.int32).cumsum(
         dim=0, dtype=torch.int32
@@ -404,22 +400,20 @@ def _run_spyre_attn_test(
             for token_idx in range(historical_len):
                 actual_block = block_tables[seq_idx, token_idx // block_size].item()
                 block_offset = token_idx % block_size
-                slot = actual_block * block_size + block_offset
-                k_pages_cpu[slot] = historical_keys[token_idx]
-                v_pages_cpu[slot] = historical_values[token_idx]
+                k_pages_cpu[actual_block][block_offset] = historical_keys[token_idx]
+                v_pages_cpu[actual_block][block_offset] = historical_values[token_idx]
         for token_idx in range(historical_len, kv_len):
             block_idx = token_idx // block_size
             block_offset = token_idx % block_size
             actual_block = block_tables[seq_idx, block_idx].item()
-            slot = actual_block * block_size + block_offset
-            k_pages_cpu[slot] = key[q_offset + token_idx - historical_len]
-            v_pages_cpu[slot] = value[q_offset + token_idx - historical_len]
-            slot_mapping.append(slot)
+            k_pages_cpu[actual_block][block_offset] = key[q_offset + token_idx - historical_len]
+            v_pages_cpu[actual_block][block_offset] = value[q_offset + token_idx - historical_len]
+            slot_mapping.append(actual_block * block_size + block_offset)
         q_offset += query_len
     slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
-    k_pages = _to_cache_device(k_pages_cpu, cache_device, block_size)
-    v_pages = _to_cache_device(v_pages_cpu, cache_device, block_size)
+    k_pages = _to_cache_device(k_pages_cpu, cache_device)
+    v_pages = _to_cache_device(v_pages_cpu, cache_device)
 
     attn_metadata = _build_metadata(
         num_query_heads=num_query_heads,
@@ -1039,13 +1033,15 @@ def test_sliding_window_none_equivalence(default_vllm_config):
     # Single sequence: query_len=32, kv_len=256
     query_len, kv_len = 32, 256
 
-    k_pages_cpu = torch.zeros(num_blocks * block_size, num_kv_heads, head_size, dtype=dtype)
-    v_pages_cpu = torch.zeros(num_blocks * block_size, num_kv_heads, head_size, dtype=dtype)
+    k_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
+    v_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
 
     # Pre-populate KV cache
     for i in range(kv_len):
-        k_pages_cpu[i] = torch.randn(num_kv_heads, head_size, dtype=dtype)
-        v_pages_cpu[i] = torch.randn(num_kv_heads, head_size, dtype=dtype)
+        block_idx = i // block_size
+        block_offset = i % block_size
+        k_pages_cpu[block_idx][block_offset] = torch.randn(num_kv_heads, head_size, dtype=dtype)
+        v_pages_cpu[block_idx][block_offset] = torch.randn(num_kv_heads, head_size, dtype=dtype)
 
     cu_query_lens = torch.tensor([0, query_len], dtype=torch.int32)
     kv_lens_tensor = torch.tensor([kv_len], dtype=torch.int32)
@@ -1253,50 +1249,49 @@ def test_reshape_and_cache_scatter(
     num_tokens = len(block_indices)
     num_kv_heads, head_size, block_size = 8, 128, 64
     num_pages = max(block_indices) + 1
-    num_slots = num_pages * block_size
     cache_device = torch.device(configure_device)
+    slots = [b * block_size + o for b, o in zip(block_indices, block_offsets)]
 
     key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
     value = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
-    slots = [b * block_size + o for b, o in zip(block_indices, block_offsets)]
 
-    def fresh_cache():
+    def fresh_pages():
         # Sentinel fill, not zeros, so an untouched slot is distinguishable.
-        return torch.full((num_slots, num_kv_heads, head_size), -7.0, dtype=torch.float16)
+        return torch.full(
+            (num_pages, block_size, num_kv_heads, head_size), -7.0, dtype=torch.float16
+        )
 
-    k_expected, v_expected = fresh_cache(), fresh_cache()
-    for t, slot in enumerate(slots):
-        k_expected[slot] = key[t]
-        v_expected[slot] = value[t]
+    k_expected, v_expected = fresh_pages(), fresh_pages()
+    for t, (block, offset) in enumerate(zip(block_indices, block_offsets)):
+        k_expected[block][offset] = key[t]
+        v_expected[block][offset] = value[t]
 
-    k_actual = _to_cache_device(fresh_cache(), cache_device, block_size)
-    v_actual = _to_cache_device(fresh_cache(), cache_device, block_size)
-    k_slots = k_actual.view(num_slots, num_kv_heads, head_size)
-    v_slots = v_actual.view(num_slots, num_kv_heads, head_size)
-    attn_impl = SpyreAttentionImpl(
-        num_heads=num_kv_heads,
-        head_size=head_size,
-        scale=head_size**-0.5,
-        num_kv_heads=num_kv_heads,
-    )
+    k_actual = _to_cache_device(fresh_pages(), cache_device)
+    v_actual = _to_cache_device(fresh_pages(), cache_device)
+
     if source_layout == "qkv_split":
         query = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
         key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
     else:
         key_src, value_src = convert(key, cache_device), convert(value, cache_device)
 
+    attn_impl = SpyreAttentionImpl(
+        num_heads=num_kv_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+    )
     attn_impl._reshape_and_cache(
         key_src,
         value_src,
-        k_slots,
-        v_slots,
+        k_actual,
+        v_actual,
         convert(torch.tensor(slots, dtype=torch.int32), cache_device),
     )
 
     # A Spyre round trip perturbs fp16 by up to an ulp, so this is not bit-exact.
-    flat = (num_slots, num_kv_heads, head_size)
-    torch.testing.assert_close(k_actual.to("cpu").view(flat), k_expected, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(v_actual.to("cpu").view(flat), v_expected, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(k_actual.to("cpu"), k_expected, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(v_actual.to("cpu"), v_expected, atol=1e-2, rtol=1e-2)
 
     # Release Spyre DMA mappings eagerly (see _run_spyre_attn_test).
     if configure_device == "spyre":

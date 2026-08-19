@@ -86,18 +86,21 @@ QUERY_CHUNK_SIZE = 32
 # yields an unsupported Mod(var, 32) stick coord. Otherwise fall back to CPU.
 ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE = 128
 
+# Elements per stick for int32 (128-byte stick / 4 bytes). Page-index rows are
+# padded to this width so each row starts on a stick boundary; see
+# SpyreAttentionMetadata.page_index_table.
+INT32_ELEMS_PER_STICK = 32
+
 
 class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
 
-    Each field is one dense tensor of the shape
-    `SpyreAttentionBackend.get_kv_cache_shape` advertises,
-    [num_blocks, block_size, num_kv_heads, head_size], on the Spyre device.
-    `SpyreAttentionImpl.forward` views the two leading dims as one slot axis, so
-    both the write and the page read index one dimension, which is all the
-    backend supports per access.
+    Each field is one dense tensor of shape
+    [num_blocks, block_size, num_kv_heads, head_size] on the Spyre device,
+    matching `SpyreAttentionBackend.get_kv_cache_shape`.
 
-    Must be allocated with the slot axis outermost in the device layout, see
+    Must be allocated with the slot axis outermost in the device layout so
+    reshape_and_cache can scatter through a slot-major view, see
     `slot_major_kv_layout`.
 
     NamedTuple (not dataclass) because it is a tuple at runtime, so unpacking
@@ -179,10 +182,10 @@ def _create_compilable_reshape_and_cache(num_tokens: int):
     of compiled variants, since the store specializes on it under dynamic=False.
     """
 
-    def specialized_reshape_and_cache_kernel(key, value, k_pages, v_pages, slot_mapping):
+    def specialized_reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
         # Correct only on a slot-outermost cache; see slot_major_kv_layout.
-        k_pages.index_copy_(0, slot_mapping, key)
-        v_pages.index_copy_(0, slot_mapping, value)
+        k_slots.index_copy_(0, slot_mapping, key)
+        v_slots.index_copy_(0, slot_mapping, value)
 
     return specialized_reshape_and_cache_kernel
 
@@ -203,7 +206,7 @@ def _create_compilable_page_attn(
         q,
         k_pages,
         v_pages,
-        slot_index_table,
+        page_index_table,
         mask_tiles,
         scale,
         alibi_bias_tiles=None,
@@ -212,10 +215,11 @@ def _create_compilable_page_attn(
         This kernels specializes for num_blocks and padded_query_len.
 
         Expected shapes:
-            k_pages: [num_slots_total, num_kv_heads, head_size]
-            v_pages: [num_slots_total, num_kv_heads, head_size]
-            slot_index_table: [num_blocks, block_size] int32 device tensor,
-                row i holding the cache slot ids of the i-th active block.
+            k_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
+            v_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
+            page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
+                tensor, row i holding the i-th active block's page index at
+                column 0.
             mask_tiles: [num_blocks]
             alibi_bias_tiles: list of [num_kv_heads, num_queries_per_kv, 1, block_size]
                 (only when has_alibi=True; None otherwise). The query-axis dim
@@ -229,17 +233,14 @@ def _create_compilable_page_attn(
         tile_output = None
 
         for i in range(num_blocks):
-            # .clone(), not .contiguous(): torch-spyre#3851. Eager only; the
-            # gather is still short under SPYRE_FORCE_COMPILE_ATTN=1.
-            slot_ids = slot_index_table[i].clone()
-            # index_select, not subscripting: subscripting lowers to aten.index,
-            # which upcasts the int32 index to int64 and fails eager.
-            k_page = k_pages.index_select(0, slot_ids)
-            v_page = v_pages.index_select(0, slot_ids)
-            # Gathered page is [block_size, num_kv_heads, head_size]; permute puts
-            # num_kv_heads back on the batch axis the matmuls need.
-            k_page_4d = k_page.permute(1, 0, 2).unsqueeze(1)
-            v_page_4d = v_page.permute(1, 0, 2).unsqueeze(1)
+            # index_select, not `k_pages[page_idx]`: subscripting lowers to
+            # aten.index, which upcasts the int32 index to int64 and fails eager.
+            page_idx = page_index_table[i, 0:1]
+            k_page = k_pages.index_select(0, page_idx)
+            v_page = v_pages.index_select(0, page_idx)
+            # Token-major page to head-major for the matmuls; permutes on device.
+            k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+            v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
 
             mask_tile = mask_tiles[i]
 
@@ -357,10 +358,13 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # per 256-token tier, not per distinct sequence length.
     aligned_max_seq_len: int = 0
 
-    # Gather indices for the paged attention loop: [num_seqs, max_active_blocks,
-    # block_size] int32, [s, b] = slot ids of sequence s's b-th active block.
-    slot_index_table_cpu: torch.Tensor | None = None
-    slot_index_table: torch.Tensor | None = None
+    # Gather indices for the paged attention loop, one row per active block:
+    # [num_seqs, max_active_blocks, INT32_ELEMS_PER_STICK] int32 with the page
+    # index at [s, b, 0]. Each index needs its own stick-wide row to compile,
+    # which is why block_table cannot serve as the index. The device mirror is
+    # filled by the first forward(), since the builder's device is CPU.
+    page_index_table_cpu: torch.Tensor | None = None
+    page_index_table: torch.Tensor | None = None
 
     # slot_mapping[:num_actual_tokens] on the pages' device, the scatter index.
     slot_mapping_device: torch.Tensor | None = None
@@ -733,17 +737,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 active_block_indices.append(active_bs)
                 attention_mask_tiles.append(tiles)
 
-        # Expand active page indices into their slot ids once per step, so the
-        # per-layer forward does no host-side block_table reads.
+        # Gather indices for the attention loop, one row per active block.
         num_active = [len(tiles) for tiles in attention_mask_tiles]
-        slot_index_table_cpu = torch.zeros(
-            num_seqs, max(max(num_active, default=0), 1), block_size, dtype=torch.int32
+        page_index_table_cpu = torch.zeros(
+            num_seqs, max(num_active), INT32_ELEMS_PER_STICK, dtype=torch.int32
         )
-        within_page = torch.arange(block_size, dtype=torch.int32)
         for s, n in enumerate(num_active):
             blocks_s = slice(n) if active_block_indices is None else active_block_indices[s]
-            pages = block_table[s, blocks_s].to(torch.int32)
-            slot_index_table_cpu[s, :n] = pages.unsqueeze(1) * block_size + within_page
+            page_index_table_cpu[s, :n, 0] = block_table[s, blocks_s]
 
         return SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
@@ -760,7 +761,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             num_heads=self.num_heads,
             attention_mask_tiles=attention_mask_tiles,
             active_block_indices=active_block_indices,
-            slot_index_table_cpu=slot_index_table_cpu,
+            page_index_table_cpu=page_index_table_cpu,
             aligned_max_query_len=aligned_max_query_len,
             aligned_max_seq_len=aligned_max_seq_len,
         )
@@ -827,11 +828,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     """Online-softmax paged attention iterating over KV pages.
 
     KV cache is a tuple (k_pages, v_pages) where each is one dense tensor of
-    shape [num_blocks, block_size, num_kv_heads, head_size] on Spyre, viewed as
-    [num_blocks * block_size, num_kv_heads, head_size] here. Both directions are
-    indirect accesses on the slot axis: reshape_and_cache scatters by
-    slot_mapping, and the per-page read gathers that page's slot ids from
-    SpyreAttentionMetadata.slot_index_table. No gather masks.
+    shape [num_blocks, block_size, num_kv_heads, head_size] on Spyre. Pages are
+    read by indirect access, indexing the dense tensor with a device-resident
+    page index. No gather masks. reshape_and_cache writes through a slot-major
+    view of the same tensor, so a token's destination is a single index.
 
     On Spyre, the per-page attention loop and reshape_and_cache are compiled
     via torch.compile with fixed iteration counts. A dict
@@ -941,18 +941,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _target_device = k_pages.device
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Both accesses index slots, so flatten blocks and offsets into one axis.
-        # Correct only because the slot axis is outermost in the device layout,
-        # which a view does not change; see slot_major_kv_layout.
-        k_slots = k_pages.view(-1, self.num_kv_heads, self.head_size)
-        v_slots = v_pages.view(-1, self.num_kv_heads, self.head_size)
-
-        # The builder runs on CPU, so the device mirrors are made here instead;
-        # only the first layer of a step pays for them.
-        if attn_metadata.slot_index_table is None:
-            assert attn_metadata.slot_index_table_cpu is not None
-            attn_metadata.slot_index_table = convert(
-                attn_metadata.slot_index_table_cpu, device=_target_device
+        # Only the first layer of a step pays for the device mirror.
+        if attn_metadata.page_index_table is None:
+            assert attn_metadata.page_index_table_cpu is not None
+            attn_metadata.page_index_table = convert(
+                attn_metadata.page_index_table_cpu, device=_target_device
             )
         if attn_metadata.slot_mapping_device is None:
             # vLLM builds slot_mapping on the device already, so this is a no-op
@@ -982,8 +975,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._reshape_and_cache(
             key[:num_actual_tokens],
             value[:num_actual_tokens],
-            k_slots,
-            v_slots,
+            k_pages,
+            v_pages,
             attn_metadata.slot_mapping_device,
         )
 
@@ -994,8 +987,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         output = self._online_softmax_attention(
             query_dev,
             query_cpu[:num_actual_tokens] if query_cpu is not None else None,
-            k_slots,
-            v_slots,
+            k_pages,
+            v_pages,
             attn_metadata,
             output,
             _target_device,
@@ -1016,7 +1009,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         key, value: [num_tokens, num_kv_heads, head_size] on the pages' device,
             strided last-dim views of the fused QKV output
-        k_pages, v_pages: [num_blocks * block_size, num_kv_heads, head_size]
+        k_pages, v_pages: [num_blocks, block_size, num_kv_heads, head_size]
         slot_mapping: [num_tokens] on the pages' device
         """
         # A source on the wrong device falls back to CPU silently, without raising.
@@ -1024,8 +1017,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             f"reshape_and_cache source is on {key.device.type}, pages on {k_pages.device.type}"
         )
 
+        # A slot is one index, so blocks and offsets collapse into one axis here.
+        # The view is only correct because that axis is outermost in the device
+        # layout, which a view does not change; see slot_major_kv_layout.
+        slots = (-1, k_pages.shape[2], k_pages.shape[3])
         fn = self._get_reshape_fn(key.shape[0])
-        fn(key, value, k_pages, v_pages, slot_mapping)
+        fn(key, value, k_pages.view(slots), v_pages.view(slots), slot_mapping)
 
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
@@ -1041,9 +1038,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """FlashAttention-style online softmax iterating over KV pages (varlen).
 
         Handles multiple sequences using query_start_loc for the varlen layout.
-        k_pages/v_pages are dense [num_blocks * block_size, num_kv_heads,
-        head_size] tensors on Spyre; each iteration gathers one page's slot ids
-        with an int32 device index, then feeds the page to bmm.
+        k_pages/v_pages are dense [num_blocks, block_size, num_kv_heads,
+        head_size] tensors on Spyre; each iteration gathers one page with a
+        one-element int32 device index, then feeds it to bmm without slicing.
 
         Writes results directly into the caller's output buffer in-place.
 
@@ -1069,11 +1066,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         mask_tiles_all = attn_metadata.attention_mask_tiles
         active_block_indices_all = attn_metadata.active_block_indices
         aligned_max_query_len = attn_metadata.aligned_max_query_len
-        slot_index_table_all = attn_metadata.slot_index_table
+        page_index_table_all = attn_metadata.page_index_table
         assert mask_tiles_all is not None, (
             "attention_mask_tiles must be precomputed by the metadata builder"
         )
-        assert slot_index_table_all is not None, "slot_index_table must be mirrored by forward()"
+        assert page_index_table_all is not None, "page_index_table must be mirrored by forward()"
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
@@ -1140,9 +1137,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 output[q_start:q_end] = 0.0
                 continue
 
-            # Pass the whole sub-table and let the kernel slice row i, so the row
-            # slices stay inside the graph instead of becoming num_blocks inputs.
-            slot_index_table = slot_index_table_all[seq_idx]
+            page_index_table = page_index_table_all[seq_idx]
             # mask_tiles_all[seq_idx] is indexed by position within active_bs.
             mask_tiles = [
                 convert(mask_tiles_all[seq_idx][i], device=_target_device)
@@ -1184,7 +1179,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 q_dev,
                 k_pages,
                 v_pages,
-                slot_index_table,
+                page_index_table,
                 mask_tiles,
                 self.scale,
                 alibi_bias_tiles=alibi_bias_tiles,

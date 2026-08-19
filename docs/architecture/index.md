@@ -94,28 +94,20 @@ in the attention backend, where offset > 0 views still corrupt on transfer (see
 ## Attention Backend
 
 The `SpyreAttentionBackend` implements paged attention using pure PyTorch operations
-(no custom CUDA kernels). The KV cache is one dense tensor per layer on Spyre of the
-shape `SpyreAttentionBackend.get_kv_cache_shape` advertises,
-`[num_blocks, block_size, num_kv_heads, head_size]`, allocated with the slot axis
-outermost in the device layout. `SpyreAttentionImpl.forward` views the two leading dims
-as one slot axis, so both the write and the page read index one dimension, which is all
-the backend supports per access. The pinned device layout is what makes that view
-correct — a plain view over a default-layout cache writes to the wrong rows. It runs a FlashAttention-style
+(no custom CUDA kernels). The KV cache is one dense tensor per layer on Spyre,
+`[num_blocks, block_size, num_kv_heads, head_size]` — the shape
+`SpyreAttentionBackend.get_kv_cache_shape` advertises. It runs a FlashAttention-style
 online softmax that iterates over pages without any compact-gather step, reading each
-page by gathering its `block_size` slot ids with an int32 device tensor (an indirect
+page by indexing the dense tensor with a one-element int32 device tensor (an indirect
 access, so the compiled bundle carries a real index rather than a constant slice) and
-permuting `num_kv_heads` back onto the batch axis before the matmuls.
-
-The cache must be allocated with the slot axis outermost in the *device* layout
-(`slot_major_kv_layout`); on the default layout the indirect store writes to the wrong
-rows and raises nothing (torch-spyre#3705, fixed by torch-spyre#3409 but not yet in
-our pinned rev). That is why the runner allocates on the
-host and transfers, rather than calling `torch.zeros(device=spyre)` directly.
+permuting the token-major page to head-major on device before the matmuls. The cache is
+allocated with the slot axis outermost in the device layout (`slot_major_kv_layout`) so
+the write can scatter through a slot-major view of it:
 
 | Step | Device | Operation |
 |---|---|---|
-| 1. q/k/v → CPU | CPU | Bring `q`, `k`, `v` to CPU once (Spyre slicing corrupts strided views) |
-| 2. Reshape & cache | Spyre | One compiled `index_copy_` per tensor, scattering new K/V into the slots named by `slot_mapping` (no host-side page indices, no per-run dispatch) |
+| 1. q → CPU | CPU | Bring `q` to CPU when its layout cannot be assembled on device; `k`/`v` stay put |
+| 2. Reshape & cache | Spyre | Scatter new K/V into the cache through a slot-major view: a token's destination is one index, so it is a single `index_copy_` per tensor |
 | 3. Per-sequence varlen loop | CPU | Iterate sequences via `query_start_loc`, pad `query_len` to 32 |
 | 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, padded_query_len)` kernel: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 5. Write-back | CPU → Spyre | Stage each sequence's result into a CPU buffer, then one bulk copy into the Spyre output (per-token `spyre.overwrite` scatter doesn't scale) |
