@@ -67,6 +67,12 @@ For questions about Spyre architecture, the PyTorch/vLLM stack, or hardware inte
 - **Prefer simplicity** and match existing patterns/architecture when uncertain.
 - Assume general vLLM familiarity in the reader.
 
+## Opening a PR
+
+Before pushing and opening a PR, invoke the `pr-cleanup` skill
+(`.claude/skills/pr-cleanup/SKILL.md`). It strips over-verbose comments, docstrings and
+commit messages, then covers the push and PR-body conventions.
+
 ## DCO (Developer Certificate of Origin)
 
 All commits must include a `Signed-off-by` line. Use the `-s` flag or append manually:
