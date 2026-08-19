@@ -649,9 +649,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Allocate KV cache as one dense slot-major tensor per layer on Spyre.
 
         Each layer gets its own SpyrePagedKVCache(k_pages, v_pages) where each is
-        a single tensor of shape [num_blocks * block_size, num_kv_heads,
-        head_size] — the slot-flattened form of the shape
-        SpyreAttentionBackend.get_kv_cache_shape advertises.
+        a single tensor of the shape SpyreAttentionBackend.get_kv_cache_shape
+        advertises, [num_blocks, block_size, num_kv_heads, head_size]. The slot
+        axis is pinned outermost in the device layout so the backend can view the
+        two leading dims as one and index slots directly.
         """
         from vllm.v1.worker.utils import bind_kv_cache
         from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -682,7 +683,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             )
             k_pages, v_pages = (
                 torch.zeros(
-                    num_slots,
+                    num_blocks,
+                    spec.block_size,
                     spec.num_kv_heads,
                     spec.head_size,
                     dtype=torch.float16,

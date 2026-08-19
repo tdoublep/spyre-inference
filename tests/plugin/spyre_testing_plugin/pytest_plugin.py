@@ -994,13 +994,13 @@ def patch_backend_list(request, monkeypatch):
             def to_slot_major(blocks):
                 # block_size next to num_blocks so the two flatten into the slot axis.
                 flat = blocks.permute(0, 2, 1, 3).contiguous()
-                flat = flat.reshape(num_slots, num_kv_heads, head_size)
-                if flat.device.type != "spyre":
-                    return flat
-                return flat.cpu().to(
-                    flat.device,
+                blocked = flat.reshape(num_blocks, block_size, num_kv_heads, head_size)
+                if blocked.device.type != "spyre":
+                    return blocked
+                return blocked.cpu().to(
+                    blocked.device,
                     device_layout=slot_major_kv_layout(
-                        num_slots, num_kv_heads, head_size, flat.dtype
+                        num_slots, num_kv_heads, head_size, blocked.dtype
                     ),
                 )
 

@@ -33,15 +33,20 @@ from spyre_testing_plugin.pytest_plugin import spyre_available
 pytestmark = pytest.mark.attention
 
 
-def _to_cache_device(cache_cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Move a KV cache to ``device``, pinning the slot-major layout on Spyre.
+def _to_cache_device(
+    cache_cpu: torch.Tensor, device: torch.device, block_size: int
+) -> torch.Tensor:
+    """Move a slot-major KV cache to ``device`` as the runner allocates it.
 
-    Matches how the model runner allocates; the scatter depends on it.
+    Takes the flat [num_slots, ...] form the reference math uses and returns the
+    blocked [num_blocks, block_size, ...] form the backend receives, with the slot
+    axis pinned outermost in the device layout.
     """
-    if device.type != "spyre":
-        return cache_cpu.to(device)
     num_slots, num_kv_heads, head_size = cache_cpu.shape
-    return cache_cpu.to(
+    blocked = cache_cpu.view(num_slots // block_size, block_size, num_kv_heads, head_size)
+    if device.type != "spyre":
+        return blocked.to(device)
+    return blocked.to(
         device,
         device_layout=slot_major_kv_layout(num_slots, num_kv_heads, head_size, cache_cpu.dtype),
     )
@@ -413,8 +418,8 @@ def _run_spyre_attn_test(
         q_offset += query_len
     slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
-    k_pages = _to_cache_device(k_pages_cpu, cache_device)
-    v_pages = _to_cache_device(v_pages_cpu, cache_device)
+    k_pages = _to_cache_device(k_pages_cpu, cache_device, block_size)
+    v_pages = _to_cache_device(v_pages_cpu, cache_device, block_size)
 
     attn_metadata = _build_metadata(
         num_query_heads=num_query_heads,
@@ -1264,8 +1269,10 @@ def test_reshape_and_cache_scatter(
         k_expected[slot] = key[t]
         v_expected[slot] = value[t]
 
-    k_actual = _to_cache_device(fresh_cache(), cache_device)
-    v_actual = _to_cache_device(fresh_cache(), cache_device)
+    k_actual = _to_cache_device(fresh_cache(), cache_device, block_size)
+    v_actual = _to_cache_device(fresh_cache(), cache_device, block_size)
+    k_slots = k_actual.view(num_slots, num_kv_heads, head_size)
+    v_slots = v_actual.view(num_slots, num_kv_heads, head_size)
     attn_impl = SpyreAttentionImpl(
         num_heads=num_kv_heads,
         head_size=head_size,
@@ -1281,14 +1288,15 @@ def test_reshape_and_cache_scatter(
     attn_impl._reshape_and_cache(
         key_src,
         value_src,
-        k_actual,
-        v_actual,
+        k_slots,
+        v_slots,
         convert(torch.tensor(slots, dtype=torch.int32), cache_device),
     )
 
     # A Spyre round trip perturbs fp16 by up to an ulp, so this is not bit-exact.
-    torch.testing.assert_close(k_actual.to("cpu"), k_expected, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(v_actual.to("cpu"), v_expected, atol=1e-2, rtol=1e-2)
+    flat = (num_slots, num_kv_heads, head_size)
+    torch.testing.assert_close(k_actual.to("cpu").view(flat), k_expected, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(v_actual.to("cpu").view(flat), v_expected, atol=1e-2, rtol=1e-2)
 
     # Release Spyre DMA mappings eagerly (see _run_spyre_attn_test).
     if configure_device == "spyre":

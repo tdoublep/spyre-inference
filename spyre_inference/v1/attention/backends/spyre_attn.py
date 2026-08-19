@@ -90,12 +90,12 @@ ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE = 128
 class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
 
-    Each field is one dense tensor of shape
-    [num_blocks * block_size, num_kv_heads, head_size] on the Spyre device --
-    the slot-flattened form of the shape
-    `SpyreAttentionBackend.get_kv_cache_shape` advertises. Flattening blocks and
-    offsets into a single slot axis lets both the write and the page read index
-    one dimension, which is all the backend supports per access.
+    Each field is one dense tensor of the shape
+    `SpyreAttentionBackend.get_kv_cache_shape` advertises,
+    [num_blocks, block_size, num_kv_heads, head_size], on the Spyre device.
+    `SpyreAttentionImpl.forward` views the two leading dims as one slot axis, so
+    both the write and the page read index one dimension, which is all the
+    backend supports per access.
 
     Must be allocated with the slot axis outermost in the device layout, see
     `slot_major_kv_layout`.
@@ -827,8 +827,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     """Online-softmax paged attention iterating over KV pages.
 
     KV cache is a tuple (k_pages, v_pages) where each is one dense tensor of
-    shape [num_blocks * block_size, num_kv_heads, head_size] on Spyre. Both
-    directions are indirect accesses on dim 0: reshape_and_cache scatters by
+    shape [num_blocks, block_size, num_kv_heads, head_size] on Spyre, viewed as
+    [num_blocks * block_size, num_kv_heads, head_size] here. Both directions are
+    indirect accesses on the slot axis: reshape_and_cache scatters by
     slot_mapping, and the per-page read gathers that page's slot ids from
     SpyreAttentionMetadata.slot_index_table. No gather masks.
 
@@ -940,6 +941,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _target_device = k_pages.device
         num_actual_tokens = attn_metadata.num_actual_tokens
 
+        # Both accesses index slots, so flatten blocks and offsets into one axis.
+        # Correct only because the slot axis is outermost in the device layout,
+        # which a view does not change; see slot_major_kv_layout.
+        k_slots = k_pages.view(-1, self.num_kv_heads, self.head_size)
+        v_slots = v_pages.view(-1, self.num_kv_heads, self.head_size)
+
         # The builder runs on CPU, so the device mirrors are made here instead;
         # only the first layer of a step pays for them.
         if attn_metadata.slot_index_table is None:
@@ -975,8 +982,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._reshape_and_cache(
             key[:num_actual_tokens],
             value[:num_actual_tokens],
-            k_pages,
-            v_pages,
+            k_slots,
+            v_slots,
             attn_metadata.slot_mapping_device,
         )
 
@@ -987,8 +994,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         output = self._online_softmax_attention(
             query_dev,
             query_cpu[:num_actual_tokens] if query_cpu is not None else None,
-            k_pages,
-            v_pages,
+            k_slots,
+            v_slots,
             attn_metadata,
             output,
             _target_device,

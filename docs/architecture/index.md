@@ -94,11 +94,13 @@ in the attention backend, where offset > 0 views still corrupt on transfer (see
 ## Attention Backend
 
 The `SpyreAttentionBackend` implements paged attention using pure PyTorch operations
-(no custom CUDA kernels). The KV cache is one dense slot-major tensor per layer on
-Spyre, `[num_blocks * block_size, num_kv_heads, head_size]` — the slot-flattened form
-of the shape `SpyreAttentionBackend.get_kv_cache_shape` advertises. Flattening blocks
-and offsets into a single slot axis means both the write and the page read index one
-dimension, which is all the backend supports per access. It runs a FlashAttention-style
+(no custom CUDA kernels). The KV cache is one dense tensor per layer on Spyre of the
+shape `SpyreAttentionBackend.get_kv_cache_shape` advertises,
+`[num_blocks, block_size, num_kv_heads, head_size]`, allocated with the slot axis
+outermost in the device layout. `SpyreAttentionImpl.forward` views the two leading dims
+as one slot axis, so both the write and the page read index one dimension, which is all
+the backend supports per access. The pinned device layout is what makes that view
+correct — a plain view over a default-layout cache writes to the wrong rows. It runs a FlashAttention-style
 online softmax that iterates over pages without any compact-gather step, reading each
 page by gathering its `block_size` slot ids with an int32 device tensor (an indirect
 access, so the compiled bundle carries a real index rather than a constant slice) and
