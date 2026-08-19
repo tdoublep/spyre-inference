@@ -678,7 +678,7 @@ def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
 
 
 # ---------------------------------------------------------------------------
-# 7. storage_offset on compiled-graph inputs
+# 8. storage_offset on compiled-graph inputs
 # ---------------------------------------------------------------------------
 
 
