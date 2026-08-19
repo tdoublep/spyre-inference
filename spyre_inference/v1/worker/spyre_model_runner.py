@@ -66,6 +66,14 @@ from vllm.v1.worker.cpu_model_runner import _torch_cuda_wrapper
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
 from spyre_inference.custom_ops.rotary_embedding import _SpyreRotaryMixin
+from spyre_inference.custom_ops.head_pad import (
+    fix_padded_attention_scale,
+    fix_padded_rope,
+    install_head_pad_weight_loader,
+    install_padded_head_dim,
+    reject_padded_qk_norm,
+    verify_padded_head_dim,
+)
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
@@ -392,6 +400,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         self._install_pooling_model_patches(self.model_config)
 
+        # Pad attention weights (q/k/v/o) to the stick-aligned head_dim as they
+        # stream in, when the platform overrode head_dim (e.g. head_size=64).
+        # Must run before load_model builds+loads the (now 128-wide) params.
+        install_padded_head_dim(self.model_config)
+        install_head_pad_weight_loader(model_loader, self.model_config.hf_config)
+
         # Load model on CPU
         self.model = model_loader.load_model(
             vllm_config=self.vllm_config, model_config=self.model_config
@@ -407,6 +421,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
             raise NotImplementedError(
                 "Models with a drafter model are not yet implemented and tested for Spyre."
             )
+
+        # Restore original RoPE frequencies and attention scale corrupted by the
+        # head_dim width override (no-op unless the platform padded head_dim).
+        verify_padded_head_dim(self.model, self.model_config.hf_config)
+        reject_padded_qk_norm(self.model, self.model_config.hf_config)
+        fix_padded_rope(self.model, self.model_config.hf_config)
+        fix_padded_attention_scale(self.model, self.model_config.hf_config)
 
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
