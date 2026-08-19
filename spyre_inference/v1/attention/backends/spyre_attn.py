@@ -158,10 +158,8 @@ def _create_compilable_page_attn(
     Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi, and
     logits_soft_cap are closure constants.
 
-    The query pad (``pad_query_from_one``) and the [query, head, dim] output
-    relayout both run inside the graph. Done outside, each is an eager
-    single-op dispatch whose ~0.4ms host cost dwarfs its device kernel; inside,
-    inductor folds them into the surrounding loads and stores.
+    The query pad and output relayout run in-graph; outside, each is a separate
+    eager dispatch.
     """
 
     def specialized_paged_attn_kernel(
@@ -178,8 +176,7 @@ def _create_compilable_page_attn(
 
         Expected shapes:
             q: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size],
-                or the same with a query axis of 1 when pad_query_from_one is
-                set (the kernel zero-pads it up to padded_query_len).
+                or a query axis of 1 when pad_query_from_one is set.
             k_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
             v_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
             page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
@@ -192,8 +189,7 @@ def _create_compilable_page_attn(
                 the derivation at the bias-tile construction site in
                 _online_softmax_attention.
 
-        Returns [padded_query_len, num_heads, head_size]; the caller slices off
-        the padding rows and writes the result into its output buffer.
+        Returns [padded_query_len, num_heads, head_size].
         """
         if pad_query_from_one and padded_query_len > 1:
             q = torch.nn.functional.pad(q, (0, 0, 0, padded_query_len - 1))
@@ -250,9 +246,6 @@ def _create_compilable_page_attn(
 
         assert tile_output is not None and tile_sum is not None
         attn = tile_output / tile_sum
-
-        # [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
-        #   -> [padded_query_len, num_heads, head_size]
         attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
         return attn.reshape(padded_query_len, num_heads, head_size)
 
@@ -346,8 +339,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Device mirror of slot_mapping, which vLLM hands us on the host.
     slot_mapping_device: torch.Tensor | None = None
 
-    # Device mirror of attention_mask_tiles. The tiles are identical for every
-    # layer of a step, so the first forward() pays the transfer for all of them.
+    # Device mirror of attention_mask_tiles, filled once per step by forward().
     attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
 
     @property
@@ -864,8 +856,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # back to CPU with an int64 one.
         self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
 
-        # Compiled attention loops, keyed by
-        # (num_blocks, padded_query_len, pad_query_from_one)
+        # Compiled attention loops, keyed by (num_blocks, padded_query_len, pad_from_one)
         self._attn_fns: dict[tuple[int, int, bool], object] = {}
 
         logger.debug_once(
@@ -1108,9 +1099,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     bias = self.alibi_slopes * rel
                     alibi_bias_tiles.append(convert(bias, device=_target_device))
 
-            # Run attention on target device. The kernel returns
-            # [aligned_max_query_len, num_heads, head_size] — the relayout from the
-            # [KV, QPK, query, dim] accumulator happens inside its graph.
             attn_fn = self._get_attn_fn(len(active_bs), aligned_max_query_len, pad_query_from_one)
             result = attn_fn(
                 q_dev,
@@ -1122,8 +1110,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 alibi_bias_tiles=alibi_bias_tiles,
             )
 
-            # q_start is a Python int, so the dim-0 write offset is a concrete constant.
-            result = convert(result, dtype=output.dtype)
+            # A mismatch would cast via CPU on every layer; fail loudly instead.
+            assert result.dtype == output.dtype
             output[q_start:q_end] = result[:query_len]
 
         return output
