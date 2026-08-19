@@ -983,8 +983,7 @@ def patch_backend_list(request, monkeypatch):
         if backend == AttentionBackendEnum.CUSTOM:
 
             def pin_slot_major(blocks):
-                # The KV write scatters through a slot-major view of the cache,
-                # which the default device layout would put on the wrong rows.
+                # The KV write needs the slot-outermost layout, not the default.
                 if blocks.device.type != "spyre":
                     return blocks
                 from spyre_inference.v1.attention.backends.spyre_attn import (

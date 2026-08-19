@@ -653,8 +653,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
         head_size], matching the shape SpyreAttentionBackend.get_kv_cache_shape
         advertises. The attention kernel selects a page by indexing with a
         one-element device tensor, so the page read is a real indirect access.
-        The slot axis is pinned outermost in the device layout so the KV write
-        can scatter through a slot-major view of the same tensor.
         """
         from vllm.v1.worker.utils import bind_kv_cache
         from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -677,8 +675,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             spec = spec_by_layer[kv_cache_tensor.shared_by[0]]
             num_blocks = kv_cache_tensor.size // spec.page_size_bytes
 
-            # Allocated on the host and transferred because only .to() takes a
-            # device_layout; torch.zeros(device=spyre) gets the default one.
+            # Host-allocated then transferred: only .to() takes a device_layout.
             layout = slot_major_kv_layout(
                 num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
             )

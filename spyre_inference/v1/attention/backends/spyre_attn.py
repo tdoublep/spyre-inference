@@ -99,10 +99,6 @@ class SpyrePagedKVCache(NamedTuple):
     [num_blocks, block_size, num_kv_heads, head_size] on the Spyre device,
     matching `SpyreAttentionBackend.get_kv_cache_shape`.
 
-    Must be allocated with the slot axis outermost in the device layout so
-    reshape_and_cache can scatter through a slot-major view, see
-    `slot_major_kv_layout`.
-
     NamedTuple (not dataclass) because it is a tuple at runtime, so unpacking
     (`k_pages, v_pages = cache`) traces cleanly under Dynamo without relying on
     attribute access on a custom object.
@@ -118,11 +114,8 @@ class SpyrePagedKVCache(NamedTuple):
 
 
 def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtype: torch.dtype):
-    """Device layout for a KV cache tensor with the slot axis outermost.
-
-    Without it the indirect store writes to the wrong rows and raises nothing
-    (torch-spyre#3705); test_spyre_slot_major_scatter_needs_pinned_layout pins that.
-    """
+    """Slot-axis-outermost layout; without it the indirect store silently
+    writes to the wrong rows (torch-spyre#3705)."""
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
 
     eps = get_elem_in_stick(dtype)
@@ -176,14 +169,11 @@ def _maybe_compile(fn):
 def _create_compilable_reshape_and_cache(num_tokens: int):
     """Create a reshape_and_cache with fixed token count for torch.compile.
 
-    A token's destination in the slot-major cache is a single index, so the
-    whole write is one indirect store per tensor no matter how the tokens are
-    spread across pages. ``num_tokens`` is unused in the body but keys the cache
-    of compiled variants, since the store specializes on it under dynamic=False.
+    ``num_tokens`` is unused in the body but keys the cache of compiled
+    variants, since the store specializes on it under dynamic=False.
     """
 
     def specialized_reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
-        # Correct only on a slot-outermost cache; see slot_major_kv_layout.
         k_slots.index_copy_(0, slot_mapping, key)
         v_slots.index_copy_(0, slot_mapping, value)
 
@@ -366,7 +356,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     page_index_table_cpu: torch.Tensor | None = None
     page_index_table: torch.Tensor | None = None
 
-    # slot_mapping[:num_actual_tokens] on the pages' device, the scatter index.
+    # Device mirror of slot_mapping, which vLLM hands us on the host.
     slot_mapping_device: torch.Tensor | None = None
 
     @property
@@ -830,8 +820,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     KV cache is a tuple (k_pages, v_pages) where each is one dense tensor of
     shape [num_blocks, block_size, num_kv_heads, head_size] on Spyre. Pages are
     read by indirect access, indexing the dense tensor with a device-resident
-    page index. No gather masks. reshape_and_cache writes through a slot-major
-    view of the same tensor, so a token's destination is a single index.
+    page index. No gather masks.
 
     On Spyre, the per-page attention loop and reshape_and_cache are compiled
     via torch.compile with fixed iteration counts. A dict
@@ -891,8 +880,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
     def _get_reshape_fn(self, num_tokens: int):
         if num_tokens not in self._reshape_fns:
-            # Unconditional, unlike the attention kernel's _maybe_compile opt-in:
-            # eager index_copy_ either raises or falls back to CPU.
+            # Always compiled: eager index_copy_ raises or falls back to CPU.
             self._reshape_fns[num_tokens] = torch.compile(
                 _create_compilable_reshape_and_cache(num_tokens), dynamic=False
             )
@@ -948,10 +936,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 attn_metadata.page_index_table_cpu, device=_target_device
             )
         if attn_metadata.slot_mapping_device is None:
-            # vLLM builds slot_mapping on the device already, so this is a no-op
-            # unless the caller assembled it on the host, as the tests do. The
-            # compiled store takes the int64 index as-is; casting it to int32 on
-            # device raises a hardware error (RAS 0x7b1b) on this pin.
             attn_metadata.slot_mapping_device = convert(
                 attn_metadata.slot_mapping[:num_actual_tokens], device=_target_device
             )
@@ -1017,9 +1001,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             f"reshape_and_cache source is on {key.device.type}, pages on {k_pages.device.type}"
         )
 
-        # A slot is one index, so blocks and offsets collapse into one axis here.
-        # The view is only correct because that axis is outermost in the device
-        # layout, which a view does not change; see slot_major_kv_layout.
+        # Valid because a view keeps the slot-outermost device layout.
         slots = (-1, k_pages.shape[2], k_pages.shape[3])
         fn = self._get_reshape_fn(key.shape[0])
         fn(key, value, k_pages.view(slots), v_pages.view(slots), slot_mapping)

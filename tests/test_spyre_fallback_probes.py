@@ -141,12 +141,9 @@ def test_spyre_matmul_output_dim_1(spyre_device, mode):
     strict=True,
     reason=(
         "Spyre cannot use a non-contiguous (strided) tensor as the source of "
-        "an indexed scatter write (torch-spyre#3508). Historically this forced "
-        "SpyreQKVParallelLinear to D2H before return, and later to un-fuse QKV "
-        "after load. It binds this eager 5D advanced-index form only; the "
-        "compiled index_copy_ takes a strided source "
-        "(test_spyre_slot_major_scatter_strided_source). The gap still "
-        "keeps encoder-only attention Q/K/V pack/unpack on CPU "
+        "this eager 5D advanced-index scatter (torch-spyre#3508); the compiled "
+        "index_copy_ takes one (test_spyre_slot_major_scatter_strided_source). "
+        "The gap keeps encoder-only attention Q/K/V pack/unpack on CPU "
         "(spyre_encoder_attn.py). Once this probe passes, move encoder "
         "ragged→dense packing back onto Spyre."
     ),
@@ -342,9 +339,7 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
     """Guard the page gather used by SpyreAttentionImpl.
 
     The index must be a one-element tensor taken as a row slice of a stick-wide
-    table (`table[b, 0:1]`). The attention kernel now gathers a whole row of slot
-    ids instead, but the constraint still holds for any single-page index.
-    Two nearby index forms do NOT work:
+    table (`table[b, 0:1]`). Two nearby index forms do NOT work:
       - a 0-dim scalar index (see test_spyre_indirect_matmul_tensor_index), and
       - a slice of a plain 1-D index tensor, or of a shared table row, which
         fails to compile rather than returning wrong values.
@@ -692,8 +687,7 @@ def _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device, pinned):
     base = torch.zeros(num_slots, num_kv_heads, head_size, dtype=torch.float16)
     if not pinned:
         return base.to(spyre_device)
-    # Prime torch-spyre autoload: .to(device_layout=) needs a live RuntimeContext,
-    # which a plain .to() would set up for us.
+    # .to(device_layout=) needs a live RuntimeContext; prime it.
     torch.empty(1, device=spyre_device)
     layout = slot_major_kv_layout(num_slots, num_kv_heads, head_size, torch.float16)
     return base.to(spyre_device, device_layout=layout)
@@ -709,12 +703,8 @@ def _slot_major_cache(num_slots, num_kv_heads, head_size, spyre_device, pinned):
                 strict=True,
                 reason=(
                     "On the default device layout index_copy_ writes to the wrong "
-                    "rows and raises nothing (torch-spyre#3705). Negative control for "
-                    "slot_major_kv_layout. Upstream #3409 added scatter destination "
-                    "enforcement and IS in our pin, but this still fails: it rewrites a "
-                    "producer buffer's layout or copies the destination in and back, and "
-                    "a KV cache arrives as a mutated graph input, so neither applies. If "
-                    "this XPASSes, the pinned layout and the host allocate-then-transfer go."
+                    "rows and raises nothing (torch-spyre#3705); if this XPASSes, "
+                    "slot_major_kv_layout and the host allocate-then-transfer can go."
                 ),
             ),
         ),
@@ -784,11 +774,8 @@ def test_spyre_slot_major_scatter_needs_compile(spyre_device, mode):
 
 
 def test_spyre_slot_major_scatter_strided_source(spyre_device):
-    """The compiled scatter takes k/v straight from the fused-QKV split.
-
-    Guards _reshape_and_cache passing its source through unpacked: a regression
-    here lands wrong data rather than raising.
-    """
+    """The compiled scatter takes k/v straight from the fused-QKV split; a
+    regression here lands wrong data rather than raising."""
     num_tokens, num_heads, num_kv_heads, head_size = 8, 32, 8, 128
     q_size, kv_size = num_heads * head_size, num_kv_heads * head_size
     num_slots = 512

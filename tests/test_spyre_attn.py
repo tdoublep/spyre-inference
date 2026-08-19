@@ -80,10 +80,8 @@ def configure_compilation(request, monkeypatch):
 
 
 def _to_cache_device(cache_cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """Move a KV cache to ``device``, pinning the slot-major layout on Spyre.
-
-    Matches how the model runner allocates; the scatter write depends on it.
-    """
+    """Move a KV cache to ``device``, pinning the slot-major layout on Spyre
+    exactly as the model runner allocates it."""
     if device.type != "spyre":
         return cache_cpu.to(device)
     num_blocks, block_size, num_kv_heads, head_size = cache_cpu.shape
@@ -98,11 +96,8 @@ def _to_cache_device(cache_cpu: torch.Tensor, device: torch.device) -> torch.Ten
 def _fused_qkv_kv_views(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """K/V as the backend receives them: strided last-dim views on ``device``.
-
-    The model splits the fused QKV on-device, so contiguous k/v would not
-    exercise the scatter's real source layout.
-    """
+    """K/V as the backend receives them: strided last-dim views of a fused QKV
+    on ``device``, which contiguous k/v would not exercise."""
     num_tokens = query.shape[0]
     slabs = [t.reshape(num_tokens, -1) for t in (query, key, value)]
     qkv = convert(torch.cat(slabs, dim=-1), device)
@@ -1240,11 +1235,8 @@ def test_reshape_and_cache_scatter(
     block_offsets,
     source_layout: str,
 ):
-    """The scatter writes exactly the mapped slots and nothing else.
-
-    Untouched slots keeping their sentinel is what catches an indirect store
-    landing on the wrong rows.
-    """
+    """The scatter writes exactly the mapped slots and nothing else; untouched
+    slots keeping their sentinel is what catches a store on the wrong rows."""
     set_random_seed(0)
     num_tokens = len(block_indices)
     num_kv_heads, head_size, block_size = 8, 128, 64
