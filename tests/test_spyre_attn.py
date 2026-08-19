@@ -47,6 +47,25 @@ def _to_cache_device(cache_cpu: torch.Tensor, device: torch.device) -> torch.Ten
     )
 
 
+def _fused_qkv_kv_views(
+    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """K/V as the backend receives them: strided last-dim views on ``device``.
+
+    The model splits the fused QKV on-device, so contiguous k/v would not
+    exercise the scatter's real source layout.
+    """
+    num_tokens = query.shape[0]
+    slabs = [t.reshape(num_tokens, -1) for t in (query, key, value)]
+    qkv = convert(torch.cat(slabs, dim=-1), device)
+    _, k_view, v_view = qkv.split([s.shape[-1] for s in slabs], dim=-1)
+    num_kv_heads, head_size = key.shape[1], key.shape[2]
+    return (
+        k_view.view(num_tokens, num_kv_heads, head_size),
+        v_view.view(num_tokens, num_kv_heads, head_size),
+    )
+
+
 @pytest.fixture()
 def configure_device(request, monkeypatch):
     """Configure overwrite_f and cache device based on the device_mode parameter.
@@ -422,11 +441,12 @@ def _run_spyre_attn_test(
 
     output = torch.empty_like(query).to(cache_device)
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
+    key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
     attn_impl.forward(
         layer=None,
         query=query,
-        key=key,
-        value=value,
+        key=key_src,
+        value=value_src,
         kv_cache=kv_cache,
         attn_metadata=attn_metadata,
         output=output,
@@ -1115,12 +1135,14 @@ _SLOT_MAPPINGS = [
     _SLOT_MAPPINGS,
     ids=[m[0] for m in _SLOT_MAPPINGS],
 )
+@pytest.mark.parametrize("source_layout", ["contiguous", "qkv_split"])
 def test_reshape_and_cache_scatter(
     default_vllm_config,
     configure_device: str,
     label,
     block_indices,
     block_offsets,
+    source_layout: str,
 ):
     """The scatter writes exactly the mapped slots and nothing else.
 
@@ -1155,13 +1177,18 @@ def test_reshape_and_cache_scatter(
         scale=head_size**-0.5,
         num_kv_heads=num_kv_heads,
     )
+    if source_layout == "qkv_split":
+        query = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
+        key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
+    else:
+        key_src, value_src = convert(key, cache_device), convert(value, cache_device)
+
     attn_impl._reshape_and_cache(
-        key,
-        value,
+        key_src,
+        value_src,
         k_actual,
         v_actual,
         convert(torch.tensor(slots, dtype=torch.int32), cache_device),
-        cache_device,
     )
 
     # A Spyre round trip perturbs fp16 by up to an ulp, so this is not bit-exact.
