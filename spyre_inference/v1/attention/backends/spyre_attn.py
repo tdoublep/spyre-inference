@@ -362,7 +362,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     slot_index_table_cpu: torch.Tensor | None = None
     slot_index_table: torch.Tensor | None = None
 
-    # int32 device mirror of slot_mapping[:num_actual_tokens], the scatter index.
+    # slot_mapping[:num_actual_tokens] on the pages' device, the scatter index.
     slot_mapping_device: torch.Tensor | None = None
 
     @property
@@ -948,9 +948,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 attn_metadata.slot_index_table_cpu, device=_target_device
             )
         if attn_metadata.slot_mapping_device is None:
+            # vLLM builds slot_mapping on the device already, so this is a no-op
+            # unless the caller assembled it on the host, as the tests do. The
+            # compiled store takes the int64 index as-is; casting it to int32 on
+            # device raises a hardware error (RAS 0x7b1b) on this pin.
             attn_metadata.slot_mapping_device = convert(
-                attn_metadata.slot_mapping[:num_actual_tokens].detach().cpu().to(torch.int32),
-                device=_target_device,
+                attn_metadata.slot_mapping[:num_actual_tokens], device=_target_device
             )
 
         # Query handling depends on whether we can stay on device:
@@ -1007,7 +1010,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         key, value: [num_tokens, num_kv_heads, head_size] on the pages' device,
             strided last-dim views of the fused QKV output
         k_pages, v_pages: [num_blocks * block_size, num_kv_heads, head_size]
-        slot_mapping: [num_tokens] int32 on the pages' device
+        slot_mapping: [num_tokens] on the pages' device
         """
         # A source on the wrong device falls back to CPU silently, without raising.
         assert key.device.type == k_pages.device.type, (
