@@ -91,6 +91,29 @@ so that pass is gone. The remaining slicing constraint is narrower than it was a
 in the attention backend, where offset > 0 views still corrupt on transfer (see
 [Attention Backend](#attention-backend)).
 
+## Compilation Granularity
+
+Under `CompilationMode.STOCK_TORCH_COMPILE`, `_compile_for_spyre` compiles **one
+transformer block at a time**: each entry of the model's block `ModuleList` is replaced
+by `torch.compile(block, backend="inductor", fullgraph=True, dynamic=False)`. Blocks are
+found structurally — a `ModuleList` whose non-`PPMissingLayer` entries share one type
+that owns an `Attention` module — so decoder stacks (`model.layers`) and encoder stacks
+(`bert.encoder.layer`) are both covered without hard-coding attribute names.
+
+All blocks share one `forward` code object, so Dynamo traces the first block and the rest
+reuse that entry; anything it does re-trace hits the Inductor FX graph cache. The Spyre
+backend therefore compiles a single block no matter how deep the model is, and a new
+shape (a fresh `KV_LENGTH_ALIGNMENT` tier, say) costs one block recompile instead of one
+whole-model recompile. Models with heterogeneous blocks specialize naturally — Gemma 3
+alternates sliding-window and full attention, which yields one artifact per variant.
+
+Embeddings and the final norm stay eager; they sit outside the block list. `lm_head` was
+never in the compiled region — `compute_logits` is a separate call on the wrapper.
+
+Set `SPYRE_COMPILE_GRANULARITY=model` to compile one fullgraph over the whole model
+instead. That is the older behaviour, kept for comparison: its compile cost grows with
+layer count.
+
 ## Attention Backend
 
 The `SpyreAttentionBackend` implements paged attention using pure PyTorch operations

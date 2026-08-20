@@ -38,6 +38,7 @@ the CPU fallbacks will be obsolete and most operations will be performed on Spyr
 
 from __future__ import annotations
 
+import os
 import time
 from contextlib import contextmanager
 from typing import cast
@@ -54,6 +55,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
+from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.tasks import PoolingTask
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -86,6 +88,17 @@ logger = init_logger(__name__)
 
 # Eager pooling warmup: one short sequence so the dummy stays compile-cheap.
 SPYRE_ENCODER_WARMUP_MAX_TOKENS = 16
+
+# Compile granularity under STOCK_TORCH_COMPILE.
+#   "block" (default): compile each repeated transformer block on its own. The
+#     blocks share one ``forward`` code object, so Dynamo traces one graph and
+#     every remaining block reuses it (identical shapes/dtypes hit the Inductor
+#     cache). The backend therefore compiles one block instead of a program that
+#     grows with depth.
+#   "model": one fullgraph over the whole model. Compile cost scales with layer
+#     count; kept as an escape hatch for comparing against the block path.
+# Read from SPYRE_COMPILE_GRANULARITY at load_model time.
+DEFAULT_COMPILE_GRANULARITY = "block"
 
 
 # Pure-PyTorch replacement for torch.ops._C.compute_slot_mapping_kernel_impl
@@ -215,6 +228,26 @@ class SpyreCpuGpuBuffer(CpuGpuBuffer):
         # If the copy_to_cpu also becomes required, override it here with
         # spyre-specific aspects.
         raise NotImplementedError("SpyreCpuGpuBuffer.copy_to_cpu is not implemented")
+
+
+def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
+    """The ``nn.ModuleList``s holding a model's repeated transformer blocks.
+
+    A list qualifies when its non-``PPMissingLayer`` entries all share one type
+    and that type owns an ``Attention`` module. That matches decoder stacks
+    (``model.layers``) and encoder stacks (``bert.encoder.layer``) without
+    hard-coding either attribute name.
+    """
+    block_lists = []
+    for module in model.modules():
+        if not isinstance(module, nn.ModuleList):
+            continue
+        blocks = [b for b in module if not isinstance(b, PPMissingLayer)]
+        if not blocks or len({type(b) for b in blocks}) != 1:
+            continue
+        if any(isinstance(m, Attention) for m in blocks[0].modules()):
+            block_lists.append(module)
+    return block_lists
 
 
 class _SpyreModelWrapper:
@@ -458,15 +491,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
     def _compile_for_spyre(self) -> None:
-        """Apply torch.compile for Spyre with static shapes.
+        """Wrap the model in torch.compile for Spyre with static shapes.
 
         Spyre requires static shapes — dynamic shapes (SymInt) are not yet supported.
         We therefore pass `dynamic=False` to torch.compile(...).
 
+        torch.compile is lazy: this only installs the wrappers. Tracing and
+        backend compilation happen on the first forward, in ``warming_up_model``.
+
         Supported modes:
 
         - CompilationMode.NONE: eager execution
-        - CompilationMode.STOCK_TORCH_COMPILE: whole-model torch.compile
+        - CompilationMode.STOCK_TORCH_COMPILE: compile per transformer block, or
+          the whole model when ``SPYRE_COMPILE_GRANULARITY=model``
         """
         mode = self.compilation_config.mode
         if mode not in (CompilationMode.NONE, CompilationMode.STOCK_TORCH_COMPILE):
@@ -480,20 +517,57 @@ class TorchSpyreModelRunner(GPUModelRunner):
             logger.info("Compilation disabled (enforce_eager=True)")
             return
 
-        # Trigger whole-model compile:
-        # a single fullgraph over the entire model using dynamic=False.
-        t0 = time.time()
+        granularity = os.environ.get("SPYRE_COMPILE_GRANULARITY", DEFAULT_COMPILE_GRANULARITY)
+        if granularity not in ("block", "model"):
+            raise ValueError(
+                f"Unsupported SPYRE_COMPILE_GRANULARITY={granularity!r}. "
+                f"Expected 'block' or 'model'."
+            )
+
+        model_name = type(self.model).__name__
+
+        if granularity == "block":
+            num_blocks = self._compile_blocks()
+            if num_blocks:
+                logger.info(
+                    "Wrapped %d transformer blocks of %s for per-block compile on Spyre. "
+                    "Embeddings and the final norm stay eager.",
+                    num_blocks,
+                    model_name,
+                )
+                return
+            logger.warning(
+                "Found no repeated transformer blocks in %s; falling back to a whole-model graph.",
+                model_name,
+            )
+
+        # One fullgraph over the entire model.
         self.model = torch.compile(
             self.model,
             backend="inductor",
             fullgraph=True,
             dynamic=False,
         )
-        logger.info(
-            "Compiled model %s as a single graph for Spyre in %.3fs.",
-            type(self.get_model()).__name__,
-            time.time() - t0,
-        )
+        logger.info("Wrapped %s as a single graph for Spyre.", model_name)
+
+    def _compile_blocks(self) -> int:
+        """Replace each repeated transformer block with a compiled copy.
+
+        Returns the number of blocks wrapped (0 if none were found).
+        """
+        num_blocks = 0
+        for blocks in _repeated_block_lists(cast(nn.Module, self.model)):
+            for i, block in enumerate(blocks):
+                if isinstance(block, PPMissingLayer):
+                    continue
+                # torch.compile is typed as returning a callable; OptimizedModule
+                # is an nn.Module, which is what ModuleList.__setitem__ wants.
+                blocks[i] = cast(
+                    nn.Module,
+                    torch.compile(block, backend="inductor", fullgraph=True, dynamic=False),
+                )
+                num_blocks += 1
+        return num_blocks
 
     def warming_up_model(self) -> None:
         """Run a dummy forward pass to warm up kernels and optional compile.

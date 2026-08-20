@@ -35,14 +35,34 @@ pytestmark = pytest.mark.compile
     ],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Construct `vllm.LLM(enforce_eager=False)` end-to-end."""
+    """Construct `vllm.LLM(enforce_eager=False)` end-to-end.
+
+    Runs the default per-block compile granularity.
+    """
+    model, ref_output = model_ref_output
+    _assert_compiled_output(model, ref_output, monkeypatch)
+
+
+def test_whole_model_granularity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`SPYRE_COMPILE_GRANULARITY=model` still produces the same tokens.
+
+    One model only — a whole-model graph is the slow path to compile and is kept
+    just as an escape hatch.
+    """
+    monkeypatch.setenv("SPYRE_COMPILE_GRANULARITY", "model")
+    _assert_compiled_output(
+        "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+        "\n\nIBMs main businesses are the companies that provide the services of the",
+        monkeypatch,
+    )
+
+
+def _assert_compiled_output(model: str, ref_output: str, monkeypatch: pytest.MonkeyPatch) -> None:
     from vllm import LLM, SamplingParams
 
     monkeypatch.setenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "36000")
 
     prompt = "What are IBMs main businesses?"
-
-    model, ref_output = model_ref_output
 
     engine = LLM(
         model=model,
