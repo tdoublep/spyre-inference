@@ -442,3 +442,79 @@ def test_yarn_cos_sin_cache_has_mscale(default_vllm_config, head_size):
     assert not torch.allclose(
         rope_yarn.cos_sin_cache[:2048], rope_base.cos_sin_cache[:2048], atol=1e-4
     ), "YaRN cos_sin_cache should differ from base RoPE due to mscale and freq blending"
+
+
+def _fresh_rope(**kwargs):
+    """get_rope memoizes instances globally; the cache-bound tests need an unprimed one."""
+    from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT, get_rope
+
+    _ROPE_DICT.clear()
+    return get_rope(**kwargs)
+
+
+@pytest.mark.rotary
+def test_bound_rope_position_cache_truncates_device_cache(default_vllm_config):
+    """The device cache shrinks to the bound and positions below it still match
+    forward_native."""
+    from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
+    from spyre_inference.custom_ops.rotary_embedding import bound_rope_position_cache
+
+    torch.manual_seed(7)
+    max_position, bound, num_tokens, num_heads, head_size = 8192, 256, 16, 4, 128
+    rope = _fresh_rope(
+        head_size=head_size, max_position=max_position, is_neox_style=True, dtype=torch.float16
+    )
+    model = torch.nn.Sequential(rope)
+
+    bound_rope_position_cache(model, bound)
+    model.to("spyre")
+
+    assert rope._device_rotation_cache is not None, "the move to spyre must prime the cache"
+    assert rope._device_rotation_cache.shape[0] == bound
+    assert rope.cos_sin_cache.shape[0] == max_position, "the host cache stays full length"
+
+    positions = torch.randint(0, bound, (num_tokens,), dtype=torch.long)
+    query, key = _make_qk(num_tokens, num_heads, num_heads, head_size, True)
+
+    actual_query, actual_key = rope.forward_oot(
+        positions.to("spyre"), query.to("spyre"), key.to("spyre")
+    )
+    expected_query, expected_key = RotaryEmbedding.forward_native(
+        rope, positions, query.clone(), key.clone()
+    )
+
+    torch.testing.assert_close(
+        actual_query.cpu().float(), expected_query.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(actual_key.cpu().float(), expected_key.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.rotary
+def test_bound_rope_position_cache_no_op_above_cache_length(default_vllm_config):
+    """A bound above the module's own cache length leaves the device cache intact."""
+    from spyre_inference.custom_ops.rotary_embedding import bound_rope_position_cache
+
+    max_position, head_size = 2048, 128
+    rope = _fresh_rope(
+        head_size=head_size, max_position=max_position, is_neox_style=True, dtype=torch.float16
+    )
+    model = torch.nn.Sequential(rope)
+
+    bound_rope_position_cache(model, max_position * 4)
+    model.to("spyre")
+
+    assert rope._device_rotation_cache is not None
+    assert rope._device_rotation_cache.shape[0] == max_position
+
+
+@pytest.mark.rotary
+def test_bound_rope_position_cache_rejects_primed_cache(default_vllm_config):
+    """Bounding after the device cache is primed would silently keep the full cache."""
+    from spyre_inference.custom_ops.rotary_embedding import bound_rope_position_cache
+
+    rope = _fresh_rope(head_size=128, max_position=2048, is_neox_style=True, dtype=torch.float16)
+    model = torch.nn.Sequential(rope)
+    model.to("spyre")
+
+    with pytest.raises(RuntimeError, match="before the device rotation"):
+        bound_rope_position_cache(model, 256)

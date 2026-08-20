@@ -23,6 +23,10 @@ The cache must be materialized on-device *before* compile: building it inside th
 forward (host chunk/stack/view then device transfer) segfaults libsenlib during warmup.
 ``_apply`` primes it when the module moves to Spyre, ahead of ``torch.compile``.
 
+A compiled ``index_select`` costs time proportional to its *source* tensor, not to the
+row it gathers, so the device cache is truncated to ``max_position_bound`` rows; unset,
+the full ``max_position_embeddings``-sized cache is kept.
+
 Only neox-style full rotary is supported; other configs raise ``NotImplementedError``.
 """
 
@@ -83,6 +87,8 @@ class _SpyreRotaryMixin:
         self._padded_inner = self.rotary_dim // 2
         self._rotation_cache: torch.Tensor | None = None
         self._device_rotation_cache: torch.Tensor | None = None
+        # Row count to keep on device (highest position + 1), or None for all rows.
+        self.max_position_bound: int | None = None
 
     def _apply(self, fn, recurse=True):
         # Skip super()._apply: cos_sin_cache is intentionally CPU-pinned and this module
@@ -112,11 +118,23 @@ class _SpyreRotaryMixin:
         return self._rotation_cache
 
     def _get_device_rotation_cache(self) -> torch.Tensor:
-        """Device-resident copy of the 4D rotation cache ``[max_pos, 2, 2, padded]``,
+        """Device-resident copy of the 4D rotation cache ``[rows, 2, 2, padded]``,
         built once from the CPU cache so the per-pass gather runs on-device via
-        ``index_select`` (single-row gather has a kernel since torch-spyre#3418)."""
+        ``index_select`` (single-row gather has a kernel since torch-spyre#3418).
+
+        ``rows`` honours ``max_position_bound`` when set.
+        """
         if self._device_rotation_cache is None:
-            self._device_rotation_cache = self._get_rotation_cache().contiguous()
+            cache = self._get_rotation_cache()
+            bound = self.max_position_bound
+            if bound is not None and bound < cache.shape[0]:
+                logger.info(
+                    "SpyreRoPE: keeping %d of %d rotation-cache rows on device.",
+                    bound,
+                    cache.shape[0],
+                )
+                cache = cache[:bound]
+            self._device_rotation_cache = cache.contiguous()
         return self._device_rotation_cache
 
     def forward_oot(
@@ -143,6 +161,19 @@ class _SpyreRotaryMixin:
             else None
         )
         return out_query, out_key
+
+
+def bound_rope_position_cache(model: torch.nn.Module, max_positions: int) -> None:
+    """Bound every Spyre RoPE module's device cache. Must run before the move to
+    Spyre, which primes that cache."""
+    for module in model.modules():
+        if isinstance(module, _SpyreRotaryMixin):
+            if module._device_rotation_cache is not None:
+                raise RuntimeError(
+                    "bound_rope_position_cache must run before the device rotation "
+                    "cache is primed (i.e. before model.to(spyre))."
+                )
+            module.max_position_bound = max_positions
 
 
 @RotaryEmbeddingBase.register_oot(name="RotaryEmbedding")
