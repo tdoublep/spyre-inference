@@ -30,6 +30,16 @@ therefore primes the device cache when the module is moved to Spyre (which happe
 before ``torch.compile`` wraps the model), so ``forward_oot`` only traces the
 ``index_select`` over an existing device tensor.
 
+A compiled ``index_select`` costs time proportional to its *source* tensor, not to the
+single row it gathers (measured on Spyre: 0.15ms over 128 rows vs 1.37ms over 131072),
+and this gather runs once per layer per step. ``cos_sin_cache`` is sized for
+``max_position_embeddings`` — 131072 rows / 67MB for Granite-3.3-8B, a thousand times
+more than a 128-token context can index — so the device cache is truncated to the
+positions the engine can actually produce. The bound comes from
+``bound_rope_position_cache``, called by the model runner before the move to device:
+only there is ``max_model_len`` known to describe *this* model. Left unset, the full
+cache is kept, so a directly-constructed module keeps the unrestricted contract.
+
 Only neox-style full rotary is supported; other configs raise
 ``NotImplementedError`` at construction instead of silently falling back to CPU.
 """
@@ -93,6 +103,9 @@ class _SpyreRotaryMixin:
         self._padded_inner = self.rotary_dim // 2
         self._rotation_cache: torch.Tensor | None = None
         self._device_rotation_cache: torch.Tensor | None = None
+        # Highest position + 1 this module will ever be asked for, or None for no
+        # bound. Set by bound_rope_position_cache before the device cache is primed.
+        self.max_position_bound: int | None = None
 
     def _apply(self, fn, recurse=True):
         # cos_sin_cache has no Spyre kernel, so it is deliberately kept on CPU (we skip
@@ -128,12 +141,27 @@ class _SpyreRotaryMixin:
         return self._rotation_cache
 
     def _get_device_rotation_cache(self, device: torch.device) -> torch.Tensor:
-        """Device-resident copy of the 4D rotation cache ``[max_pos, 2, 2, padded]``,
+        """Device-resident copy of the 4D rotation cache ``[rows, 2, 2, padded]``,
         built once from the CPU cache so the per-pass gather runs on-device via
-        ``index_select`` (single-row gather has a kernel since torch-spyre#3418)."""
+        ``index_select`` (single-row gather has a kernel since torch-spyre#3418).
+
+        ``rows`` honours ``max_position_bound`` when set; a shorter source makes
+        every per-layer gather cheaper (see module docstring).
+        """
         if self._device_rotation_cache is None:
+            cache = self._get_rotation_cache()
+            bound = self.max_position_bound
+            if bound is not None and bound < cache.shape[0]:
+                logger.info(
+                    "SpyreRoPE: keeping %d of %d rotation-cache rows on device (%.1f -> %.1f MB).",
+                    bound,
+                    cache.shape[0],
+                    cache.numel() * cache.element_size() / 1e6,
+                    bound * cache[0].numel() * cache.element_size() / 1e6,
+                )
+                cache = cache[:bound]
             self._device_rotation_cache = convert(
-                self._get_rotation_cache().contiguous(), device=device, dtype=self.dtype
+                cache.contiguous(), device=device, dtype=self.dtype
             )
         return self._device_rotation_cache
 
@@ -164,6 +192,23 @@ class _SpyreRotaryMixin:
             else None
         )
         return out_query, out_key
+
+
+def bound_rope_position_cache(model: torch.nn.Module, max_positions: int) -> None:
+    """Tell every Spyre RoPE module the highest position it can be asked for.
+
+    Must run before the model is moved to Spyre: the move primes the device
+    rotation cache, and only rows below the bound are kept. Modules whose own
+    cache is already shorter are unaffected.
+    """
+    for module in model.modules():
+        if isinstance(module, _SpyreRotaryMixin):
+            if module._device_rotation_cache is not None:
+                raise RuntimeError(
+                    "bound_rope_position_cache must run before the device rotation "
+                    "cache is primed (i.e. before model.to(spyre))."
+                )
+            module.max_position_bound = max_positions
 
 
 @RotaryEmbeddingBase.register_oot(name="RotaryEmbedding")

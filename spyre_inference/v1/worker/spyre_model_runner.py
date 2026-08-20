@@ -74,6 +74,7 @@ from spyre_inference.custom_ops.head_pad import (
     reject_padded_qk_norm,
     verify_padded_head_dim,
 )
+from spyre_inference.custom_ops.rotary_embedding import bound_rope_position_cache
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
@@ -417,6 +418,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not
         # an nn.Module, but just the attention implementation.
         Attention._apply = lambda self, fn, recurse=True: self  # ty: ignore[invalid-assignment]
+
+        # The scheduler never emits a position at or beyond max_model_len, so RoPE
+        # can drop the rest of its rotation cache before it reaches the device —
+        # the in-graph gather costs time proportional to the whole cache.
+        bound_rope_position_cache(self.model, self.model_config.max_model_len)
 
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)

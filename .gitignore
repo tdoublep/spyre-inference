@@ -45,3 +45,6 @@ htmlcov/
 # mkdocs documentation
 /site
 docs/examples
+
+# Local profiling scratch
+.claude-scratch/
