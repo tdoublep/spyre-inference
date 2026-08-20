@@ -1,5 +1,5 @@
 ---
-name: pr-cleanup
+name: prepare-pull-request
 description: Strip verbose comments, docstrings and commit messages out of a finished change, then push and open a PR with a brief plain-English body. Use whenever the user asks to clean up code for a PR, tidy up before review, or open/raise a PR for work that is already written — and always before running `gh pr create`. Encodes hard limits (comments deleted by default, 1-2 lines each if kept, no absolute performance numbers anywhere) because the unguided default is far too verbose.
 ---
 
@@ -75,28 +75,7 @@ git status --short
 git diff origin/main...HEAD --stat
 ```
 
-## 4. Commit messages
-
-Reword, or squash, so each commit is:
-
-```text
-type(scope): what changed, imperative, <=72 chars
-```
-
-Body: usually none. At most 3 short bullets, only for something the subject cannot carry
-— a subtle root cause, or an upstream issue reference. No "this commit...", no
-before/after essay, no test output, no timings.
-
-```bash
-git commit --amend -s      # reword the top commit, keeps sign-off
-git rebase -i origin/main  # squash a chain of WIP commits
-```
-
-Every commit needs `Signed-off-by:` (`-s`) with the email matching GitHub or DCO fails.
-Never leave a blank line at the end of a commit message — it silently breaks trailer and
-co-author parsing.
-
-## 5. Format and verify
+## 4. Format and verify
 
 ```bash
 bash format.sh
@@ -105,6 +84,10 @@ uv run pytest -m "not upstream" <the test covering this change>
 
 Deleting comments cannot break code, but the formatter reflows what is left and those
 changes must be committed. Re-run the test so the PR body can honestly claim it.
+
+## 5. Verify commit signoffs
+
+Ensure all commits have DCO-correct signoffs. Every commit needs `Signed-off-by:` (`-s`) with the email matching GitHub or DCO fails.
 
 ## 6. Push
 
@@ -134,10 +117,8 @@ step", "~15% fewer device transfers"). If the user wants numbers, they will ask.
 
 ```bash
 gh pr create --repo torch-spyre/spyre-inference --base main \
-  --title "type(scope): what changed" --body-file "$(git rev-parse --git-dir)/PR_BODY.md"
+  --title "type(scope): what changed" --body-file "$(git rev-parse --git-dir)/PR_BODY.md" --draft
 ```
-
-Add `--draft` if CI has not run yet.
 
 ## Final gate
 

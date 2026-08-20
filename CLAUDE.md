@@ -69,9 +69,7 @@ For questions about Spyre architecture, the PyTorch/vLLM stack, or hardware inte
 
 ## Opening a PR
 
-Before pushing and opening a PR, invoke the `pr-cleanup` skill
-(`.claude/skills/pr-cleanup/SKILL.md`). It strips over-verbose comments, docstrings and
-commit messages, then covers the push and PR-body conventions.
+Always use the `prepare-pull-request` skill to clean up the current branch and open a pull request.
 
 ## DCO (Developer Certificate of Origin)
 
