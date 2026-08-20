@@ -27,6 +27,7 @@ from spyre_inference.custom_ops.utils import convert
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.config.cache import CacheDType
+from vllm.model_executor.layers.attention.attention import Attention
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -136,6 +137,105 @@ def _maybe_compile(fn):
 def _reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
     k_slots.index_copy_(0, slot_mapping, key)
     v_slots.index_copy_(0, slot_mapping, value)
+
+
+# ---------------------------------------------------------------------------
+# Inline KV-cache scatter
+# ---------------------------------------------------------------------------
+#
+# The scatter is a compiled graph of its own, so it costs a launch per layer per
+# step (~0.19ms) for work that is nearly free — appending it to the graph that
+# already computes QKV and RoPE measured +0.011ms. `Attention.forward` is traced
+# Python up to the opaque attention op, so a scatter placed there lands in that
+# graph and the launch disappears.
+#
+# It has to stay a separate *launch* from attention, though: within one graph the
+# Spyre lowering schedules the page gathers off the original buffer, so attention
+# reads stale pages. Across launches the ordering holds.
+#
+# The per-step slot mapping arrives as a plain tensor attribute, which Dynamo
+# lifts to a graph input guarded on metadata — a same-shaped tensor each step is
+# not a recompile. The 3D slot views are stable for the process.
+_SLOT_MAPPING_ATTR = "_spyre_slot_mapping"
+_K_SLOTS_ATTR = "_spyre_k_slots"
+_V_SLOTS_ATTR = "_spyre_v_slots"
+
+_inline_scatter_installed = False
+_wired_layers: dict[str, Attention] = {}
+
+
+def _attention_forward_with_kv_scatter(orig_forward):
+    def forward(self, query, key, value, *args, **kwargs):
+        slot_mapping = getattr(self, _SLOT_MAPPING_ATTR, None)
+        if slot_mapping is not None and key is not None and value is not None:
+            num_tokens = slot_mapping.shape[0]
+            getattr(self, _K_SLOTS_ATTR).index_copy_(
+                0,
+                slot_mapping,
+                key.view(-1, self.num_kv_heads, self.head_size)[:num_tokens],
+            )
+            getattr(self, _V_SLOTS_ATTR).index_copy_(
+                0,
+                slot_mapping,
+                value.view(-1, self.num_kv_heads, self.head_size)[:num_tokens],
+            )
+        return orig_forward(self, query, key, value, *args, **kwargs)
+
+    return forward
+
+
+def install_inline_kv_scatter(static_forward_context, kv_caches) -> int:
+    """Move the KV scatter into the graph that produces K/V, for layers we can.
+
+    Attaches the flattened slot-major views of each layer's pages, then wraps
+    ``Attention.forward`` so it scatters before delegating. Layers left without
+    the views fall back to ``SpyreAttentionImpl._reshape_and_cache``.
+
+    Returns the number of layers wired up.
+    """
+    global _inline_scatter_installed
+
+    _wired_layers.clear()
+    for layer_name, cache in kv_caches.items():
+        layer = static_forward_context.get(layer_name)
+        if layer is None:
+            continue
+        # A view keeps the slot-outermost device layout; taken here rather than in
+        # the traced graph, where an in-graph view of the 4D pages makes inductor
+        # assert on the store's stride map.
+        slots = (-1, cache.k_pages.shape[2], cache.k_pages.shape[3])
+        setattr(layer, _K_SLOTS_ATTR, cache.k_pages.view(slots))
+        setattr(layer, _V_SLOTS_ATTR, cache.v_pages.view(slots))
+        _wired_layers[layer_name] = layer
+
+    if _wired_layers and not _inline_scatter_installed:
+        Attention.forward = _attention_forward_with_kv_scatter(  # ty: ignore[invalid-assignment]
+            Attention.forward
+        )
+        _inline_scatter_installed = True
+    return len(_wired_layers)
+
+
+def wired_kv_scatter_layers() -> dict[str, Attention]:
+    """Layers whose KV write the traced scatter can take over."""
+    return _wired_layers
+
+
+def publish_slot_mapping(slot_mapping_by_layer) -> None:
+    """Hand this step's device slot mappings to the traced scatter.
+
+    Every wired layer is visited, every step: a mapping left over from another
+    step would be applied to this step's K/V, and it is the wrong length as soon
+    as the token count changes — an out-of-bounds device write, not an error. Any
+    layer absent from ``slot_mapping_by_layer`` falls back to the impl's scatter.
+    """
+    for layer_name, layer in _wired_layers.items():
+        slot_mapping = slot_mapping_by_layer.get(layer_name)
+        if slot_mapping is None:
+            if hasattr(layer, _SLOT_MAPPING_ATTR):
+                delattr(layer, _SLOT_MAPPING_ATTR)
+        else:
+            setattr(layer, _SLOT_MAPPING_ATTR, slot_mapping)
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +429,10 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
     # Device mirror of slot_mapping, which vLLM hands us on the host.
     slot_mapping_device: torch.Tensor | None = None
+
+    # True once the traced scatter in Attention.forward has taken over the KV write
+    # for this step, so forward() must not do it again. See install_inline_kv_scatter.
+    inline_kv_scatter: bool = False
 
     # Device mirror of attention_mask_tiles, filled once per step by forward().
     attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
@@ -921,14 +1025,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 [convert(t, device=_target_device) for t in seq_tiles] for seq_tiles in tiles_cpu
             ]
 
-        # Step 1: Reshape and cache — scatter new tokens into their slots
-        self._reshape_and_cache(
-            key[:num_actual_tokens],
-            value[:num_actual_tokens],
-            k_pages,
-            v_pages,
-            attn_metadata.slot_mapping_device,
-        )
+        # Step 1: Reshape and cache — scatter new tokens into their slots, unless the
+        # traced scatter in Attention.forward already folded it into the graph that
+        # produced K/V (see install_inline_kv_scatter).
+        if not attn_metadata.inline_kv_scatter:
+            self._reshape_and_cache(
+                key[:num_actual_tokens],
+                value[:num_actual_tokens],
+                k_pages,
+                v_pages,
+                attn_metadata.slot_mapping_device,
+            )
 
         # Step 2: Online softmax attention over pages (varlen)
         output = self._online_softmax_attention(

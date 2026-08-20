@@ -75,6 +75,7 @@ from spyre_inference.custom_ops.head_pad import (
     verify_padded_head_dim,
 )
 from spyre_inference.custom_ops.rotary_embedding import bound_rope_position_cache
+from spyre_inference.v1.attention.backends.spyre_attn import install_inline_kv_scatter
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
@@ -280,6 +281,8 @@ class _SpyreModelWrapper:
             val = kwargs.get(key)
             kwargs_converted[key] = _convert_int(val)
 
+        self._arm_inline_kv_scatter()
+
         t0 = time.time()
         result = self._model(*args_converted, **kwargs_converted)
 
@@ -296,6 +299,54 @@ class _SpyreModelWrapper:
         logger.debug("t_token: %.2fms [num tokens %d]", (time.time() - t0) * 1000, num_tokens)
 
         return result
+
+    def _arm_inline_kv_scatter(self) -> None:
+        """Publish this step's device slot mapping so the traced scatter can run.
+
+        Runs here, once per forward and outside any graph, because the scatter now
+        happens per layer *before* SpyreAttentionImpl.forward — which is where the
+        device mirror used to be built lazily.
+        """
+        from vllm.forward_context import get_forward_context
+
+        from spyre_inference.v1.attention.backends.spyre_attn import (
+            SpyreAttentionMetadata,
+            publish_slot_mapping,
+            wired_kv_scatter_layers,
+        )
+
+        wired = wired_kv_scatter_layers()
+        if not wired:
+            return
+
+        try:
+            attn_metadata = get_forward_context().attn_metadata
+        except AssertionError:
+            attn_metadata = None
+        if not isinstance(attn_metadata, dict):
+            # Nothing to publish, but stale mappings must still be withdrawn.
+            publish_slot_mapping({})
+            return
+
+        by_metadata: dict[int, tuple[SpyreAttentionMetadata, list[str]]] = {}
+        for layer_name, md in attn_metadata.items():
+            if isinstance(md, SpyreAttentionMetadata):
+                by_metadata.setdefault(id(md), (md, []))[1].append(layer_name)
+
+        published: dict[str, torch.Tensor] = {}
+        for md, layer_names in by_metadata.values():
+            # All-or-nothing per metadata: the impl skips its scatter for every layer
+            # sharing this metadata, so every one of them must be covered here.
+            if not all(name in wired for name in layer_names):
+                md.inline_kv_scatter = False
+                continue
+            if md.slot_mapping_device is None:
+                md.slot_mapping_device = convert(
+                    md.slot_mapping[: md.num_actual_tokens], device=self._spyre_device
+                )
+            md.inline_kv_scatter = True
+            published.update(dict.fromkeys(layer_names, md.slot_mapping_device))
+        publish_slot_mapping(published)
 
     def compute_logits(self, hidden_states, *args, **kwargs):
         """Move hidden_states onto Spyre for the lm_head custom op.
@@ -738,6 +789,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.compilation_config.static_forward_context,
             self.kv_caches,
         )
+
+        wired = install_inline_kv_scatter(self.compilation_config.static_forward_context, kv_caches)
+        if wired:
+            logger.info(
+                "Wired %d attention layers for the in-graph KV scatter; "
+                "the write folds into the graph that produces K/V.",
+                wired,
+            )
         return kv_caches
 
     # --- Stubs copied from CPUModelRunner ---
