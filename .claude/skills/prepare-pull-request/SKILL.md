@@ -100,7 +100,9 @@ git identity is unset, run the `github-commit` skill first.
 
 ## 7. PR body
 
-Write the body to a file and use `--body-file`; inline `--body` mangles multi-line text.
+Write the body to `.pr_drafts/$(git branch --show-current).md` and use `--body-file`; inline `--body`
+mangles multi-line text. The `.pr_drafts/` folder is gitignored, so drafts never land in
+the diff.
 
 Fill the repo template and keep the whole thing **under ~150 words**:
 
@@ -116,8 +118,10 @@ the test plan or the commit message. Relative statements are fine ("one less cop
 step", "~15% fewer device transfers"). If the user wants numbers, they will ask.
 
 ```bash
+mkdir -p .pr_drafts
+# ... write the body to .pr_drafts/$(git branch --show-current).md ...
 gh pr create --repo torch-spyre/spyre-inference --base main \
-  --title "type(scope): what changed" --body-file "$(git rev-parse --git-dir)/PR_BODY.md" --draft
+  --title "type(scope): what changed" --body-file ".pr_drafts/$(git branch --show-current).md" --draft
 ```
 
 ## Final gate
