@@ -150,11 +150,16 @@ def _create_compilable_page_attn(
     head_size: int,
     has_alibi: bool = False,
     logits_soft_cap: float = 0.0,
+    fused_store: bool = False,
 ):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
-    Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi, and
-    logits_soft_cap are closure constants.
+    Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi,
+    logits_soft_cap, and fused_store are closure constants.
+
+    With ``fused_store``, the kernel scatters its result into the caller's output
+    buffer instead of returning it, so the store lands in the same jobplan rather
+    than costing an extra eager dispatch and launch per layer.
     """
 
     def specialized_paged_attn_kernel(
@@ -165,6 +170,8 @@ def _create_compilable_page_attn(
         mask_tiles,
         scale,
         alibi_bias_tiles=None,
+        out=None,
+        out_rows=None,
     ):
         """
         This kernels specializes for num_blocks and padded_query_len.
@@ -182,8 +189,11 @@ def _create_compilable_page_attn(
                 is 1 because softmax absorbs per-query-row constants — see
                 the derivation at the bias-tile construction site in
                 _online_softmax_attention.
+            out, out_rows: only with fused_store — the full output buffer and the
+                int64 device rows of it this sequence owns, [padded_query_len].
 
-        Returns [padded_query_len, num_heads, head_size].
+        Returns [padded_query_len, num_heads, head_size], or ``out`` when
+        fused_store scattered the result in place.
         """
         tile_max = None
         tile_sum = None
@@ -238,7 +248,14 @@ def _create_compilable_page_attn(
         assert tile_output is not None and tile_sum is not None
         attn = tile_output / tile_sum
         attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
-        return attn.reshape(padded_query_len, num_heads, head_size)
+        attn = attn.reshape(padded_query_len, num_heads, head_size)
+        if fused_store:
+            # index_copy_ rather than a slice assign: writing a prefix view copies
+            # its whole extent and overruns the destination (torch-spyre#3826).
+            assert out is not None and out_rows is not None
+            out.index_copy_(0, out_rows, attn)
+            return out
+        return attn
 
     return specialized_paged_attn_kernel
 
@@ -332,6 +349,13 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
     # Device mirror of attention_mask_tiles, filled once per step by forward().
     attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
+
+    # Output rows each sequence owns, one tensor per sequence, filled once per step
+    # by forward(). Lets the attention kernel scatter its result straight into the
+    # caller's buffer. Own tensor per sequence for the same reason as
+    # page_index_tables: a compiled kernel ignores storage_offset (torch-spyre#3770).
+    # None when no sequence qualifies for the fused store.
+    output_row_tables: list[torch.Tensor] | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:
@@ -851,17 +875,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # back to CPU with an int64 one.
         self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
 
-        # Compiled attention loops, keyed by (num_blocks, padded_query_len)
-        self._attn_fns: dict[tuple[int, int], object] = {}
+        # Compiled attention loops, keyed by (num_blocks, padded_query_len, fused_store)
+        self._attn_fns: dict[tuple[int, int, bool], object] = {}
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
         )
 
-    def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
+    def _get_attn_fn(self, num_blocks: int, padded_query_len: int, fused_store: bool = False):
         # self.alibi_slopes and self.logits_soft_cap are fixed per instance, so
         # has_alibi and logits_soft_cap don't need to be part of the cache key.
-        key = (num_blocks, padded_query_len)
+        key = (num_blocks, padded_query_len, fused_store)
         if key not in self._attn_fns:
             self._attn_fns[key] = _maybe_compile(
                 _create_compilable_page_attn(
@@ -871,6 +895,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     self.head_size,
                     has_alibi=self.alibi_slopes is not None,
                     logits_soft_cap=self.logits_soft_cap,
+                    fused_store=fused_store,
                 )
             )
         return self._attn_fns[key]
@@ -912,6 +937,25 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.slot_mapping_device = convert(
                 attn_metadata.slot_mapping[:num_actual_tokens], device=_target_device
             )
+        # The fused store has the kernel scatter into `output` itself. Two conditions:
+        # every row the kernel emits must be a real query row (no alignment padding to
+        # discard), and only one sequence may write the buffer — a second compiled
+        # scatter into the same tensor clobbers the first sequence's rows, the
+        # whole-extent write hazard of torch-spyre#3826.
+        if (
+            attn_metadata.output_row_tables is None
+            and attn_metadata.num_seqs == 1
+            and attn_metadata.aligned_max_query_len == attn_metadata.max_query_len
+        ):
+            starts = attn_metadata.query_start_loc
+            attn_metadata.output_row_tables = [
+                convert(
+                    torch.arange(int(starts[s].item()), int(starts[s + 1].item())),
+                    dtype=torch.int64,
+                    device=_target_device,
+                )
+                for s in range(attn_metadata.num_seqs)
+            ]
         if attn_metadata.attention_mask_tiles_device is None:
             tiles_cpu = attn_metadata.attention_mask_tiles
             assert tiles_cpu is not None, (
@@ -1005,6 +1049,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         active_block_indices_all = attn_metadata.active_block_indices
         aligned_max_query_len = attn_metadata.aligned_max_query_len
         page_index_tables = attn_metadata.page_index_tables
+        # A compiled kernel reads its arguments from offset 0 (torch-spyre#3770), so
+        # the fused store is only safe on a buffer that is the whole tensor. vLLM
+        # hands out a fresh buffer per layer, so re-check it every call.
+        out_row_tables = attn_metadata.output_row_tables
+        if output.storage_offset() != 0 or not output.is_contiguous():
+            out_row_tables = None
         assert mask_tiles_all is not None, (
             "attention_mask_tiles_device must be mirrored by forward()"
         )
@@ -1094,8 +1144,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     bias = self.alibi_slopes * rel
                     alibi_bias_tiles.append(convert(bias, device=_target_device))
 
-            # Run attention on target device
-            attn_fn = self._get_attn_fn(len(active_bs), aligned_max_query_len)
+            # Run attention on target device. When the kernel can scatter straight
+            # into `output`, the store joins its jobplan instead of costing a
+            # separate eager dispatch and launch per layer.
+            out_rows = None if out_row_tables is None else out_row_tables[seq_idx]
+            attn_fn = self._get_attn_fn(
+                len(active_bs), aligned_max_query_len, fused_store=out_rows is not None
+            )
             result = attn_fn(
                 q_dev,
                 k_pages,
@@ -1104,9 +1159,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 mask_tiles,
                 self.scale,
                 alibi_bias_tiles=alibi_bias_tiles,
+                out=output if out_rows is not None else None,
+                out_rows=out_rows,
             )
 
             assert result.dtype == output.dtype
+            if out_rows is not None:
+                continue
             if query_len < aligned_max_query_len:
                 # Writing a prefix view copies its whole extent and overruns the
                 # destination (torch-spyre#3826), so copy it first.
