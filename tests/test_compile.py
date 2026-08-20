@@ -35,7 +35,11 @@ pytestmark = pytest.mark.compile
     ],
 )
 def test_basic_llm_inference(model_ref_output, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Construct `vllm.LLM(enforce_eager=False)` end-to-end."""
+    """Construct `vllm.LLM(enforce_eager=False)` end-to-end.
+
+    No compilation_config is passed: the platform defaults a non-eager run to
+    STOCK_TORCH_COMPILE (one transformer block at a time + attention kernel).
+    """
     model, ref_output = model_ref_output
     _assert_compiled_output(model, ref_output, monkeypatch)
 
@@ -60,7 +64,6 @@ def _assert_compiled_output(model: str, ref_output: str, monkeypatch: pytest.Mon
     engine = LLM(
         model=model,
         enforce_eager=False,
-        compilation_config={"mode": "STOCK_TORCH_COMPILE"},
         max_model_len=128,
         max_num_seqs=2,
     )
