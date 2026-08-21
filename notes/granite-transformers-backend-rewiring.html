@@ -1,0 +1,823 @@
+<title>Granite 3.3 Rewiring</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+Condensed:wght@400;500;600&family=IBM+Plex+Serif:ital,wght@0,400;0,600;1,400&display=swap">
+
+<style>
+:root {
+  --paper:      #eceff0;
+  --surface:    #f9fbfb;
+  --ink:        #1a1f21;
+  --ink-soft:   #4f5a5d;
+  --ink-faint:  #7d8789;
+  --rule:       #cfd7d8;
+  --rule-soft:  #e0e6e7;
+
+  --vllm:       #0c6673;
+  --vllm-ink:   #094e59;
+  --vllm-wash:  #dceef1;
+  --vllm-edge:  #8cc2cb;
+
+  --hf:         #8f6317;
+  --hf-ink:     #6d4b11;
+  --hf-wash:    #f2ebdc;
+  --hf-edge:    #cfb383;
+
+  --flag:       #a1382a;
+  --flag-wash:  #f6e3df;
+  --flag-edge:  #d3a096;
+
+  --ok:         #2f6a4a;
+
+  --step: 1.5rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper:      #0e1214;
+    --surface:    #161c1e;
+    --ink:        #dfe7e8;
+    --ink-soft:   #a2aeb0;
+    --ink-faint:  #74807f;
+    --rule:       #2b3437;
+    --rule-soft:  #222a2c;
+
+    --vllm:       #4dc0d0;
+    --vllm-ink:   #8fdae5;
+    --vllm-wash:  #10333a;
+    --vllm-edge:  #2b6b78;
+
+    --hf:         #d9a44e;
+    --hf-ink:     #ecc584;
+    --hf-wash:    #2e2617;
+    --hf-edge:    #6d5628;
+
+    --flag:       #e88671;
+    --flag-wash:  #34201c;
+    --flag-edge:  #7a4136;
+
+    --ok:         #63b389;
+  }
+}
+
+:root[data-theme="dark"] {
+  --paper:      #0e1214;
+  --surface:    #161c1e;
+  --ink:        #dfe7e8;
+  --ink-soft:   #a2aeb0;
+  --ink-faint:  #74807f;
+  --rule:       #2b3437;
+  --rule-soft:  #222a2c;
+
+  --vllm:       #4dc0d0;
+  --vllm-ink:   #8fdae5;
+  --vllm-wash:  #10333a;
+  --vllm-edge:  #2b6b78;
+
+  --hf:         #d9a44e;
+  --hf-ink:     #ecc584;
+  --hf-wash:    #2e2617;
+  --hf-edge:    #6d5628;
+
+  --flag:       #e88671;
+  --flag-wash:  #34201c;
+  --flag-edge:  #7a4136;
+
+  --ok:         #63b389;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "IBM Plex Serif", Georgia, serif;
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap {
+  max-width: 62rem;
+  margin: 0 auto;
+  padding: 3.5rem 1.5rem 6rem;
+  display: flex;
+  flex-direction: column;
+  gap: 3.5rem;
+}
+
+/* ---------- type roles ---------- */
+
+.eyebrow {
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-weight: 600;
+  font-size: .75rem;
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  margin: 0;
+}
+
+h1 {
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-weight: 600;
+  font-size: clamp(2.1rem, 6vw, 3.1rem);
+  line-height: 1.04;
+  letter-spacing: -.012em;
+  text-wrap: balance;
+  margin: .5rem 0 0;
+}
+
+h2 {
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-weight: 600;
+  font-size: 1.3rem;
+  letter-spacing: .005em;
+  text-wrap: balance;
+  margin: 0;
+}
+
+h3 {
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-weight: 600;
+  font-size: .95rem;
+  letter-spacing: .02em;
+  margin: 0;
+}
+
+p { margin: 0; max-width: 40rem; }
+.lede { font-size: 1.12rem; color: var(--ink-soft); max-width: 38rem; }
+
+code, .m {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: .875em;
+  font-variant-ligatures: none;
+}
+
+a { color: var(--vllm); }
+
+section {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.sechead {
+  display: flex;
+  flex-direction: column;
+  gap: .4rem;
+  border-top: 2px solid var(--ink);
+  padding-top: .7rem;
+}
+
+/* ---------- legend ---------- */
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .5rem 1.4rem;
+  padding: .85rem 1rem;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  background: var(--surface);
+}
+
+.legend > div {
+  display: flex;
+  align-items: center;
+  gap: .55rem;
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-size: .875rem;
+  color: var(--ink-soft);
+}
+
+.key {
+  width: 1.55rem;
+  height: 1.05rem;
+  border-radius: 2px;
+  flex: none;
+}
+.key.k-vllm { background: var(--vllm-wash); border: 1px solid var(--vllm-edge); border-left: 3px solid var(--vllm); }
+.key.k-hf   { background: transparent;     border: 1px solid var(--hf-edge); }
+.key.k-rw   { background: transparent;     border: 1px dashed var(--hf); }
+
+/* ---------- construction order ---------- */
+
+.steps {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr));
+  gap: 1px;
+  background: var(--rule);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.steps > li {
+  background: var(--surface);
+  padding: .8rem .85rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: .35rem;
+  list-style: none;
+}
+
+.steps { margin: 0; padding: 0; }
+
+.stepnum {
+  font-family: "IBM Plex Mono", monospace;
+  font-size: .7rem;
+  font-weight: 600;
+  color: var(--ink-faint);
+  letter-spacing: .06em;
+}
+
+.steps .m { color: var(--ink); font-weight: 500; word-break: break-word; }
+.steps small {
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-size: .82rem;
+  line-height: 1.35;
+  color: var(--ink-soft);
+}
+
+/* ---------- the nested diagram ---------- */
+
+.diagram {
+  border: 1px solid var(--rule);
+  border-radius: 5px;
+  background: var(--surface);
+  padding: 1.4rem;
+  overflow-x: auto;
+}
+
+.stack { display: flex; flex-direction: column; gap: .55rem; min-width: 30rem; }
+
+.frame {
+  border: 1px solid var(--hf-edge);
+  border-radius: 4px;
+  display: flex;
+  flex-direction: column;
+}
+.frame.rewritten { border: 1px dashed var(--hf); }
+
+.frame > header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .3rem .6rem;
+  padding: .4rem .7rem;
+  border-bottom: 1px solid var(--rule-soft);
+  background: var(--hf-wash);
+}
+.frame > header .m { color: var(--hf-ink); font-weight: 600; font-size: .82rem; }
+.frame > header .tag {
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-size: .72rem;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--hf-ink);
+  opacity: .8;
+}
+.frame > .body {
+  padding: .6rem;
+  display: flex;
+  flex-direction: column;
+  gap: .5rem;
+}
+
+/* vLLM op block */
+.op {
+  border: 1px solid var(--vllm-edge);
+  border-left: 3px solid var(--vllm);
+  border-radius: 3px;
+  background: var(--vllm-wash);
+  padding: .45rem .65rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .2rem .7rem;
+}
+.op .m { color: var(--vllm-ink); font-weight: 600; font-size: .84rem; }
+.op .note {
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-size: .8rem;
+  color: var(--ink-soft);
+  margin-left: auto;
+}
+
+/* HF inline step */
+.hfstep {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: .2rem .55rem;
+  padding: .15rem .65rem .15rem .55rem;
+  border-left: 2px dotted var(--hf-edge);
+}
+.hfstep .m { color: var(--ink); font-size: .82rem; }
+.hfstep .note {
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-size: .8rem;
+  color: var(--ink-faint);
+}
+.hfstep.scalar .m { color: var(--hf-ink); font-weight: 600; }
+
+.op.flagged {
+  border-color: var(--flag-edge);
+  border-left-color: var(--flag);
+  background: var(--flag-wash);
+}
+.op.flagged .m { color: var(--flag); }
+
+.divider {
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-size: .78rem;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  padding-left: .1rem;
+}
+
+.caption {
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-size: .875rem;
+  color: var(--ink-soft);
+  max-width: 42rem;
+}
+
+/* ---------- tables ---------- */
+
+.tablewrap { overflow-x: auto; border: 1px solid var(--rule); border-radius: 4px; }
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+  min-width: 38rem;
+  background: var(--surface);
+}
+
+th {
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-size: .75rem;
+  font-weight: 600;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  color: var(--ink-faint);
+  text-align: left;
+  padding: .6rem .8rem;
+  border-bottom: 1px solid var(--rule);
+  white-space: nowrap;
+}
+
+td {
+  padding: .55rem .8rem;
+  border-bottom: 1px solid var(--rule-soft);
+  vertical-align: top;
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-size: .875rem;
+  line-height: 1.45;
+  color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+tr:last-child td { border-bottom: none; }
+
+td .m { font-size: .82rem; }
+td.from .m { color: var(--hf-ink); }
+td.to   .m { color: var(--vllm-ink); font-weight: 600; }
+td.n { color: var(--ink); font-weight: 500; text-align: right; white-space: nowrap; }
+
+.pill {
+  display: inline-block;
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-size: .7rem;
+  font-weight: 600;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  padding: .1rem .42rem;
+  border-radius: 2px;
+  white-space: nowrap;
+}
+.pill.applied { color: var(--ok);   border: 1px solid currentColor; }
+.pill.dropped { color: var(--flag); background: var(--flag-wash); border: 1px solid var(--flag-edge); }
+
+tr.flagrow td { background: var(--flag-wash); }
+
+/* ---------- stays-HF list ---------- */
+
+.reasons {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
+  gap: 1px;
+  background: var(--rule);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  overflow: hidden;
+  margin: 0;
+  padding: 0;
+}
+.reasons > li {
+  list-style: none;
+  background: var(--surface);
+  padding: .85rem;
+  display: flex;
+  flex-direction: column;
+  gap: .3rem;
+}
+.reasons .m { color: var(--hf-ink); font-weight: 600; font-size: .84rem; }
+.reasons small {
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-size: .84rem;
+  line-height: 1.42;
+  color: var(--ink-soft);
+}
+
+footer {
+  border-top: 1px solid var(--rule);
+  padding-top: 1rem;
+  font-family: "IBM Plex Sans Condensed", system-ui, sans-serif;
+  font-size: .82rem;
+  color: var(--ink-faint);
+  max-width: 42rem;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  a { transition: color .15s ease; }
+}
+:focus-visible { outline: 2px solid var(--vllm); outline-offset: 2px; }
+</style>
+
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">vLLM Transformers modeling backend</p>
+  <h1>Granite 3.3 Rewiring</h1>
+  <p class="lede" style="margin-top:.9rem">
+    Under <code>--model-impl transformers</code>, vLLM runs Hugging Face's own
+    <code>modeling_granite.py</code> forward code and surgically swaps the modules
+    underneath it. HF keeps the control flow; vLLM takes the kernels.
+  </p>
+</header>
+
+<div class="legend">
+  <div><span class="key k-vllm"></span> vLLM module or kernel</div>
+  <div><span class="key k-hf"></span> HF <code>forward</code>, untouched</div>
+  <div><span class="key k-rw"></span> HF <code>forward</code>, AST-rewritten by a fuser</div>
+</div>
+
+<section>
+  <div class="sechead">
+    <h2>How the swap happens</h2>
+    <p class="caption">Construction order in <code>TransformersBase.__init__</code>. Each step
+      mutates the tree HF just built — nothing is re-implemented.</p>
+  </div>
+  <ol class="steps">
+    <li>
+      <span class="stepnum">01</span>
+      <span class="m">_patch_config</span>
+      <small>Sets <code>_attn_implementation = "vllm"</code>, the single hook HF exposes.</small>
+    </li>
+    <li>
+      <span class="stepnum">02</span>
+      <span class="m">AutoModel.from_config</span>
+      <small>Builds <code>GraniteModel</code> on the <code>meta</code> device. No weights, no buffers.</small>
+    </li>
+    <li>
+      <span class="stepnum">03</span>
+      <span class="m">pipeline_parallel</span>
+      <small>Replaces off-rank decoder layers with <code>PPMissingLayer()</code>.</small>
+    </li>
+    <li>
+      <span class="stepnum">04</span>
+      <span class="m">recursive_replace</span>
+      <span></span>
+      <small><code>torch.fx</code> traces each module <em>class</em> once, matches a fuser, rewrites forwards, swaps linears and norms.</small>
+    </li>
+    <li>
+      <span class="stepnum">05</span>
+      <span class="m">create_attention_instances</span>
+      <small>40 <code>Attention</code> objects for the KV cache, dispatched to by name.</small>
+    </li>
+    <li>
+      <span class="stepnum">06</span>
+      <span class="m">init_parameters</span>
+      <small>Allocates real tensors for anything still on <code>meta</code>, then <code>load_weights</code> at load time.</small>
+    </li>
+  </ol>
+</section>
+
+<section>
+  <div class="sechead">
+    <h2>One forward pass</h2>
+    <p class="caption">Nesting is the point: every teal block sits <em>inside</em> an HF
+      <code>forward</code>. vLLM never owns a layer's control flow — only the ops it calls.</p>
+  </div>
+
+  <div class="diagram">
+    <div class="stack">
+
+      <div class="frame">
+        <header>
+          <span class="m">GraniteModel.forward</span>
+          <span class="tag">HF · torch.compile region</span>
+        </header>
+        <div class="body">
+
+          <div class="op">
+            <span class="m">VocabParallelEmbedding</span>
+            <span class="note">49 159 × 4096 · swapped after recursive_replace</span>
+          </div>
+
+          <div class="hfstep scalar">
+            <span class="m">× embedding_multiplier = 12.0</span>
+            <span class="note">outside the inputs_embeds branch, so it always applies</span>
+          </div>
+
+          <div class="hfstep">
+            <span class="m">GraniteRotaryEmbedding → cos, sin</span>
+            <span class="note">stays HF — see below</span>
+          </div>
+
+          <div class="frame">
+            <header>
+              <span class="m">GraniteDecoderLayer.forward</span>
+              <span class="tag">HF · × 40</span>
+            </header>
+            <div class="body">
+
+              <div class="hfstep"><span class="m">residual = hidden_states</span></div>
+
+              <div class="op">
+                <span class="m">TPAwareRMSNorm</span>
+                <span class="note">input_layernorm</span>
+              </div>
+
+              <div class="frame rewritten">
+                <header>
+                  <span class="m">GraniteAttention.forward</span>
+                  <span class="tag">rewritten by QKVFuser</span>
+                </header>
+                <div class="body">
+                  <div class="op">
+                    <span class="m">QKVParallelLinear → q, k, v</span>
+                    <span class="note">4096 → 4096 + 1024 + 1024</span>
+                  </div>
+                  <div class="hfstep">
+                    <span class="m">.view / .transpose → [1, H, S, 128]</span>
+                    <span class="note">HF's layout</span>
+                  </div>
+                  <div class="hfstep">
+                    <span class="m">apply_rotary_pos_emb(q, k, cos, sin)</span>
+                    <span class="note">HF kernel, not vLLM's fused rope</span>
+                  </div>
+
+                  <div class="frame">
+                    <header>
+                      <span class="m">ALL_ATTENTION_FUNCTIONS["vllm"]</span>
+                      <span class="tag">registered hook</span>
+                    </header>
+                    <div class="body">
+                      <div class="op">
+                        <span class="m">Attention</span>
+                        <span class="note">paged KV cache · causal · 32 q / 8 kv heads</span>
+                      </div>
+                      <div class="hfstep">
+                        <span class="m">impl.scale ← attention_multiplier = 0.0078125</span>
+                        <span class="note">1/128, not 1/√128 — the override is load-bearing</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="hfstep">
+                    <span class="m">.reshape → [S, 4096]</span>
+                    <span class="note">back to HF's layout</span>
+                  </div>
+                  <div class="op">
+                    <span class="m">RowParallelLinear</span>
+                    <span class="note">o_proj · also swapped by QKVFuser</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="hfstep scalar">
+                <span class="m">h = residual + attn_out × residual_multiplier (0.22)</span>
+              </div>
+
+              <div class="op">
+                <span class="m">TPAwareRMSNorm</span>
+                <span class="note">post_attention_layernorm</span>
+              </div>
+
+              <div class="frame rewritten">
+                <header>
+                  <span class="m">GraniteMLP.forward</span>
+                  <span class="tag">rewritten by GLUFuser</span>
+                </header>
+                <div class="body">
+                  <div class="op">
+                    <span class="m">MergedColumnParallelLinear</span>
+                    <span class="note">gate_up_proj · [12800, 12800]</span>
+                  </div>
+                  <div class="op">
+                    <span class="m">SiluAndMul</span>
+                    <span class="note">replaces act_fn(gate(x)) * up(x)</span>
+                  </div>
+                  <div class="op">
+                    <span class="m">RowParallelLinear</span>
+                    <span class="note">down_proj · 12800 → 4096</span>
+                  </div>
+                </div>
+              </div>
+
+              <div class="hfstep scalar">
+                <span class="m">h = residual + mlp_out × residual_multiplier (0.22)</span>
+              </div>
+
+            </div>
+          </div>
+
+          <div class="op">
+            <span class="m">TPAwareRMSNorm</span>
+            <span class="note">final norm</span>
+          </div>
+
+        </div>
+      </div>
+
+      <p class="divider">then, in TransformersForCausalLM</p>
+
+      <div class="op">
+        <span class="m">ParallelLMHead</span>
+        <span class="note">49 159 × 4096 · tied to embed_tokens</span>
+      </div>
+
+      <div class="op flagged">
+        <span class="m">LogitsProcessor(scale = logit_scale)</span>
+        <span class="note">logits_scaling = 16.0 is never read — see below</span>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="sechead">
+    <h2>Every module that changes hands</h2>
+    <p class="caption">Counts are for the full 40-layer model at TP 1.</p>
+  </div>
+  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr><th>HF module</th><th>becomes</th><th style="text-align:right">count</th><th>mechanism</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="from"><code>embed_tokens</code> <span class="m"></span><br><code>nn.Embedding(49159, 4096)</code></td>
+          <td class="to"><code>VocabParallelEmbedding</code></td>
+          <td class="n">1</td>
+          <td><code>replace_embedding_class</code>, after <code>recursive_replace</code></td>
+        </tr>
+        <tr>
+          <td class="from"><code>q_proj</code> + <code>k_proj</code> + <code>v_proj</code></td>
+          <td class="to"><code>qkv_proj</code><br><code>QKVParallelLinear</code></td>
+          <td class="n">40 → 40</td>
+          <td><code>QKVFuser</code> — three linears sharing one <code>fx</code> placeholder; q is the odd width out</td>
+        </tr>
+        <tr>
+          <td class="from"><code>o_proj</code></td>
+          <td class="to"><code>RowParallelLinear</code></td>
+          <td class="n">40</td>
+          <td><code>QKVFuser.update_attrs</code> (it owns the whole attention block)</td>
+        </tr>
+        <tr>
+          <td class="from"><code>gate_proj</code> + <code>up_proj</code></td>
+          <td class="to"><code>gate_up_proj</code><br><code>MergedColumnParallelLinear</code></td>
+          <td class="n">40 → 40</td>
+          <td><code>GLUFuser</code> — matches <code>act(gate(x)) * up(x)</code></td>
+        </tr>
+        <tr>
+          <td class="from"><code>act_fn</code> <code>SiLU</code></td>
+          <td class="to"><code>SiluAndMul</code></td>
+          <td class="n">40</td>
+          <td><code>GLUFuser</code>, via <code>_ACTIVATION_AND_MUL_REGISTRY</code></td>
+        </tr>
+        <tr>
+          <td class="from"><code>down_proj</code></td>
+          <td class="to"><code>RowParallelLinear</code></td>
+          <td class="n">40</td>
+          <td><code>GLUFuser.update_attrs</code></td>
+        </tr>
+        <tr>
+          <td class="from"><code>GraniteRMSNorm</code></td>
+          <td class="to"><code>TPAwareRMSNorm</code></td>
+          <td class="n">81</td>
+          <td><code>RMSNormFuser</code> — matches the <code>x · rsqrt(mean(x²))</code> dataflow, then sniffs out the <code>eps</code> attribute by retracing with markers</td>
+        </tr>
+        <tr>
+          <td class="from">attention math inside <code>GraniteAttention</code></td>
+          <td class="to"><code>Attention</code></td>
+          <td class="n">40</td>
+          <td><code>_attn_implementation = "vllm"</code> → <code>vllm_attention_forward</code></td>
+        </tr>
+        <tr>
+          <td class="from">— <span style="opacity:.6">(added, not replaced)</span></td>
+          <td class="to"><code>ParallelLMHead</code> + <code>LogitsProcessor</code></td>
+          <td class="n">1</td>
+          <td><code>CausalMixin</code>; <code>AutoModel</code> never builds an LM head</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section>
+  <div class="sechead">
+    <h2>What stays Hugging Face</h2>
+  </div>
+  <ul class="reasons">
+    <li>
+      <span class="m">GraniteRotaryEmbedding</span>
+      <small>There is no registry to inject into, and the signatures disagree: HF wants
+        <code>(x, position_ids) → (cos, sin)</code> applied after the projections, vLLM's
+        <code>RotaryEmbedding.forward</code> wants <code>(positions, q, k) → (q, k)</code>.
+        Consequence: vLLM's fused rope kernels never fire on this path. HF also owns the whole
+        <code>rope_scaling</code> config surface — Granite 3.3 sets it to <code>null</code>, so
+        <code>torch.compile</code> stays enabled and the HF rope is at least compiled in.</small>
+    </li>
+    <li>
+      <span class="m">All forward control flow</span>
+      <small><code>GraniteModel.forward</code> and <code>GraniteDecoderLayer.forward</code> are
+        untouched. Only <code>GraniteAttention.forward</code> and <code>GraniteMLP.forward</code>
+        get re-parsed and recompiled, and only to redirect projection calls.</small>
+    </li>
+    <li>
+      <span class="m">The tensor-layout round trip</span>
+      <small><code>qkv_proj</code> hands back <code>[S, 6144]</code>; HF splits and reshapes to
+        <code>[1, H, S, 128]</code>, then back to <code>[S, 4096]</code> for
+        <code>o_proj</code>. Both reshapes are pure HF code either side of the attention hook.</small>
+    </li>
+    <li>
+      <span class="m">Anything a fuser can't see</span>
+      <small><code>LayerNorm</code>, unmatched RMSNorms, standalone activations, and any module
+        whose traced graph doesn't hit a known pattern. Granite happens to fuse cleanly; a model
+        with an unusual norm gets a warning and keeps the HF implementation.</small>
+    </li>
+  </ul>
+</section>
+
+<section>
+  <div class="sechead">
+    <h2>Granite's four muP multipliers</h2>
+    <p class="caption">Granite scales activations at four points. Three survive the rewiring
+      because they live in HF forward code the backend doesn't touch. The fourth lives in the
+      <code>ForCausalLM</code> wrapper that <code>AutoModel</code> never builds.</p>
+  </div>
+  <div class="tablewrap">
+    <table>
+      <thead>
+        <tr><th>config field</th><th style="text-align:right">value</th><th>where it runs</th><th>status</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="from"><code>embedding_multiplier</code></td>
+          <td class="n">12.0</td>
+          <td><code>GraniteModel.forward</code>, outside the <code>inputs_embeds</code> branch</td>
+          <td><span class="pill applied">applied</span></td>
+        </tr>
+        <tr>
+          <td class="from"><code>attention_multiplier</code></td>
+          <td class="n">0.0078125</td>
+          <td>passed as <code>scaling=</code> to the hook, which overwrites <code>impl.scale</code></td>
+          <td><span class="pill applied">applied</span></td>
+        </tr>
+        <tr>
+          <td class="from"><code>residual_multiplier</code></td>
+          <td class="n">0.22</td>
+          <td><code>GraniteDecoderLayer.forward</code>, twice per layer</td>
+          <td><span class="pill applied">applied</span></td>
+        </tr>
+        <tr class="flagrow">
+          <td class="from"><code>logits_scaling</code></td>
+          <td class="n">16.0</td>
+          <td><code>GraniteForCausalLM</code> divides the logits by it. The backend's
+            <code>CausalMixin</code> reads <code>logit_scale</code> instead, and nothing aliases
+            the two names.</td>
+          <td><span class="pill dropped">dropped</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="caption">
+    Net effect of the last row: logits come out 16× too large, which flattens temperature into
+    near-greedy sampling. Greedy decoding hides it entirely — which is why it can sit unnoticed.
+    vLLM's native <code>granite.py</code> handles it at <code>granite.py:430</code>.
+  </p>
+</section>
+
+<footer>
+  vLLM-side details read from the working tree at <code>vllm/model_executor/models/transformers/</code>.
+  Granite module structure and HF forward ordering read from <code>transformers</code> <code>main</code>
+  and <code>ibm-granite/granite-3.3-8b-instruct/config.json</code>; <code>transformers</code> is not
+  importable in this checkout, so nothing here was confirmed by running the model.
+</footer>
+
+</div>
