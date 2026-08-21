@@ -76,35 +76,26 @@ def _hf_rope(head_dim: int, n_heads: int = 4):
     return LlamaRotaryEmbedding(config=cfg)
 
 
-def _spyre_rope_parts(hf_rope, head_dim: int):
+def _spyre_rope(hf_rope, padded_head_dim=None):
     """Build the patched rope pair the way ``_patch_rope`` does."""
-    from spyre_inference.hf_adapters import (
-        _STICK,
-        _make_spyre_apply_rotary,
-        _qk_expand_matrix,
-        _SpyreRotaryEmbedding,
-    )
+    from spyre_inference.hf_adapters import _make_spyre_apply_rotary, _SpyreRotaryEmbedding
 
-    stick_aligned = ((head_dim + 2 * _STICK - 1) // (2 * _STICK)) * (2 * _STICK)
-    padded = stick_aligned if stick_aligned > head_dim else None
-    qk_expand = _qk_expand_matrix(head_dim, padded) if padded is not None else None
     return (
         _SpyreRotaryEmbedding(
             hf_rope.inv_freq,
             getattr(hf_rope, "attention_scaling", 1.0),
-            padded_head_dim=padded,
+            padded_head_dim=padded_head_dim,
         ),
-        _make_spyre_apply_rotary(qk_expand),
-        padded,
+        _make_spyre_apply_rotary(),
     )
 
 
-@pytest.mark.parametrize("head_dim", [64, 128, 256])
+@pytest.mark.parametrize("head_dim", [128, 256])
 def test_rope_matches_hf_reference_cpu(head_dim: int) -> None:
     """CPU-only: the 2x2 rotation reproduces HF's own ``apply_rotary_pos_emb``.
 
-    ``head_dim=64`` (inner dim 32) exercises the expand/contract path; 128 and 256 are
-    already stick-aligned and rotate in place.
+    Covers stick-aligned head dims, which the platform leaves alone and which
+    therefore rotate in place.
     """
     from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 
@@ -118,7 +109,7 @@ def test_rope_matches_hf_reference_cpu(head_dim: int) -> None:
     cos, sin = hf_rope(query, positions)
     expected_q, expected_k = apply_rotary_pos_emb(query, key, cos, sin)
 
-    spyre_rope, apply_spyre, _ = _spyre_rope_parts(hf_rope, head_dim)
+    spyre_rope, apply_spyre = _spyre_rope(hf_rope)
     rot, second = spyre_rope(query.half(), positions)
     assert second is None, "must return (rotation, None) to fit HF's (cos, sin) contract"
     actual_q, actual_k = apply_spyre(query.half(), key.half(), rot)
@@ -126,6 +117,55 @@ def test_rope_matches_hf_reference_cpu(head_dim: int) -> None:
     assert actual_q.shape == query.shape and actual_k.shape == key.shape
     torch.testing.assert_close(actual_q.float(), expected_q, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(actual_k.float(), expected_k, atol=1e-2, rtol=1e-2)
+
+
+def test_padded_rope_matches_unpadded_reference_cpu() -> None:
+    """CPU-only: platform head padding + corrected frequencies == unpadded HF rope.
+
+    The platform widens head_dim 64->128 and ``head_pad`` pads the projection weights
+    interleaved, so each head holds ``[first_half | zeros | second_half | zeros]``.
+    ``_patch_rope`` rebuilds the rope at the original 64 and identity-pads the
+    rotation. Rotating the padded Q/K must leave the occupied slots equal to HF's rope
+    over the original 64-wide tensors, and the padded slots zero.
+    """
+    from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+
+    from spyre_inference.custom_ops.head_pad import _pad_qk_interleaved
+
+    torch.manual_seed(11)
+    orig, padded = 64, 128
+    n_heads, n_kv, seq, bsz = 4, 2, 7, 1
+    half, phalf = orig // 2, padded // 2
+
+    hf_rope_orig = _hf_rope(orig, n_heads)
+    query = torch.randn(bsz, n_heads, seq, orig)
+    key = torch.randn(bsz, n_kv, seq, orig)
+    positions = torch.arange(seq).unsqueeze(0).expand(bsz, seq)
+
+    cos, sin = hf_rope_orig(query, positions)
+    expected_q, expected_k = apply_rotary_pos_emb(query, key, cos, sin)
+
+    def pad_heads(x, n):
+        """Apply the same interleaved per-head padding head_pad applies to weights."""
+        flat = x.permute(0, 2, 1, 3).reshape(-1, n * orig).t()
+        out = _pad_qk_interleaved(flat, n, orig, padded).t()
+        return out.reshape(bsz, seq, n, padded).permute(0, 2, 1, 3).contiguous()
+
+    spyre_rope, apply_spyre = _spyre_rope(hf_rope_orig, padded_head_dim=padded)
+    rot, _ = spyre_rope(query.half(), positions)
+    assert rot.shape[-1] == phalf, "rotation must be identity-padded to the padded half"
+
+    padded_q, padded_k = pad_heads(query, n_heads).half(), pad_heads(key, n_kv).half()
+    actual_q, actual_k = apply_spyre(padded_q, padded_k, rot)
+
+    def unpad(x):
+        return torch.cat([x[..., :half], x[..., phalf : phalf + half]], dim=-1)
+
+    torch.testing.assert_close(unpad(actual_q).float(), expected_q, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(unpad(actual_k).float(), expected_k, atol=1e-2, rtol=1e-2)
+
+    zeros = torch.zeros(bsz, n_heads, seq, half)
+    torch.testing.assert_close(actual_q[..., half:phalf].float(), zeros, atol=1e-3, rtol=0)
 
 
 @pytest.mark.parametrize("mode", ["eager", "compile"])
@@ -146,9 +186,9 @@ def test_padded_rotation_lowers_on_spyre(spyre_device, mode: str) -> None:
     strict=True,
     reason="Spyre cannot lower the 2x2 rotation at a sub-stick inner dim: the "
     "[.., 2, 32] pairing view yields stick expression '32*d3 + d4' where the backend "
-    "requires Mod(var, 64). This is why _patch_rope expands Q/K to a stick-aligned "
-    "head_dim. When this XPASSes, drop _qk_expand_matrix and the expand/contract "
-    "matmuls from _make_spyre_apply_rotary.",
+    "requires Mod(var, 64). This is why the platform pads head_dim to a 128-multiple "
+    "for this backend too. When this XPASSes, head padding is no longer needed for "
+    "stick alignment (the restickify constraint in head_pad.py is separate).",
 )
 def test_unpadded_rotation_rejected_on_spyre(spyre_device, mode: str) -> None:
     """Probe: rotating an unpadded head_dim=64 (inner dim 32) on Spyre."""
@@ -160,3 +200,48 @@ def test_unpadded_rotation_rejected_on_spyre(spyre_device, mode: str) -> None:
 
     fn = torch.compile(_rotate, dynamic=False) if mode == "compile" else _rotate
     assert tuple(fn(query, rot).to("cpu").shape) == (1, 4, 8, 64)
+
+
+def test_padded_attention_scale_restored_cpu() -> None:
+    """CPU-only: HF's head_dim-derived ``scaling`` is reset to the pre-padding width.
+
+    ``head_pad.fix_padded_attention_scale`` cannot do this here: it rewrites
+    ``Attention.impl.scale``, but ``vllm_attention_forward`` reassigns that from HF's
+    ``module.scaling`` on every forward, and the ``Attention`` instances live in a
+    plain dict that ``model.modules()`` never yields.
+    """
+    import math
+
+    import torch.nn as nn
+    from transformers import LlamaConfig
+    from transformers.models.llama.modeling_llama import LlamaAttention
+
+    from spyre_inference.custom_ops.head_pad import _ORIG_ATTR
+    from spyre_inference.hf_adapters import HfAdaptersForCausalLM
+
+    orig, padded = 64, 128
+    cfg = LlamaConfig(
+        hidden_size=2048,
+        num_attention_heads=32,
+        num_key_value_heads=8,
+        head_dim=padded,
+        max_position_embeddings=512,
+    )
+    setattr(cfg, _ORIG_ATTR, orig)
+
+    attn = LlamaAttention(config=cfg, layer_idx=0)
+    assert math.isclose(attn.scaling, padded**-0.5, rel_tol=1e-6), "HF should derive 1/sqrt(padded)"
+
+    class Backbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([attn])
+            self.config = cfg
+
+    class Holder:
+        model = Backbone()
+
+    HfAdaptersForCausalLM._fix_padded_attention_scale(Holder())
+    assert math.isclose(attn.scaling, orig**-0.5, rel_tol=1e-6), (
+        f"scaling should be 1/sqrt({orig}), got {attn.scaling}"
+    )

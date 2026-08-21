@@ -28,10 +28,15 @@ to CPU, changing the fp16 accumulation order).
 ``HfAdaptersForCausalLM`` subclasses ``TransformersForCausalLM`` and patches both HF
 RoPE call sites — the ``rotary_emb`` that produces ``(cos, sin)`` and the
 module-level ``apply_rotary_pos_emb`` that consumes it — to an equivalent 2x2
-rotation-matrix formulation that needs no slicing. Where ``head_dim/2`` is not
-stick-aligned, Q/K are expanded into a stick-aligned dimension for the rotation and
-contracted back afterwards, leaving attention and the KV cache at the native
-``head_dim`` (the platform's ``_maybe_pad_head_dim`` no-ops on this backend).
+rotation-matrix formulation that needs no slicing.
+
+Stick alignment is handled once, by the platform: ``_maybe_pad_head_dim`` widens
+``head_dim`` to a 128-multiple and ``head_pad`` pads the projection weights, so Q/K
+already arrive aligned and the rotation applies in place. Two of ``head_pad``'s
+fix-up passes cannot reach this backend, so their counterparts live here:
+``_patch_rope`` rebuilds the RoPE at the pre-padding ``head_dim`` (HF derived its
+frequencies from the padded width), and ``_fix_padded_attention_scale`` restores
+HF's ``scaling`` to ``1/sqrt(orig_head_dim)``.
 
 Everything else comes from upstream — model creation, weight loading, attention
 routing, KV cache, scheduling, forward execution — and the Spyre OOT layers
@@ -44,6 +49,7 @@ Activated when ``model_impl="transformers"`` on the Spyre platform via
 
 from __future__ import annotations
 
+import math
 import sys
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
@@ -60,10 +66,6 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 logger = init_logger(__name__)
-
-# Spyre stick size at fp16: 128 bytes / 2 bytes per element. The 2x2 rotation's
-# inner dim is head_dim/2, so a stick-aligned head_dim is a multiple of 2*_STICK.
-_STICK = 64
 
 
 def _text_backbone(model: nn.Module) -> nn.Module:
@@ -146,46 +148,17 @@ class _SpyreRotaryEmbedding(nn.Module):
         return self._cache[positions].to(x.device), None
 
 
-def _qk_expand_matrix(orig_hd: int, padded_hd: int) -> torch.Tensor:
-    """Interleaved expand matrix for Q/K (RoPE-compatible half-split)."""
-    half, phalf = orig_hd // 2, padded_hd // 2
-    m = torch.zeros(orig_hd, padded_hd)
-    m[:half, :phalf] = torch.eye(half, phalf)
-    m[half:, phalf:] = torch.eye(half, phalf)
-    return m
+def _make_spyre_apply_rotary():
+    """Replace ``apply_rotary_pos_emb`` with the matmul-based rotation.
 
-
-def _make_spyre_apply_rotary(qk_expand=None):
-    """Replace apply_rotary_pos_emb with matmul-based RoPE.
-
-    When *qk_expand* is provided (head_dim/2 is not stick-aligned), Q/K are
-    temporarily padded into the stick-aligned dimension for the rotation,
-    then contracted back to the original size.
+    Q/K arrive already stick-aligned: the platform pads ``head_dim`` to a
+    128-multiple and the projection weights are padded to match, so the rotation
+    applies in place.
     """
-    qk_contract = qk_expand.t().contiguous() if qk_expand is not None else None
-    _cached: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
 
     @torch.no_grad()
     def wrapper(q, k, cos, sin=None, *args, **kwargs):
-        if qk_expand is not None:
-            assert qk_contract is not None  # set together with qk_expand above
-            dev = q.device
-            if dev not in _cached:
-                _cached[dev] = (
-                    qk_expand.to(device=dev, dtype=q.dtype),
-                    qk_contract.to(device=dev, dtype=q.dtype),
-                )
-            exp, con = _cached[dev]
-            q = torch.matmul(q, exp)
-            k = torch.matmul(k, exp)
-
-        q, k = _rotate(q, cos), _rotate(k, cos)
-
-        if qk_expand is not None:
-            q = torch.matmul(q, con)
-            k = torch.matmul(k, con)
-
-        return q, k
+        return _rotate(q, cos), _rotate(k, cos)
 
     wrapper._spyre_patched = True
     return wrapper
@@ -200,10 +173,48 @@ class HfAdaptersForCausalLM(TransformersForCausalLM):
         logger.debug("HfAdaptersForCausalLM ready: %s", type(self.model).__name__)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load weights and patch rope."""
+        """Load weights, patch rope, and repair the head_dim-derived attention scale."""
         result = super().load_weights(weights)
         self._patch_rope()
+        self._fix_padded_attention_scale()
         return result
+
+    def _fix_padded_attention_scale(self) -> None:
+        """Restore ``scaling`` to ``1/sqrt(orig_head_dim)`` on HF attention modules.
+
+        The Transformers-backend counterpart of ``head_pad.fix_padded_attention_scale``,
+        which cannot help here: it rewrites ``Attention.impl.scale``, but
+        ``vllm_attention_forward`` reassigns that from HF's ``module.scaling`` on every
+        forward, and vLLM's ``Attention`` instances live in a plain
+        ``attention_instances`` dict that ``model.modules()`` never yields.
+
+        With head_dim padded, HF derived ``scaling`` from the padded width while the
+        dot product still runs over the original dims (the rest are zero), so softmax
+        would be flattened. Scales that are not head_dim-derived (Granite's
+        ``attention_multiplier``) must be left alone, detected by comparing against the
+        padded default.
+        """
+        from spyre_inference.custom_ops.head_pad import _ORIG_ATTR, head_padding_active
+
+        cfg = self.model.config
+        if not head_padding_active(cfg):
+            return
+
+        orig = getattr(cfg, _ORIG_ATTR)
+        padded_default = float(cfg.head_dim**-0.5)
+        orig_default = float(orig**-0.5)
+
+        fixed = 0
+        for module in self.model.modules():
+            scaling = getattr(module, "scaling", None)
+            if (
+                "Attention" in module.__class__.__name__
+                and isinstance(scaling, float)
+                and math.isclose(scaling, padded_default, rel_tol=1e-3)
+            ):
+                module.scaling = orig_default
+                fixed += 1
+        logger.info("Reset HF attention scaling to 1/sqrt(%d) on %d layers.", orig, fixed)
 
     @staticmethod
     def _fix_generic_config(vllm_config: VllmConfig) -> None:
@@ -244,25 +255,45 @@ class HfAdaptersForCausalLM(TransformersForCausalLM):
     # (e.g. Phi-3) by splitting them into separate modules with TP-aware
     # weight redistribution and partial-rotary dimension permutation.
 
+    @staticmethod
+    def _rope_at_original_head_dim(hf_rope: nn.Module, cfg) -> nn.Module:
+        """Rebuild *hf_rope* at the pre-padding head_dim.
+
+        Reconstructing through HF's own rope class keeps its rope-scaling dispatch
+        (llama3, yarn, ...) rather than recomputing ``inv_freq`` by hand.
+        """
+        from spyre_inference.custom_ops.head_pad import _ORIG_ATTR
+
+        orig = getattr(cfg, _ORIG_ATTR)
+        padded = cfg.head_dim
+        cfg.head_dim = orig
+        try:
+            return type(hf_rope)(config=cfg)
+        finally:
+            cfg.head_dim = padded
+
     def _patch_rope(self):
         """Point both HF RoPE call sites at the 2x2 rotation.
 
-        A ``head_dim/2`` that is not a multiple of ``_STICK`` also gets an
-        expand/contract matrix pair, so Q/K are widened into a stick-aligned
-        dimension for the rotation and contracted back; attention and the KV cache
-        keep the native head_dim.
+        When the platform padded ``head_dim`` for stick alignment, HF built its RoPE
+        from the padded width and so has the wrong frequency spacing; rebuild it at
+        the original width and identity-pad the rotation to match the padded Q/K.
+        This is the Transformers-backend counterpart of ``head_pad.fix_padded_rope``.
         """
+        from spyre_inference.custom_ops.head_pad import head_padding_active
+
         cfg = self.model.config
-        head_dim = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
-
-        stick_aligned = ((head_dim + 2 * _STICK - 1) // (2 * _STICK)) * (2 * _STICK)
-        padded_head_dim = stick_aligned if stick_aligned > head_dim else None
-        qk_exp = (
-            _qk_expand_matrix(head_dim, padded_head_dim) if padded_head_dim is not None else None
-        )
-
         backbone = _text_backbone(self.model)
         hf_rope = backbone.rotary_emb
+        padded_head_dim = None
+
+        if head_padding_active(cfg):
+            padded_head_dim = cfg.head_dim
+            hf_rope = self._rope_at_original_head_dim(
+                hf_rope,  # ty: ignore[invalid-argument-type]
+                cfg,
+            )
+
         # One shared instance: the rotation cache is position-indexed, so every layer
         # can read the same one.
         spyre_rope = _SpyreRotaryEmbedding(
@@ -301,7 +332,7 @@ class HfAdaptersForCausalLM(TransformersForCausalLM):
             orig = getattr(mod, "apply_rotary_pos_emb", None)
             if orig is None or getattr(orig, "_spyre_patched", False):
                 continue
-            mod.apply_rotary_pos_emb = _make_spyre_apply_rotary(qk_exp)
+            mod.apply_rotary_pos_emb = _make_spyre_apply_rotary()
             patched_mods.add(id(mod))
 
 
