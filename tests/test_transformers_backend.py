@@ -139,10 +139,9 @@ def test_padded_qk_logits_match_the_unpadded_reference():
     "model",
     [
         "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
+        # head_dim=64, so this one exercises the padded path (issue #597); micro-g3.3
+        # is head_dim=128 and stays unpadded, covering both branches.
         "meta-llama/Llama-3.2-1B-Instruct",
-        # head_dim=4, so the KV cache is only stick-aligned once head_dim is padded
-        # (issue #597). Llama-3.2-1B (head_dim=64) exercises the padded path too.
-        "stas/tiny-random-llama-2",
     ],
 )
 def test_transformers_generate(model: str) -> None:
