@@ -105,11 +105,7 @@ def _pad_input_end(w: torch.Tensor, n_heads: int, orig: int, padded: int) -> tor
 def _pad_fused_qkv(
     w: torch.Tensor, n_heads: int, n_kv_heads: int, orig: int, padded: int
 ) -> torch.Tensor:
-    """Pad a checkpoint that fuses q/k/v into one output-dim-concatenated tensor.
-
-    Phi-3 ships ``qkv_proj`` rather than three projections, so each slice has to be
-    split out and padded by its own rule before being reassembled.
-    """
+    """Pad a fused ``[q | k | v]`` checkpoint tensor (Phi-3 ships one, not three)."""
     q, k, v = w.split([n_heads * orig, n_kv_heads * orig, n_kv_heads * orig])
     return torch.cat(
         [
@@ -157,10 +153,8 @@ def install_padded_head_dim(model_config) -> None:
     with a property whose setter substitutes the padded width makes the whole
     module consistent regardless of how it computed the value.
 
-    Not needed on the Transformers backend: HF attention modules size themselves
-    from ``config.head_dim``, so the override already lands, and the class this
-    resolves to there is the thin ``HfAdaptersForCausalLM`` wrapper rather than a
-    module holding attention classes.
+    Skipped on the Transformers backend: HF attention sizes itself from
+    ``config.head_dim``, so the override already lands there.
     """
     if not head_padding_active(model_config.hf_config):
         return
@@ -218,11 +212,8 @@ def install_padded_head_dim(model_config) -> None:
 
 
 def _attention_layers(model) -> list[tuple[str, torch.nn.Module]]:
-    """``named_modules()`` plus the Transformers backend's vLLM Attention layers.
-
-    That backend holds them in a plain ``attention_instances`` dict, which nn.Module
-    never registers, so they do not appear in ``named_modules()``.
-    """
+    """``named_modules()`` plus ``attention_instances``, a plain dict nn.Module never
+    registers (the Transformers backend keeps its Attention layers there)."""
     instances = getattr(model, "attention_instances", None) or {}
     return list(model.named_modules()) + [(f"attn.{i}", m) for i, m in instances.items()]
 
@@ -318,9 +309,8 @@ def fix_padded_attention_scale(model, hf_config) -> None:
     their scale must be left untouched — detected by comparing the built scale
     against the padded head_dim default.
 
-    On the Transformers backend the HF module's own ``scaling`` has to be fixed too:
-    ``vllm_attention_forward`` copies it onto ``impl.scale`` on every forward, so
-    correcting only the vLLM layer would be undone on the first step.
+    HF's ``module.scaling`` is reset too: ``vllm_attention_forward`` copies it onto
+    ``impl.scale`` on every forward, so fixing only the vLLM layer would not stick.
     """
     if not head_padding_active(hf_config):
         return

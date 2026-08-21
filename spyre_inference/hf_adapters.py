@@ -73,11 +73,7 @@ class _SpyreRotaryEmbedding(nn.Module):
 
 @torch.no_grad()
 def _spyre_apply_rotary(q, k, cos, sin=None, *args, **kwargs):
-    """Matmul-based replacement for HF's ``apply_rotary_pos_emb``.
-
-    ``cos`` carries the [B, L, 2, 2, D/2] rotation matrices built by
-    ``_SpyreRotaryEmbedding``; ``sin`` is unused.
-    """
+    """Matmul RoPE; ``cos`` carries [B, L, 2, 2, D/2] rotation matrices, ``sin`` unused."""
     return apply_rope_matmul(q, cos), apply_rope_matmul(k, cos)
 
 
@@ -85,13 +81,10 @@ _spyre_apply_rotary._spyre_patched = True
 
 
 def _rope_at_original_head_dim(cfg, rope: nn.Module, orig_head_dim: int) -> InvFreqShim:
-    """Rebuild ``rope``'s frequencies at the pre-pad head_dim.
+    """Rebuild ``inv_freq``/``attention_scaling`` at the pre-pad head_dim.
 
-    The platform widens ``config.head_dim`` for stick alignment before the model is
-    built, so HF derived ``inv_freq`` (and any rope-scaling ``attention_scaling``)
-    from the padded width — one frequency per padded pair instead of per real pair.
-    Re-running HF's own rope init with the original width restores them; the caller
-    identity-pads the rotation back out to the padded width.
+    HF derived them from the widened ``config.head_dim``, giving one frequency per
+    padded pair instead of per real pair.
     """
     padded = cfg.head_dim
     cfg.head_dim = orig_head_dim
@@ -158,14 +151,9 @@ class HfAdaptersForCausalLM(TransformersForCausalLM):
     def _patch_rope(self):
         """Replace RoPE with matmul-based rotation.
 
-        Q/K arrive already stick-aligned: ``TorchSpyrePlatform._maybe_pad_head_dim``
-        widens ``config.head_dim`` to a multiple of 128 before the model is built and
-        the weight pass interleave-pads Q/K per head, so the rotation runs at the
-        padded width with no expand/contract needed here. What the width override
-        does corrupt is the frequency spacing, so on a padded model the rotation is
-        rebuilt from the pre-pad ``inv_freq`` and identity-padded back out — the
-        padded dims pair with the zeros the weight pass wrote, so they rotate to
-        zero either way.
+        head_dim is already a 128-multiple (the platform pads it), so the rotation
+        needs no expand/contract here — only the pre-pad frequencies, identity-padded
+        back out to the padded width.
         """
 
         cfg = self.model.config

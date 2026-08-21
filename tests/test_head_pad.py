@@ -153,12 +153,7 @@ def test_shim_skips_the_shared_vllm_attention_layers(monkeypatch):
 
 
 def test_shim_skipped_on_the_transformers_backend(monkeypatch):
-    """HF attention reads config.head_dim directly, so there is nothing to shim there.
-
-    ``resolve_model_cls`` resolves to the ``HfAdaptersForCausalLM`` wrapper on that
-    path, so shimming would patch whatever ``*Attention`` names happen to live in the
-    wrapper's module rather than the model's.
-    """
+    """HF attention reads config.head_dim directly, so there is nothing to shim."""
     cls = type("FakeAttention", (_DerivesOwnHeadDim,), {})
     model_config = _fake_model_config(
         monkeypatch, classes={"FakeAttention": cls}, transformers_backend=True
@@ -222,8 +217,7 @@ def test_reject_qk_norm_allows_norms_of_other_widths():
 
 
 def test_verify_checks_the_transformers_backend_attention_dict():
-    """That backend keeps its Attention layers in a plain dict, invisible to
-    named_modules(), so the guard has to look there too."""
+    """The backend's Attention layers live in a plain dict, invisible to named_modules()."""
     model = torch.nn.Module()
     layer = torch.nn.Module()
     layer.impl = object()
@@ -257,8 +251,7 @@ def test_fix_scale_resets_the_padded_default_on_the_vllm_layer():
 
 
 def test_fix_scale_resets_the_hf_module_scaling():
-    """``vllm_attention_forward`` copies HF's ``scaling`` onto impl.scale on every
-    forward, so fixing only the vLLM layer would be undone on the first step."""
+    """``vllm_attention_forward`` copies it onto impl.scale every forward."""
     model, layer = _attention_with_scale(impl_scale=_PADDED**-0.5, hf_scaling=_PADDED**-0.5)
 
     fix_padded_attention_scale(model, SimpleNamespace(head_dim=_PADDED, _spyre_orig_head_dim=_ORIG))
@@ -277,11 +270,7 @@ def test_fix_scale_leaves_a_head_dim_independent_scale_alone():
 
 
 def test_pad_weight_splits_a_fused_qkv_projection():
-    """Phi-3 fuses q/k/v into one checkpoint tensor, so each slice needs its own rule.
-
-    The name also ends with "v_proj.weight", so the v branch must not claim the whole
-    tensor.
-    """
+    """Each fused slice needs its own rule, and "qkv_proj" must not hit the v branch."""
     n_heads, n_kv, hidden = 4, 2, 8
     rows = (n_heads + 2 * n_kv) * _ORIG
     w = torch.arange(float(rows * hidden)).reshape(rows, hidden)

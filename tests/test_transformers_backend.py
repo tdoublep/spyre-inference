@@ -25,12 +25,7 @@ import torch
 
 
 def test_rope_frequencies_rebuilt_at_the_pre_pad_head_dim():
-    """The width override corrupts RoPE frequency spacing; #597's fix has to undo it.
-
-    ``_maybe_pad_head_dim`` widens ``config.head_dim`` before the model is built, so
-    HF derives one ``inv_freq`` entry per *padded* pair instead of per real pair.
-    CPU-only: this is pure config/frequency arithmetic.
-    """
+    """HF derives inv_freq from the widened head_dim, so the rebuild has to undo it."""
     from transformers import LlamaConfig
     from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 
@@ -61,14 +56,8 @@ def test_rope_frequencies_rebuilt_at_the_pre_pad_head_dim():
 
 
 def test_padded_qk_logits_match_the_unpadded_reference():
-    """The whole #597 padding path, checked numerically against stock HF on CPU.
-
-    Interleaved Q/K weight padding, the rotation rebuilt at the pre-pad frequencies
-    and identity-padded out to the padded width, and the ``1/sqrt(orig_head_dim)``
-    scale must together leave the pre-softmax logits identical to running the model
-    at its native head_dim. Uses the padding widths of stas/tiny-random-llama-2
-    (head_dim=4) at fp32 so the comparison is exact to rounding.
-    """
+    """Weight padding + rebuilt rotation + 1/sqrt(orig) scale must leave the logits
+    unchanged versus stock HF at the native head_dim."""
     from hf_adapters.hf_common import PrecomputedRotaryEmbedding, apply_rope_matmul
     from transformers import LlamaConfig
     from transformers.models.llama.modeling_llama import (
@@ -99,13 +88,11 @@ def test_padded_qk_logits_match_the_unpadded_reference():
         # [B, L, hidden] -> [B, H, L, head_dim], the layout RoPE and attention use.
         return (inputs @ weight.T).view(1, seq, n_heads, head_dim).transpose(1, 2)
 
-    # Reference: stock HF at the native head_dim.
     hf_rope = LlamaRotaryEmbedding(config=cfg)
     cos, sin = hf_rope(x, position_ids)
     q_ref, k_ref = apply_rotary_pos_emb(heads(x, q_w, orig), heads(x, k_w, orig), cos, sin)
     logits_ref = (q_ref @ k_ref.transpose(-1, -2)) * orig**-0.5
 
-    # Padded: what the platform override + weight pass + rebuilt RoPE produce.
     cfg.head_dim = padded
     q_pad = heads(x, _pad_weight("q_proj.weight", q_w, n_heads, n_heads, orig, padded), padded)
     k_pad = heads(x, _pad_weight("k_proj.weight", k_w, n_heads, n_heads, orig, padded), padded)
@@ -123,8 +110,6 @@ def test_padded_qk_logits_match_the_unpadded_reference():
 
     torch.testing.assert_close(logits_pad, logits_ref, rtol=1e-5, atol=1e-5)
 
-    # The real dims land where the RoPE half-split expects them, and nothing else
-    # carries signal: that is what makes the zero-padded dot product exact.
     half, padded_half = orig // 2, padded // 2
     assert torch.allclose(q_rot[..., :half], q_ref[..., :half], atol=1e-6)
     assert torch.allclose(
@@ -139,8 +124,7 @@ def test_padded_qk_logits_match_the_unpadded_reference():
     "model",
     [
         "ibm-ai-platform/micro-g3.3-8b-instruct-1b",
-        # head_dim=64, so this one exercises the padded path (issue #597); micro-g3.3
-        # is head_dim=128 and stays unpadded, covering both branches.
+        # head_dim=64 -> padded; micro-g3.3 is 128 -> unpadded. Covers both branches.
         "meta-llama/Llama-3.2-1B-Instruct",
     ],
 )

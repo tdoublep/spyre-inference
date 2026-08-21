@@ -336,12 +336,7 @@ def test_pad_head_dim_full_rotary_pads():
 
 
 def test_pad_head_dim_pads_on_the_transformers_backend():
-    """Regression for #597: this used to return early for the Transformers backend.
-
-    That backend rotates through a stick-aligned pad of its own, but the KV cache is
-    still allocated at ``get_head_size()``, so head_dim itself has to be widened.
-    Shape is stas/tiny-random-llama-2: hidden_size=16 over 4 heads, head_dim=4.
-    """
+    """Regression for #597: this used to return early for the Transformers backend."""
     from spyre_inference.platform import TorchSpyrePlatform
 
     vllm_config, hf, mc = _fake_pad_config(

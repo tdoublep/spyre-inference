@@ -276,11 +276,9 @@ class TorchSpyrePlatform(CpuPlatform):
         """Override hf_config.head_dim to a 128-multiple when the native head_dim
         is not stick-aligned, stashing the original as ``_spyre_orig_head_dim``.
 
-        Applies to the Transformers backend as well. That backend used to pad only the
-        RoPE rotation, which leaves ``head_dim`` itself untouched while the KV cache is
-        still allocated at ``get_head_size()`` — a width the device copy requires to be
-        stick-aligned. Widening head_dim here covers the rotation too, so that backend
-        no longer needs a pad of its own.
+        Applies to the Transformers backend too: padding only the RoPE rotation leaves
+        the KV cache allocated at the native ``get_head_size()``, which the device copy
+        requires to be stick-aligned.
 
         No-op for models whose head_dim is already a multiple of 128 (e.g.
         head_size=128 Granite) and for models without RoPE. The restickify failure
