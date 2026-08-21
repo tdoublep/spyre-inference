@@ -24,7 +24,7 @@ import torch
 
 from spyre_inference.custom_ops.utils import convert
 
-from vllm.config import VllmConfig
+from vllm.config import CompilationMode, VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.config.cache import CacheDType
 from vllm.v1.attention.backend import (
@@ -61,12 +61,6 @@ def _record_function(name: str):
 
     return decorator
 
-
-# Force torch.compile(dynamic=False) on the Spyre attention/reshape kernels
-# regardless of the vLLM compilation config. Used to evaluate the compiled path
-# on Spyre, where CompilationMode.NONE otherwise makes _maybe_compile a no-op.
-# Default: off (unset or "0").
-_FORCE_COMPILE_ATTN = os.environ.get("SPYRE_FORCE_COMPILE_ATTN", "0") == "1"
 
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
@@ -122,13 +116,11 @@ def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtyp
     )
 
 
-def _maybe_compile(fn):
-    """Triggers compilation when SPYRE_FORCE_COMPILE_ATTN=1.
-
-    Used only for the online-softmax attention kernel; the reshape/cache
-    kernel is compiled unconditionally instead (see _reshape_and_cache).
+def _maybe_compile(fn, compile_enabled: bool):
+    """Compile `fn` when enabled. Attention compiles separately from the model's
+    fullgraph capture, which can't hold its per-sequence Python loop.
     """
-    if _FORCE_COMPILE_ATTN:
+    if compile_enabled:
         return torch.compile(fn, dynamic=False)
     return fn
 
@@ -329,6 +321,9 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
     # Device mirror of slot_mapping, which vLLM hands us on the host.
     slot_mapping_device: torch.Tensor | None = None
+
+    # Device mirror of attention_mask_tiles, filled once per step by forward().
+    attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:
@@ -823,6 +818,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
 
+        # `== STOCK`, not `!= NONE`: a bare CompilationConfig (e.g. the unit-test
+        # fixture) leaves mode unset (Python None), which `!= NONE` would wrongly
+        # treat as compiled. The platform resolves compiled runs to STOCK.
+        _mode = get_current_vllm_config().compilation_config.mode
+        self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
+
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
         # per-block bias construction in _online_softmax_attention broadcasts
@@ -868,7 +869,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     self.head_size,
                     has_alibi=self.alibi_slopes is not None,
                     logits_soft_cap=self.logits_soft_cap,
-                )
+                ),
+                self._compile_attn,
             )
         return self._attn_fns[key]
 
@@ -909,6 +911,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.slot_mapping_device = convert(
                 attn_metadata.slot_mapping[:num_actual_tokens], device=_target_device
             )
+        if attn_metadata.attention_mask_tiles_device is None:
+            tiles_cpu = attn_metadata.attention_mask_tiles
+            assert tiles_cpu is not None, (
+                "attention_mask_tiles must be precomputed by the metadata builder"
+            )
+            attn_metadata.attention_mask_tiles_device = [
+                [convert(t, device=_target_device) for t in seq_tiles] for seq_tiles in tiles_cpu
+            ]
 
         # Step 1: Reshape and cache — scatter new tokens into their slots
         self._reshape_and_cache(
@@ -990,12 +1000,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_seqs = attn_metadata.num_seqs
         query_start_loc = attn_metadata.query_start_loc
         seq_lens = attn_metadata.seq_lens
-        mask_tiles_all = attn_metadata.attention_mask_tiles
+        mask_tiles_all = attn_metadata.attention_mask_tiles_device
         active_block_indices_all = attn_metadata.active_block_indices
         aligned_max_query_len = attn_metadata.aligned_max_query_len
         page_index_tables = attn_metadata.page_index_tables
         assert mask_tiles_all is not None, (
-            "attention_mask_tiles must be precomputed by the metadata builder"
+            "attention_mask_tiles_device must be mirrored by forward()"
         )
         assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
 
@@ -1052,10 +1062,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             page_index_table = page_index_tables[seq_idx]
             # mask_tiles_all[seq_idx] is indexed by position within active_bs.
-            mask_tiles = [
-                convert(mask_tiles_all[seq_idx][i], device=_target_device)
-                for i in range(len(active_bs))
-            ]
+            mask_tiles = mask_tiles_all[seq_idx][: len(active_bs)]
 
             # ALiBi bias tiles: slope[h] * (kv_pos - context_len), one per block.
             #
