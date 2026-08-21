@@ -100,13 +100,7 @@ def _pad_input_end(w: torch.Tensor, n_heads: int, orig: int, padded: int) -> tor
 def _pad_fused_qkv(
     w: torch.Tensor, n_heads: int, n_kv_heads: int, orig: int, padded: int
 ) -> torch.Tensor:
-    """Pad a checkpoint that stores q/k/v pre-fused (Phi3's ``qkv_proj``).
-
-    ``QKVParallelLinear`` splits a shard-id-less load at offsets derived from its own
-    (already padded) ``head_size``, so the tensor has to arrive re-fused at the padded
-    layout: split at the original boundaries, pad each projection the way that
-    projection needs, concatenate.
-    """
+    """Pre-fused q/k/v (Phi3): vLLM narrows a shard-id-less load at padded-head_size offsets."""
     q, k, v = w.split([n_heads * orig, n_kv_heads * orig, n_kv_heads * orig])
     return torch.cat(
         [
@@ -118,7 +112,6 @@ def _pad_fused_qkv(
 
 
 def _require_width(name: str, w: torch.Tensor, dim: int, expected: int) -> None:
-    """Reject a tensor this pass cannot reshape, naming it, instead of a bare view error."""
     if w.shape[dim] != expected:
         raise ValueError(
             f"Head padding cannot reshape {name} of shape {tuple(w.shape)}: expected "
@@ -129,12 +122,8 @@ def _require_width(name: str, w: torch.Tensor, dim: int, expected: int) -> None:
 def _pad_weight(
     name: str, w: torch.Tensor, n_heads: int, n_kv_heads: int, orig: int, padded: int
 ) -> torch.Tensor:
-    """Dispatch a single checkpoint tensor to the right padding by its name.
-
-    Matched on the projection's own name component rather than a name suffix: a fused
-    ``qkv_proj.weight`` also ends with ``v_proj.weight``, and padding it as V fed a
-    3x-too-tall tensor through the V reshape.
-    """
+    """Dispatch a checkpoint tensor to its padding by name component; note that
+    ``qkv_proj.weight`` also ends with ``v_proj.weight``."""
     head, _, param = name.rpartition(".")
     proj = head.rpartition(".")[2]
     if param not in ("weight", "bias"):
@@ -181,10 +170,7 @@ def install_padded_head_dim(model_config) -> None:
 
     architectures = getattr(model_config.hf_config, "architectures", None) or []
     model_cls, _ = model_config.registry.resolve_model_cls(architectures, model_config=model_config)
-    # Follow the MRO, not just the resolved class's own module: a thin subclass
-    # (vLLM's Phi3ForCausalLM is LlamaForCausalLM with a different
-    # packed_modules_mapping) declares no attention class of its own, so scanning
-    # only its module found nothing to patch and said so as if it had succeeded.
+    # A thin subclass (vLLM's Phi3ForCausalLM) declares no attention class of its own.
     module_names = {model_cls.__module__} | {
         base.__module__
         for base in model_cls.__mro__
@@ -237,10 +223,8 @@ def install_padded_head_dim(model_config) -> None:
             patched[id(obj)] = f"{obj.__module__.rpartition('.')[2]}.{name}"
     if not patched:
         logger.warning(
-            "Found no attention class to shim head_dim %d -> %d in %s. Attention that "
-            "sizes itself from hidden_size // num_heads rather than config.head_dim "
-            "would be built at the unpadded width; verify_padded_head_dim rejects that "
-            "after load.",
+            "Found no attention class to shim head_dim %d -> %d in %s; attention sizing "
+            "itself from hidden_size // num_heads would build at the unpadded width.",
             orig,
             padded,
             ", ".join(sorted(module_names)),

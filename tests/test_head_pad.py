@@ -150,11 +150,7 @@ def test_shim_skips_the_shared_vllm_attention_layers(monkeypatch):
 
 
 def test_shim_follows_the_mro_into_a_base_class_module(monkeypatch):
-    """vLLM's Phi3ForCausalLM subclasses LlamaForCausalLM and declares no attention.
-
-    Scanning only the resolved class's own module found nothing to patch, so a
-    Phi3-shaped arch was built at the native width while config.head_dim read padded.
-    """
+    """vLLM's Phi3ForCausalLM subclasses LlamaForCausalLM and declares no attention."""
     base_module_name = "spyre_test_fake_base_module"
     base_module = ModuleType(base_module_name)
     attn_cls = type("FakeAttention", (_DerivesOwnHeadDim,), {})
@@ -254,7 +250,6 @@ _HIDDEN, _N_HEADS, _N_KV = 32, 4, 2
 
 
 def _qkv_parts(orig=_ORIG, n_heads=_N_HEADS, n_kv=_N_KV, hidden=_HIDDEN):
-    """Deterministic q/k/v checkpoint tensors at the unpadded head width."""
     sizes = (n_heads * orig, n_kv * orig, n_kv * orig)
     return tuple(torch.arange(n * hidden).float().view(n, hidden) + i for i, n in enumerate(sizes))
 
@@ -293,12 +288,7 @@ def test_pad_v_and_o_end_pad():
 
 @pytest.mark.parametrize("orig", [2, _ORIG, 96])
 def test_pad_fused_qkv_matches_the_per_projection_padding(orig):
-    """A checkpoint-fused qkv (Phi3) must be split, padded per projection, re-fused.
-
-    vLLM narrows a shard-id-less qkv load at offsets derived from the padded
-    head_size, so each padded shard has to sit exactly where a separate q/k/v
-    checkpoint would have put it.
-    """
+    """Each padded shard must sit where a separate q/k/v checkpoint would have put it."""
     q, k, v = _qkv_parts(orig)
 
     out = _pad("qkv_proj.weight", torch.cat([q, k, v]), orig)
@@ -313,8 +303,7 @@ def test_pad_fused_qkv_matches_the_per_projection_padding(orig):
 
 
 def test_pad_fused_qkv_is_not_mistaken_for_v():
-    """`qkv_proj.weight` also ends with `v_proj.weight`; that suffix match sized the
-    fused tensor as V and died on its reshape (issue #596)."""
+    """`qkv_proj.weight` also ends with `v_proj.weight` (issue #596)."""
     q, k, v = _qkv_parts()
     fused = torch.cat([q, k, v])
 
@@ -340,7 +329,6 @@ def test_pad_leaves_non_head_dim_tensors_untouched(name):
 
 
 def _qkv_layer(n_kv):
-    """A real vLLM QKV layer sized at the padded head_dim (TP off, no device)."""
     from vllm.model_executor.layers.linear import QKVParallelLinear
 
     return QKVParallelLinear(
@@ -358,12 +346,7 @@ def _qkv_layer(n_kv):
 
 @pytest.mark.parametrize("n_kv", [_N_KV, _N_HEADS])
 def test_padded_fused_qkv_loads_like_separate_projections(tp_group, n_kv):
-    """Drive vLLM's own weight loader: a fused (shard-id-less) load must produce the
-    same parameter as loading q, k and v separately.
-
-    vLLM narrows the fused tensor at offsets derived from the layer's padded
-    head_size, which is the contract the fused padding has to satisfy.
-    """
+    """A fused load through vLLM's own loader must match loading q, k and v separately."""
     torch.manual_seed(0)
     q, k, v = (torch.randn(n * _ORIG, _HIDDEN, dtype=torch.float16) for n in (_N_HEADS, n_kv, n_kv))
 
@@ -378,5 +361,4 @@ def test_padded_fused_qkv_loads_like_separate_projections(tp_group, n_kv):
         split_layer.weight.weight_loader(split_layer.weight, pad(f"{shard}_proj.weight", w), shard)
 
     assert torch.equal(fused_layer.weight.data, split_layer.weight.data)
-    # And the padded region really is the zeros the dot product ignores.
     assert fused_layer.weight.data.view(-1, _PADDED, _HIDDEN)[:, _ORIG:].eq(0).any()
