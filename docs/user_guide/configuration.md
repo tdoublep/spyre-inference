@@ -9,8 +9,8 @@ export VLLM_PLUGINS=spyre_inference,spyre_inference_ops,spyre_inference_hf_adapt
 ```
 
 `spyre_inference` activates the platform, `spyre_inference_ops` registers the OOT custom
-ops, and `spyre_inference_hf_adaptor` swaps in the hf-adapters Transformers backend
-(needed for `model_impl="transformers"`).
+ops, and `spyre_inference_hf_adaptor` applies the Spyre RoPE patch to vLLM's
+Transformers backend (needed for `model_impl="transformers"`).
 
 ## Usage
 
@@ -55,10 +55,9 @@ The plugin pulls dependencies from specific Git repositories:
 [tool.uv.sources]
 vllm = { git = "https://github.com/vllm-project/vllm", rev = "..." }
 torch-spyre = { git = "https://github.com/torch-spyre/torch-spyre", rev = "..." }
-hf-adapters-spyre = { git = "https://github.com/torch-spyre/hf-adapters.git", rev = "..." }
 ```
 
-This ensures that torch-spyre, hf-adapters, and vllm are compiled/installed from source, instead of pulling pre-compiled wheels from PyPI.
+This ensures that torch-spyre and vllm are compiled/installed from source, instead of pulling pre-compiled wheels from PyPI.
 
 ### PyTorch CPU Index
 

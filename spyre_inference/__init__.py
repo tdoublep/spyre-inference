@@ -42,7 +42,7 @@ def register_ops():
 
 def register_hf_adapters():
     # Override the Transformers backend model class so that
-    # ``model_impl="transformers"`` uses hf-adapters'
+    # ``model_impl="transformers"`` gets the Spyre RoPE patch.
     try:
         from vllm.model_executor.models import ModelRegistry
 
@@ -51,7 +51,7 @@ def register_hf_adapters():
             "spyre_inference.hf_adapters:HfAdaptersForCausalLM",
         )
     except Exception:
-        logger.warning("Failed to register hf-adapters Transformers backend", exc_info=True)
+        logger.warning("Failed to register the Spyre Transformers backend", exc_info=True)
 
 
 def _init_logging():

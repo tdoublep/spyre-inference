@@ -26,7 +26,7 @@ The plugin registers via three entry points:
 |---|---|---|
 | `vllm.platform_plugins` | `spyre_inference:register` | Registers `TorchSpyrePlatform` — sets dtype, worker class, attention backend, and distributed backend |
 | `vllm.general_plugins` | `spyre_inference:register_ops` | Calls `register_all()` — importing the ops package triggers every `@register_oot()` layer swap, and `register_all()` additionally registers the opaque `spyre_rope_rot` and `spyre_convert` custom ops |
-| `vllm.general_plugins` | `spyre_inference:register_hf_adapters` | Overrides vLLM's `TransformersForCausalLM` with `HfAdaptersForCausalLM` so `model_impl="transformers"` uses hf-adapters (matmul-based RoPE) on Spyre |
+| `vllm.general_plugins` | `spyre_inference:register_hf_adapters` | Overrides vLLM's `TransformersForCausalLM` with `HfAdaptersForCausalLM` so `model_impl="transformers"` gets the matmul-based Spyre RoPE |
 
 `vLLM` is built from source with `VLLM_TARGET_DEVICE=empty` (no device-specific C
 kernels), so the platform overrides a few CPU-backend assumptions: `import_kernels()` is
@@ -184,16 +184,25 @@ operations that Spyre doesn't yet support natively (the embedding gather, the ro
 frequency-cache `index_select`, q/k/v slicing, the per-sequence attention varlen loop,
 logits indexing).
 
-## HF-adapters Transformers backend
+## Transformers backend
 
 When `model_impl="transformers"`, the `register_hf_adapters` general plugin swaps vLLM's
 `TransformersForCausalLM` for `HfAdaptersForCausalLM` (`spyre_inference/hf_adapters.py`).
 vLLM's stock Transformers backend still handles model creation, weight loading, attention
 routing, the KV cache, and scheduling; the Spyre OOT layers above apply automatically at
-instantiation. The adapter's main job is to replace HF's `RotaryEmbedding` with a
-matmul-based RoPE (`apply_rope_matmul`), padding Q/K into a stick-aligned dimension for
-the rotation when `head_dim/2` is not a multiple of the Spyre block size and contracting
-back afterward.
+instantiation.
+
+The subclass exists to patch RoPE. The backend replaces the layers it has fusers or
+explicit replacements for (linears, convs, GLU MLPs, fused QKV, RMSNorm, input
+embeddings, LM head) and routes attention through vLLM's `Attention`, but layers it has
+no replacement for keep running HF's own code — RoPE, `nn.LayerNorm`, non-gated MLP
+activations. RoPE is the only one of those the Spyre compiler cannot lower: HF applies
+the rotation with `rotate_half`, a last-dim slice at `head_dim/2` plus a `cat`, whose
+sub-stick stride fails to lower. `_patch_rope` swaps both HF call sites (`rotary_emb`
+and the module-level `apply_rotary_pos_emb`) for an equivalent 2x2 rotation-matrix
+formulation, and where `head_dim/2` is not stick-aligned it widens Q/K into a
+stick-aligned dimension for the rotation and contracts back afterwards, leaving
+attention and the KV cache at the native `head_dim`.
 
 ## Distributed (TP)
 
