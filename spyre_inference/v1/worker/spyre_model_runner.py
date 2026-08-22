@@ -77,6 +77,8 @@ from spyre_inference.custom_ops.head_pad import (
     verify_padded_head_dim,
 )
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.attention import attn_layer
+from spyre_inference.v1.attention.backends.spyre_attn import KV_WRITE_IN_GRAPH
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
     configure_pooling_for_spyre,
@@ -467,6 +469,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
         logger.info("Model loaded for Spyre in %.3fs.", time.time() - t0)
+
+        num_split = attn_layer.install(cast(nn.Module, self.model), KV_WRITE_IN_GRAPH)
+        if num_split:
+            logger.info(
+                "Scattering the KV cache inside the outer graph for %d attention layers.",
+                num_split,
+            )
 
         # Compile for Spyre (no-op if enforce_eager=True)
         self._compile_for_spyre()
@@ -873,6 +882,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.compilation_config.static_forward_context,
             self.kv_caches,
         )
+
+        # Must exist before tracing; see SpyreAttentionImpl.kv_slot_views.
+        static_ctx = self.compilation_config.static_forward_context
+        for layer_name, page_cache in kv_caches.items():
+            layer = static_ctx.get(layer_name)
+            if layer is not None and hasattr(layer.impl, "kv_slot_views"):
+                layer.impl.kv_slot_views(page_cache)
+
         return kv_caches
 
     # --- Stubs copied from CPUModelRunner ---
