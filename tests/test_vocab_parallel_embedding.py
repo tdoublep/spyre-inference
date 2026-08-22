@@ -206,3 +206,45 @@ def test_single_token_embedding_on_device() -> None:
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.vocab_parallel_embedding
+@pytest.mark.parametrize("vocab_size,embedding_dim", [(32000, 128), (1024, 64)])
+def test_gather_layout_applied_on_move(tp_group, vocab_size, embedding_dim):
+    """Moving to Spyre places the table rows-outermost and the gather still matches
+    F.embedding, whose result is what the layout must preserve."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    torch.manual_seed(3)
+    layer = VocabParallelEmbedding(vocab_size, embedding_dim, params_dtype=torch.float16)
+    layer.weight.data.normal_(std=0.02)
+
+    input_ids = torch.randint(0, vocab_size, (16,), dtype=torch.int64)
+    expected = F.embedding(input_ids, layer.weight)
+
+    layer = layer.to("spyre")
+
+    from torch_spyre._C import get_elem_in_stick, get_spyre_tensor_layout
+
+    eps = get_elem_in_stick(layer.weight.data.dtype)
+    device_size = list(get_spyre_tensor_layout(layer.weight.data).device_size)
+    assert device_size == [vocab_size, embedding_dim // eps, eps], (
+        "vocab dim must be outermost in the device layout"
+    )
+    assert layer.weight.data.shape == (vocab_size, embedding_dim)
+    actual = layer(input_ids.to("spyre"))
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.vocab_parallel_embedding
+def test_lm_head_weight_not_relaid_out(tp_group):
+    """The LM head subclasses VocabParallelEmbedding but uses its weight as a matmul
+    operand, so it must not pick up the gather layout."""
+    from spyre_inference.custom_ops.parallel_lm_head import SpyreParallelLMHead
+    from spyre_inference.custom_ops.vocab_parallel_embedding import (
+        SpyreVocabParallelEmbedding,
+    )
+
+    assert not issubclass(SpyreParallelLMHead, SpyreVocabParallelEmbedding)
