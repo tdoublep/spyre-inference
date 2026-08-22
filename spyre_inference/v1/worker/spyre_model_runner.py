@@ -77,6 +77,9 @@ from spyre_inference.custom_ops.head_pad import (
 from spyre_inference.custom_ops.rotary_embedding import bound_rope_position_cache
 from spyre_inference.v1.attention.backends.spyre_attn import install_inline_kv_scatter
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.custom_ops.vocab_parallel_embedding import (
+    place_embedding_weights_for_gather,
+)
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
     configure_pooling_for_spyre,
@@ -477,6 +480,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         # Move layer weights to Spyre device.
         self.model.to(device=self._spyre_device)
+
+        # The vocab table is only ever gathered from, so give it a layout whose
+        # gather reads the wanted rows instead of the whole table.
+        num_placed = place_embedding_weights_for_gather(self.model, self._spyre_device)
+        if num_placed:
+            logger.info("Placed %d embedding table(s) under the gather layout.", num_placed)
 
         # CLS/LAST on Spyre via v1.pool; MEAN stays CPU.
         self._pooling_on_spyre = False

@@ -32,6 +32,51 @@ from .utils import convert
 logger = init_logger(__name__)
 
 
+def row_gather_layout(num_rows: int, row_width: int, dtype: torch.dtype):
+    """Row-axis-outermost layout, so a row gather reads only the rows it wants.
+
+    Under the default layout the indirect load degenerates into a pass over the
+    whole table: cost is linear in table size and flat in index count (402MB
+    table, one row 8.6ms; sixty-four rows 8.6ms). Row axis outermost: ~0.3ms.
+    """
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+
+    eps = get_elem_in_stick(dtype)
+    sticks = (row_width + eps - 1) // eps
+    return SpyreTensorLayout(
+        device_size=[num_rows, sticks, eps],
+        stride_map=[sticks * eps, eps, 1],
+        device_dtype=get_device_dtype(dtype),
+    )
+
+
+def place_embedding_weights_for_gather(model, device: torch.device) -> int:
+    """Re-place embedding tables on `device` under a gather-friendly layout.
+
+    Call after the model has been moved to the device. With tie_word_embeddings
+    the table is also lm_head's `weight`, but SpyreParallelLMHead reads its own
+    independent `padded_weight_t`, so only the gather sees this layout.
+    """
+    from torch_spyre._C import get_elem_in_stick
+
+    num_placed = 0
+    for module in model.modules():
+        if not isinstance(module, VocabParallelEmbedding):
+            continue
+        weight = module.weight.data
+        if weight.dim() != 2 or weight.device.type != device.type:
+            continue
+        num_rows, row_width = weight.shape
+        if row_width % get_elem_in_stick(weight.dtype) != 0:
+            # A partial trailing stick needs padding semantics this layout does
+            # not express; leave such a table on the default layout.
+            continue
+        layout = row_gather_layout(num_rows, row_width, weight.dtype)
+        module.weight.data = weight.to("cpu").to(device, device_layout=layout)
+        num_placed += 1
+    return num_placed
+
+
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
 class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
     """Out-of-tree (OOT) VocabParallelEmbedding implementation for IBM's Spyre device."""
