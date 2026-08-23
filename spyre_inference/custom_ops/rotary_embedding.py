@@ -23,6 +23,11 @@ The cache must be materialized on-device *before* compile: building it inside th
 forward (host chunk/stack/view then device transfer) segfaults libsenlib during warmup.
 ``_apply`` primes it when the module moves to Spyre, ahead of ``torch.compile``.
 
+The device cache is 2D and stickified with the position axis outermost. Spyre requires
+the indexed dimension of a gather to sit at device position 0; under the default layout
+a ``[max_pos, 2, 2, inner]`` cache puts it second-to-last, and the gather degenerates
+into a pass over the whole cache instead of the rows it indexes.
+
 Only neox-style full rotary is supported; other configs raise ``NotImplementedError``.
 """
 
@@ -39,6 +44,8 @@ from vllm.model_executor.layers.rotary_embedding.llama3_rope import (
 from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
     YaRNScalingRotaryEmbedding,
 )
+
+from .utils import row_gather_layout
 
 logger = init_logger(__name__)
 
@@ -88,7 +95,15 @@ class _SpyreRotaryMixin:
         # Skip super()._apply: cos_sin_cache is intentionally CPU-pinned and this module
         # holds no other movable tensor, so there is nothing to relocate. We instead prime
         # the device rotation cache here (before torch.compile traces forward_oot).
-        self._device_rotation_cache = fn(self._get_device_rotation_cache())
+        cache = self._get_device_rotation_cache()
+        # fn cannot express a device_layout, so use it on a single row to learn the
+        # destination, then place the cache in the gather layout ourselves.
+        probe = fn(cache[:1])
+        num_rows, row_width = cache.shape
+        self._device_rotation_cache = cache.to(probe.dtype).to(  # ty: ignore[no-matching-overload]
+            probe.device,
+            device_layout=row_gather_layout(num_rows, row_width, probe.dtype),
+        )
         return self
 
     def _get_rotation_cache(self) -> torch.Tensor:
@@ -112,11 +127,11 @@ class _SpyreRotaryMixin:
         return self._rotation_cache
 
     def _get_device_rotation_cache(self) -> torch.Tensor:
-        """Device-resident copy of the 4D rotation cache ``[max_pos, 2, 2, padded]``,
-        built once from the CPU cache so the per-pass gather runs on-device via
+        """Device-resident rotation cache, flattened to 2D ``[max_pos, 4 * padded]`` so
+        it can be stickified with the position axis outermost, and gathered on-device via
         ``index_select`` (single-row gather has a kernel since torch-spyre#3418)."""
         if self._device_rotation_cache is None:
-            self._device_rotation_cache = self._get_rotation_cache().contiguous()
+            self._device_rotation_cache = self._get_rotation_cache().flatten(1).contiguous()
         return self._device_rotation_cache
 
     def forward_oot(
@@ -127,7 +142,7 @@ class _SpyreRotaryMixin:
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # Cache was primed in _apply before compile, so only the index_select is traced.
         cache = self._get_device_rotation_cache()
-        rot = cache.index_select(0, positions.flatten())
+        rot = cache.index_select(0, positions.flatten()).view(-1, 2, 2, self._padded_inner)
         out_query = _rotate_neox_2x2(
             query,  # ty: ignore[invalid-argument-type]
             rot,

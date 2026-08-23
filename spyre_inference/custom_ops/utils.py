@@ -117,3 +117,20 @@ def register():
         dispatch_key="CompositeExplicitAutograd",
     )
     logger.debug_once("Registered custom op: spyre_convert")
+
+
+def row_gather_layout(num_rows: int, row_width: int, dtype: torch.dtype):
+    """Row-axis-outermost device layout for a tensor that is only gathered from.
+
+    Spyre requires a gather's indexed dimension at device position 0. The default
+    layout places it inwards, which makes the gather read the whole source rather
+    than the rows it indexes. ``row_width`` must be a whole number of sticks.
+    """
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+
+    eps = get_elem_in_stick(dtype)
+    return SpyreTensorLayout(
+        device_size=[num_rows, row_width // eps, eps],
+        stride_map=[row_width, eps, 1],
+        device_dtype=get_device_dtype(dtype),
+    )
