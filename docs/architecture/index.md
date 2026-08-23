@@ -111,11 +111,23 @@ into, so a block compiles as prologue / attention / epilogue. `Attention.forward
 Python, so the backend can replace its body (see `_patched_attention_forward`) and put the
 scatter, page loop and softmax in the block's graph instead.
 
-It is off by default because it measured slower: granite-3.3-8b, 64 in / 64 out, batch 1,
-157.1 ms/token traced against 154.5 ms/token through the opaque op. The barrier described
-below costs a launch and a relayout copy per layer, which is more than the fusion saves.
-Removing that barrier — either by teaching the backend scheduler the fused batchmatmul or by
-making the head-to-hidden relayout expressible in a graph — is what would make it pay.
+It pays when attention hands its result to `o_proj` with the head axis still outermost:
+granite-3.3-8b, 64 in / 64 out, batch 1, 148.1 ms/token against 154.8 ms/token through the
+opaque op, identical tokens. `SPYRE_ATTN_HEADS_OUTER=0` restores the boundary op instead,
+which measured 157.1 ms/token — slower than not fusing at all.
+
+What the backend rejects is not the fusion of attention's epilogue into `o_proj`'s matmul (a
+pointwise epilogue fuses fine) but **collapsing a multi-axis value into the matmul's reduction
+operand**: folding `[num_heads, tokens, head_size]` down to `[tokens, num_heads * head_size]`
+mints a loop variable per collapsed axis, the matmul ends up with more than one reduction dim,
+and a bmm contracts exactly one (`out_reuse_dim.size() == 1` in `L3DlOpsScheduler`). Any
+collapse of two or more axes fails; an already-2-D operand compiles. So the fix is a shape
+choice, not a barrier: keep the head axis outermost and let `o_proj` contract each head against
+its own slice of `Wᵀ`, summing over heads (`spyre_linear_t`). `Wᵀ` is stored `[in, out]`
+contiguous, so those slices are already its rows and the split costs nothing.
+
+It stays off by default because the traced path is still wrong for batches of more than one
+sequence — see below.
 
 Four properties of the lowering constrain it:
 
@@ -126,13 +138,18 @@ Four properties of the lowering constrain it:
 - Each page's slot indices arrive as their **own** 1D tensor (`slot_rows`, cached per page
   for the process). Slicing an index row out of a 2D table inside the graph compiles but
   returns corrupted rows.
-- An opaque op (`vllm::spyre_attn_out`) separates attention from `o_proj`. Handed the value,
-  Inductor folds attention's epilogue into `o_proj`'s matmul and the backend scheduler
-  rejects the program (`out_reuse_dim.size() == 1` in `L3DlOpsScheduler`). Every in-graph
+- Layers whose result does not reach a Spyre `o_proj` unreshaped keep the opaque op
+  (`vllm::spyre_attn_out`), which folds the head axis on the host. Every in-graph
   materialization is undone by functionalization, which rewrites a store-then-read of one
-  buffer back into the value, so the boundary has to be an op Inductor cannot see through.
+  buffer back into the value, so that boundary has to be an op Inductor cannot see through.
   It returns a **clone**: a custom op must not return an alias of its input, which Inductor
   miscompiles.
+- Multi-sequence batches are **not correct yet**. The per-sequence stores lower to
+  `slice_scatter`, and with two or more sequences part of the output buffer is uncovered;
+  from `torch.empty` that base is a NaN fill the backend cannot store, so the program used
+  not to compile at all. `torch.zeros` compiles, but the tokens then come out shifted by one
+  position, which is a bug in the traced body itself and not in the o_proj lowering (the two
+  lowerings agree to 2e-6 in exact arithmetic, assembly included).
 - That same op folds the head axis into hidden. Under Spyre's stick layouts a flat hidden
   index splits into two `Mod` expressions the coordinate mapper rejects (`variable d2
   (range 4096) appears in multiple Mod expressions`); eagerly it is just a retile, which is

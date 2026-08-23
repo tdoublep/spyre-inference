@@ -77,6 +77,10 @@ _FORCE_COMPILE_ATTN = os.environ.get("SPYRE_FORCE_COMPILE_ATTN", "0") == "1"
 # scatter before the gathers (it does order them today: both address one tensor).
 _FUSE_FRESH_TILES = os.environ.get("SPYRE_FUSE_ATTN_FRESH_TILES", "0") == "1"
 
+# Hand attention's result to o_proj with the head axis still outermost, so neither
+# side has to fold it into the hidden axis. Set to 0 to restore the boundary op.
+_OPROJ_HEADS_OUTER = os.environ.get("SPYRE_ATTN_HEADS_OUTER", "1") == "1"
+
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
 # Because torch.compile treats shapes as static constants, every distinct kv_len
@@ -247,9 +251,7 @@ def _attn_out_barrier_impl(x: torch.Tensor) -> torch.Tensor:
 
 
 def _attn_out_barrier_fake(x: torch.Tensor) -> torch.Tensor:
-    return torch.empty(
-        x.shape[0], x.shape[1] * x.shape[2], dtype=x.dtype, device=x.device
-    )
+    return torch.empty(x.shape[0], x.shape[1] * x.shape[2], dtype=x.dtype, device=x.device)
 
 
 @lru_cache(maxsize=1)
@@ -341,7 +343,8 @@ def _traced_attention(impl, step, kernels, query, key, value, k_slots, v_slots):
     """Scatter this step's K/V and attend over the cache, in the caller's graph.
 
     query/key/value are [num_tokens, heads, head_size] views of this layer's
-    projection output; the result is [num_tokens, num_heads * head_size].
+    projection output. The result is [num_heads, num_tokens, head_size] when o_proj
+    takes the head axis outermost, and [num_tokens, num_heads * head_size] otherwise.
 
     Pages cover the context only. This step's own K/V is attended to from the
     tensors that hold it, so nothing here reads a slot this graph is writing —
@@ -358,9 +361,19 @@ def _traced_attention(impl, step, kernels, query, key, value, k_slots, v_slots):
     head_size = impl.head_size
     padded_query_len = step.aligned_max_query_len
 
-    out = torch.empty(
-        query.shape[0], impl.num_heads, head_size, dtype=query.dtype, device=query.device
+    heads_outer = impl.oproj_heads_outer
+    shape = (
+        (impl.num_heads, query.shape[0], head_size)
+        if heads_outer
+        else (query.shape[0], impl.num_heads, head_size)
     )
+    # zeros, not empty: the per-sequence stores lower to slice_scatter, and with more
+    # than one sequence they leave part of the buffer uncovered. Inductor models the
+    # uncovered part of an uninitialized buffer as a NaN fill, and the backend cannot
+    # store a bare constant ("store value of unexpected type Constant"), so a batch of
+    # two or more sequences fails to compile. A zero fill lowers, and where one sequence
+    # covers every row the base is dead and drops out.
+    out = torch.zeros(*shape, dtype=query.dtype, device=query.device)
     for seq_idx in range(step.num_seqs):
         q_start = step.q_starts[seq_idx]
         q_end = step.q_ends[seq_idx]
@@ -408,14 +421,18 @@ def _traced_attention(impl, step, kernels, query, key, value, k_slots, v_slots):
             fresh_k=fresh_k,
             fresh_v=fresh_v,
         )
-        if query_len < padded_query_len:
-            # A prefix view copies its whole extent and overruns the destination
-            # (torch-spyre#3826), so copy it first.
+        # A prefix view copies its whole extent and overruns the destination
+        # (torch-spyre#3826), so copy it first.
+        if heads_outer:
+            out[:, q_start:q_end] = (
+                result[:, :query_len].clone() if query_len < padded_query_len else result
+            )
+        elif query_len < padded_query_len:
             out[q_start:q_end] = result[:query_len].clone()
         else:
             out[q_start:q_end] = result
 
-    return _attn_out_barrier(out)
+    return out if heads_outer else _attn_out_barrier(out)
 
 
 def _layer_is_fusable(layer) -> bool:
@@ -504,8 +521,9 @@ def _patched_attention_forward(orig_forward):
         if step is not None and not args and not kwargs:
             num_heads = self.num_heads
             head_size = self.head_size
-            # Already [num_tokens, num_heads * head_size]: the barrier folds the
-            # head axis in, since the graph cannot express that relayout.
+            # Returns what this layer's o_proj consumes: [num_heads, num_tokens,
+            # head_size] where o_proj contracts per head, else [num_tokens,
+            # num_heads * head_size] with the head axis folded by the boundary op.
             return _traced_attention(
                 self.impl,
                 step,
@@ -535,7 +553,35 @@ def _patched_attention_forward(orig_forward):
     return forward
 
 
-def install_inline_kv_scatter(static_forward_context, kv_caches) -> int:
+def _oproj_heads_outer_layers(model) -> set[int]:
+    """`id()` of every Attention whose result may reach o_proj heads-outer.
+
+    The consumer has to be the sibling ``o_proj`` running the Spyre transposed path,
+    whose stored `Wᵀ` is `[num_heads * head_size, out]` — the per-head slices the bmm
+    needs are then already its rows. This relies on the model handing attention's
+    result straight to ``o_proj``, which is the vLLM idiom; anything that reshapes in
+    between would need the head axis folded and must keep the boundary op.
+    """
+    from spyre_inference.custom_ops.linear import SpyreUnquantizedLinearMethod
+
+    allowed: set[int] = set()
+    if model is None:
+        return allowed
+    for mod in model.modules():
+        o_proj = getattr(mod, "o_proj", None)
+        if o_proj is None or not isinstance(
+            getattr(o_proj, "quant_method", None), SpyreUnquantizedLinearMethod
+        ):
+            continue
+        for child in mod.children():
+            if isinstance(child, Attention) and getattr(child, "impl", None) is not None:
+                impl = child.impl
+                if o_proj.weight.shape[0] == impl.num_heads * impl.head_size:
+                    allowed.add(id(child))
+    return allowed
+
+
+def install_inline_kv_scatter(static_forward_context, kv_caches, model=None) -> int:
     """Move the KV scatter into the graph that produces K/V, for layers we can.
 
     Attaches the flattened slot-major views of each layer's pages, then wraps
@@ -562,6 +608,11 @@ def install_inline_kv_scatter(static_forward_context, kv_caches) -> int:
         if _layer_is_fusable(layer):
             _fusable_layers[layer_name] = layer
 
+    if _OPROJ_HEADS_OUTER:
+        allowed = _oproj_heads_outer_layers(model)
+        for layer in _fusable_layers.values():
+            layer.impl.oproj_heads_outer = id(layer) in allowed
+
     if _wired_layers and not _inline_scatter_installed:
         Attention.forward = _patched_attention_forward(  # ty: ignore[invalid-assignment]
             Attention.forward
@@ -586,6 +637,11 @@ def wired_kv_scatter_layers() -> dict[str, Attention]:
 def fusable_attention_layers() -> dict[str, Attention]:
     """Layers the traced attention path can serve."""
     return _fusable_layers
+
+
+def heads_outer_attention_layers() -> list[str]:
+    """Layers handing their result to o_proj with the head axis outermost."""
+    return [n for n, layer in _fusable_layers.items() if layer.impl.oproj_heads_outer]
 
 
 def step_kernels(impl, step) -> tuple:
@@ -650,6 +706,7 @@ def _create_compilable_page_attn(
     logits_soft_cap: float = 0.0,
     fused_store: bool = False,
     num_fresh: int = 0,
+    heads_outer: bool = False,
 ):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
@@ -701,8 +758,10 @@ def _create_compilable_page_attn(
                 sequence owns in full ([padded_query_len, num_heads, head_size]).
 
         Returns [padded_query_len, num_heads, head_size], or ``out`` when
-        fused_store scattered the result in place.
+        fused_store scattered the result in place. With ``heads_outer``, returns
+        [num_heads, padded_query_len, head_size] instead.
         """
+        assert not (heads_outer and fused_store), "heads_outer has no fused_store form"
         tile_max = None
         tile_sum = None
         tile_output = None
@@ -758,6 +817,12 @@ def _create_compilable_page_attn(
 
         assert tile_output is not None and tile_sum is not None
         attn = tile_output / tile_sum
+        if heads_outer:
+            # Stop here: [num_heads, padded_query_len, head_size]. o_proj contracts
+            # each head against its own slice of Wᵀ, so the head axis never has to
+            # move. A free view — tile_output is [num_kv_heads, num_queries_per_kv,
+            # padded_query_len, head_size], and the first two multiply to num_heads.
+            return attn.reshape(num_heads, padded_query_len, head_size)
         attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
         attn = attn.reshape(padded_query_len, num_heads, head_size)
         if fused_store:
@@ -1385,7 +1450,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Same loops for the traced path, left uncompiled: they are traced into
         # the block's graph, and a nested torch.compile there buys nothing.
-        self._traced_attn_fns: dict[tuple[int, int], object] = {}
+        self._traced_attn_fns: dict[tuple[int, int, int], object] = {}
+
+        # Set at wiring time, once the consuming o_proj is known to accept the head
+        # axis outermost (see ``install_inline_kv_scatter``).
+        self.oproj_heads_outer = False
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
@@ -1420,6 +1489,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 self.head_size,
                 logits_soft_cap=self.logits_soft_cap,
                 num_fresh=num_fresh,
+                heads_outer=self.oproj_heads_outer,
             )
             self._traced_attn_fns[key] = fn
         return fn
@@ -1451,9 +1521,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Only the first layer of a step pays for the device mirror.
         if attn_metadata.slot_row_tables is None:
-            attn_metadata.slot_row_tables = build_slot_row_tables(
-                attn_metadata, _target_device
-            )
+            attn_metadata.slot_row_tables = build_slot_row_tables(attn_metadata, _target_device)
         if attn_metadata.slot_mapping_device is None:
             attn_metadata.slot_mapping_device = convert(
                 attn_metadata.slot_mapping[:num_actual_tokens], device=_target_device

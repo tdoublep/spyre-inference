@@ -530,12 +530,12 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _fuse_attn_graph(self) -> bool:
         """Whether attention should be traced into the block graph.
 
-        Off by default: it is correct but slower. granite-3.3-8b, 64 in / 64 out,
-        batch 1, STOCK_TORCH_COMPILE measured 157.1 ms/token traced against
-        154.5 ms/token through the opaque op. The boundary op the backend forces
-        between attention and o_proj costs a launch and a relayout copy per layer,
-        which is more than folding attention into the block graph saves. Set
-        SPYRE_FUSE_ATTN=1 to trace it.
+        Faster than the opaque op now that o_proj takes the head axis outermost:
+        granite-3.3-8b, 64 in / 64 out, batch 1, STOCK_TORCH_COMPILE measured
+        148.1 ms/token traced against 154.8 ms/token, identical tokens. Still off by
+        default because the traced body is wrong for batches of more than one
+        sequence (tokens come out shifted by one position). Set SPYRE_FUSE_ATTN=1 to
+        trace it; SPYRE_ATTN_HEADS_OUTER=0 restores the boundary op, at 157.1 ms/token.
 
         Only under compilation either way: traced eagerly, the KV scatter would be
         an eager index_copy_, which falls back to CPU.
@@ -840,18 +840,25 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.kv_caches,
         )
 
-        wired = install_inline_kv_scatter(self.compilation_config.static_forward_context, kv_caches)
+        wired = install_inline_kv_scatter(
+            self.compilation_config.static_forward_context, kv_caches, self.model
+        )
         if wired:
             from spyre_inference.v1.attention.backends.spyre_attn import (
                 fusable_attention_layers,
+                heads_outer_attention_layers,
             )
 
-            fusable = len(fusable_attention_layers()) if self._fuse_attn_graph() else 0
+            traced = self._fuse_attn_graph()
+            fusable = len(fusable_attention_layers()) if traced else 0
+            heads_outer = len(heads_outer_attention_layers()) if traced else 0
             logger.info(
                 "Wired %d attention layers for the in-graph KV scatter; %d of them "
-                "run attention inside the block's graph.",
+                "run attention inside the block's graph, %d of those handing o_proj "
+                "the head axis outermost.",
                 wired,
                 fusable,
+                heads_outer,
             )
         return kv_caches
 

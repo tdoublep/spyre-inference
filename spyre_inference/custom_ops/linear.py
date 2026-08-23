@@ -42,8 +42,19 @@ def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor |
 
     `weight_t` is the physically-transposed weight of shape `[in, out]`, so the
     matmul is a plain `x @ A` (the Spyre-fast layout), not `F.linear`'s `x @ Aᵀ`.
+
+    A `[num_heads, tokens, head_size]` input is attention's own output, handed over
+    with the head axis still outermost (see `_traced_attention`). Folding it into
+    `[tokens, num_heads * head_size]` first would make the matmul contract more than
+    one dim, which the backend scheduler rejects; contracting each head against its
+    own slice of `Wᵀ` and summing is the same sum in a different order. The `view` is
+    free — `Wᵀ` is `[in, out]` contiguous, so its head slices are already rows.
     """
-    out = torch.matmul(x, weight_t)
+    if x.ndim == 3 and x.shape[0] * x.shape[2] == weight_t.shape[0]:
+        num_heads, _, head_size = x.shape
+        out = torch.bmm(x, weight_t.view(num_heads, head_size, -1)).sum(dim=0)
+    else:
+        out = torch.matmul(x, weight_t)
     if bias is not None:
         out = out + bias
     return out
