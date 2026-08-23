@@ -530,10 +530,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _fuse_attn_graph(self) -> bool:
         """Whether attention should be traced into the block graph.
 
-        Only under compilation: traced eagerly, the KV scatter would be an eager
-        index_copy_, which falls back to CPU.
+        Off by default: it is correct but slower. granite-3.3-8b, 64 in / 64 out,
+        batch 1, STOCK_TORCH_COMPILE measured 157.1 ms/token traced against
+        154.5 ms/token through the opaque op. The boundary op the backend forces
+        between attention and o_proj costs a launch and a relayout copy per layer,
+        which is more than folding attention into the block graph saves. Set
+        SPYRE_FUSE_ATTN=1 to trace it.
+
+        Only under compilation either way: traced eagerly, the KV scatter would be
+        an eager index_copy_, which falls back to CPU.
         """
-        if os.environ.get("SPYRE_FUSE_ATTN", "1") == "0":
+        if os.environ.get("SPYRE_FUSE_ATTN", "0") != "1":
             return False
         if self.vllm_config.model_config.enforce_eager:
             return False

@@ -105,13 +105,19 @@ one block however deep the model is, and a new shape (a fresh `KV_LENGTH_ALIGNME
 costs one block recompile rather than a whole-model one. Heterogeneous stacks specialize
 per variant — Gemma 3 alternates sliding-window and full attention, giving two artifacts.
 
-Attention is part of that graph rather than a hole in it. vLLM routes attention through
-`torch.ops.vllm.unified_attention_with_output`, which Dynamo cannot trace into, so a block
-would otherwise compile as prologue / attention / epilogue — three launches per layer, with
-the query padding, permutes and output copy around the kernel as eager dispatches on top.
-`Attention.forward` is traced Python, so the backend replaces its body (see
-`_patched_attention_forward`) and the scatter, page loop and softmax land in the block's
-graph. Two properties of the lowering make it possible:
+Attention is a hole in that graph by default, and `SPYRE_FUSE_ATTN=1` fills it. vLLM routes
+attention through `torch.ops.vllm.unified_attention_with_output`, which Dynamo cannot trace
+into, so a block compiles as prologue / attention / epilogue. `Attention.forward` is traced
+Python, so the backend can replace its body (see `_patched_attention_forward`) and put the
+scatter, page loop and softmax in the block's graph instead.
+
+It is off by default because it measured slower: granite-3.3-8b, 64 in / 64 out, batch 1,
+157.1 ms/token traced against 154.5 ms/token through the opaque op. The barrier described
+below costs a launch and a relayout copy per layer, which is more than the fusion saves.
+Removing that barrier — either by teaching the backend scheduler the fused batchmatmul or by
+making the head-to-hidden relayout expressible in a graph — is what would make it pay.
+
+Four properties of the lowering constrain it:
 
 - The scatter and the page gathers go through the **same** tensor, the flat slot-major
   view. Given the 4D pages and a 3D view of them as two graph inputs, Inductor sees no
@@ -120,14 +126,25 @@ graph. Two properties of the lowering make it possible:
 - Each page's slot indices arrive as their **own** 1D tensor (`slot_rows`, cached per page
   for the process). Slicing an index row out of a 2D table inside the graph compiles but
   returns corrupted rows.
+- An opaque op (`vllm::spyre_attn_out`) separates attention from `o_proj`. Handed the value,
+  Inductor folds attention's epilogue into `o_proj`'s matmul and the backend scheduler
+  rejects the program (`out_reuse_dim.size() == 1` in `L3DlOpsScheduler`). Every in-graph
+  materialization is undone by functionalization, which rewrites a store-then-read of one
+  buffer back into the value, so the boundary has to be an op Inductor cannot see through.
+  It returns a **clone**: a custom op must not return an alias of its input, which Inductor
+  miscompiles.
+- That same op folds the head axis into hidden. Under Spyre's stick layouts a flat hidden
+  index splits into two `Mod` expressions the coordinate mapper rejects (`variable d2
+  (range 4096) appears in multiple Mod expressions`); eagerly it is just a retile, which is
+  how the untraced path has always done it.
 
 Per-step values reach the traced body through one `FusedAttentionStep` mutated in place and
 shared by every layer, published by `_arm_inline_kv_scatter` outside any graph — a traced
 body cannot mirror anything to device itself. Dynamo lifts its tensors to graph inputs
 guarded on metadata and bakes its ints as constants, so a block recompiles when a shape or
 a page count changes, not every step. Layers the traced path cannot serve — ALiBi, KV
-sharing, quantised query, encoder attention — and eager mode fall back to the opaque op,
-and `SPYRE_FUSE_ATTN=0` disables it outright.
+sharing, quantised query, encoder attention — plus sliding-window steps and eager mode fall
+back to the opaque op.
 
 Embeddings and the final norm sit outside the block list and stay eager. `lm_head` was
 never in the compiled region; `compute_logits` is a separate call on the wrapper.
