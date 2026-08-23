@@ -24,7 +24,7 @@ import torch
 
 from spyre_inference.custom_ops.utils import convert
 
-from vllm.config import CompilationMode, VllmConfig, get_current_vllm_config
+from vllm.config import VllmConfig
 from vllm.logger import init_logger
 from vllm.config.cache import CacheDType
 from vllm.v1.attention.backend import (
@@ -903,18 +903,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
 
-        # `== STOCK`, not `!= NONE`: a bare CompilationConfig (e.g. the unit-test
-        # fixture) leaves mode unset (Python None), which `!= NONE` would wrongly
-        # treat as compiled. The platform resolves compiled runs to STOCK.
-        #
-        # When compiled, `forward` runs inside the enclosing block graph
-        # (`TorchSpyrePlatform.opaque_attention_op` is False), so the page loop and
-        # the KV scatter are traced with the rest of the block and must NOT be
-        # wrapped in a graph of their own -- that is the fusing. Uncompiled there is
-        # no enclosing graph, and they run as they always did.
-        _mode = get_current_vllm_config().compilation_config.mode
-        self._inside_block_graph = _mode == CompilationMode.STOCK_TORCH_COMPILE
-
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
         # per-block bias construction in _online_softmax_attention broadcasts
@@ -937,13 +925,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.logits_soft_cap: float = 0.0 if logits_soft_cap is None else float(logits_soft_cap)
 
         # Eager index_copy_ rejects an int32 index and falls back to CPU with an int64
-        # one, so uncompiled runs need their own graph for the scatter. Inside the
-        # block graph it is just traced along with everything else.
-        self._reshape_fn = (
-            _reshape_and_cache_kernel
-            if self._inside_block_graph
-            else torch.compile(_reshape_and_cache_kernel, dynamic=False)
-        )
+        # one, so a call that is not being traced needs its own graph for the scatter;
+        # a traced one must NOT have it, or the scatter lands in a nested graph instead
+        # of the block's. Which applies is a property of the call, not of the config --
+        # STOCK mode does not imply an enclosing graph, since the impl is also called
+        # directly (tests) and by layers outside a compiled block. `_reshape_and_cache`
+        # picks per call on `torch.compiler.is_compiling()`.
+        self._reshape_fn_traced = _reshape_and_cache_kernel
+        self._reshape_fn_compiled = torch.compile(_reshape_and_cache_kernel, dynamic=False)
 
         # Attention loops, keyed by (num_blocks, padded_query_len) -- the shapes the
         # kernel bakes in. Still cached per key even when traced: the specialised
@@ -996,13 +985,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         k_pages, v_pages = kv_cache
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Nothing here mirrors to device or reads a tensor's value: compiled, this
-        # body is traced into the block's graph and both would break it. `build`
-        # resolved the mirrors and the loop bounds on the host.
+        # This body reads no tensor's value: compiled, it is traced into the block's
+        # graph and an `.item()` would break it. `build` resolved the loop bounds on
+        # the host.
+        #
+        # The mirrors it took are only a fast path. The device that matters is the
+        # pages', which only `forward` knows -- a builder handed the wrong one (its
+        # `device` is whatever the runner passed) would otherwise leave the scatter's
+        # index on the host, and `index_copy_` then fails outright or falls back to
+        # CPU. `convert` short-circuits when the device already matches, so this
+        # re-mirror costs nothing and emits no node once the two agree.
         slot_mapping_device = attn_metadata.slot_mapping_device
         assert slot_mapping_device is not None, (
             "slot_mapping_device must be mirrored by SpyreAttentionMetadataBuilder.build"
         )
+        slot_mapping_device = convert(slot_mapping_device, device=k_pages.device)
 
         # Step 1: Reshape and cache — scatter new tokens into their slots
         self._reshape_and_cache(
@@ -1045,9 +1042,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             f"reshape_and_cache source is on {key.device.type}, pages on {k_pages.device.type}"
         )
 
+        # Traced, the scatter belongs in the enclosing graph; untraced it needs one of
+        # its own or index_copy_ falls back to CPU.
+        reshape_fn = (
+            self._reshape_fn_traced
+            if torch.compiler.is_compiling()
+            else self._reshape_fn_compiled
+        )
+
         # Valid because a view keeps the slot-outermost device layout.
         slots = (-1, k_pages.shape[2], k_pages.shape[3])
-        self._reshape_fn(key, value, k_pages.view(slots), v_pages.view(slots), slot_mapping)
+        reshape_fn(key, value, k_pages.view(slots), v_pages.view(slots), slot_mapping)
 
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
@@ -1087,11 +1092,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         page_index_tables = attn_metadata.page_index_tables
         q_starts = attn_metadata.q_starts
         q_ends = attn_metadata.q_ends
+        kv_lens = attn_metadata.kv_lens
         loop_blocks = attn_metadata.loop_blocks
         alibi_rel_tiles = attn_metadata.alibi_rel_tiles_device
+        block_size = attn_metadata.block_size
         assert mask_tiles_all is not None and page_index_tables is not None, (
             "device mirrors must be filled by SpyreAttentionMetadataBuilder.build"
         )
+
+        # As in `forward`: the pages' device is the authority, and `convert` is a no-op
+        # once the builder's mirror already landed there.
+        pages_device = k_pages.device
+        page_index_tables = [convert(t, device=pages_device) for t in page_index_tables]
+        mask_tiles_all = [
+            [convert(t, device=pages_device) for t in seq_tiles] for seq_tiles in mask_tiles_all
+        ]
 
         # One [query_len, num_heads, head_size] piece per sequence, concatenated and
         # stored once at the end. A store per sequence lowers to a slice_scatter per
@@ -1176,12 +1191,25 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # Scaling by this layer's slopes is a device multiply in the graph.
             alibi_bias_tiles: list[torch.Tensor] | None = None
             if self.alibi_slopes is not None:
-                assert alibi_rel_tiles is not None, (
-                    "a layer has ALiBi slopes but the builder saw none; "
-                    "SpyreAttentionMetadataBuilder reads them from static_forward_context"
-                )
                 slopes_dev = convert(self.alibi_slopes, device=query_dev.device)
-                alibi_bias_tiles = [slopes_dev * rel for rel in alibi_rel_tiles[seq_idx]]
+                if alibi_rel_tiles is not None:
+                    alibi_bias_tiles = [slopes_dev * rel for rel in alibi_rel_tiles[seq_idx]]
+                else:
+                    # The builder found no ALiBi layer to read slopes off -- it scans
+                    # `static_forward_context`, which an impl constructed directly does
+                    # not appear in. Build the tiles here instead. Host arithmetic, so
+                    # only correct on an untraced call; a traced ALiBi layer is served
+                    # by the builder, which does see registered layers.
+                    context_len = kv_lens[seq_idx] - query_len
+                    alibi_bias_tiles = []
+                    for b in active_bs:
+                        kv_pos = torch.arange(
+                            b * block_size, (b + 1) * block_size, dtype=torch.float16
+                        )
+                        rel = (kv_pos - context_len).view(1, 1, 1, block_size)
+                        alibi_bias_tiles.append(
+                            convert(self.alibi_slopes * rel, device=query_dev.device)
+                        )
 
             # Run attention on target device
             attn_fn = self._get_attn_fn(len(active_bs), aligned_max_query_len)
