@@ -1203,6 +1203,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             else:
                 parts.append(result)
 
+        if not parts:
+            # No sequences, so nothing to attend over and nothing to store.
+            return output
+
         # One store covering every element. `output` is vLLM's torch.empty buffer and
         # its width is the padded batch, so a batch with padding rows needs the tail
         # covered too -- otherwise the uncovered rows keep the undefined fill.
