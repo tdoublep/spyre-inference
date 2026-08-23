@@ -708,6 +708,21 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     # --- KV cache allocation ---
 
+    def initialize_metadata_builders(self, kv_cache_config, kernel_block_sizes) -> None:
+        """Hand the attention metadata builders the Spyre device, not `self.device`.
+
+        `SpyreAttentionMetadataBuilder.build` mirrors this step's host tensors (slot
+        mapping, mask tiles, page indices) to the device it was constructed with, and
+        attention reads those mirrors from inside the block's graph, where it cannot
+        mirror anything itself. `self.device` is deliberately CPU (see `__init__`), so
+        swap it for the duration of the construction call.
+        """
+        saved, self.device = self.device, self._spyre_device
+        try:
+            super().initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
+        finally:
+            self.device = saved
+
     def initialize_kv_cache_tensors(self, kv_cache_config, kernel_block_sizes):
         """Allocate KV cache as one dense paged tensor per layer on Spyre.
 

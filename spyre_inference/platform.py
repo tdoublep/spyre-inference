@@ -154,6 +154,24 @@ class TorchSpyrePlatform(CpuPlatform):
         pass
 
     @classmethod
+    def opaque_attention_op(cls) -> bool:
+        # CpuPlatform returns True, which wraps every attention layer in
+        # torch.ops.vllm.unified_attention_with_output. That op is opaque to Dynamo,
+        # so the KV scatter, the page loop and the online softmax sit in their own
+        # graphs and every dispatch from the untraced Python body is its own launch.
+        #
+        # False takes the other branch of `Attention.forward`, which calls
+        # `unified_attention_with_output` as plain Python. `SpyreAttentionImpl.forward`
+        # is then inlined into whatever graph encloses the layer -- the per-block graph
+        # `_compile_for_spyre` installs. Attention becomes ordinary nodes in the
+        # block's graph and Inductor schedules it alongside the rest of the block.
+        #
+        # `SpyreAttentionImpl.forward` has to stay traceable for this to hold: the
+        # host-side work (H2D mirrors, per-sequence offsets) lives in
+        # `SpyreAttentionMetadataBuilder.build`, which runs outside the graph.
+        return False
+
+    @classmethod
     def get_device_name(cls, device_id: int = 0) -> str:
         return "torch-spyre"
 

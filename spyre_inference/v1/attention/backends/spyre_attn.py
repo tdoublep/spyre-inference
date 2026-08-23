@@ -116,15 +116,6 @@ def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtyp
     )
 
 
-def _maybe_compile(fn, compile_enabled: bool):
-    """Compile `fn` when enabled. Attention compiles separately from the model's
-    fullgraph capture, which can't hold its per-sequence Python loop.
-    """
-    if compile_enabled:
-        return torch.compile(fn, dynamic=False)
-    return fn
-
-
 def _reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
     k_slots.index_copy_(0, slot_mapping, key)
     v_slots.index_copy_(0, slot_mapping, value)
@@ -312,8 +303,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Gather indices for the paged attention loop, one row per active block:
     # [num_seqs, max_active_blocks, INT32_ELEMS_PER_STICK] int32 with the page
     # index at [s, b, 0]. Each index needs its own stick-wide row to compile,
-    # which is why block_table cannot serve as the index. The device mirror is
-    # filled by the first forward(), since the builder's device is CPU.
+    # which is why block_table cannot serve as the index.
     # One tensor per sequence, materialized once per step: a compiled kernel reads
     # its inputs from offset 0, ignoring storage_offset (torch-spyre#3770).
     page_index_table_cpu: torch.Tensor | None = None
@@ -322,8 +312,34 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Device mirror of slot_mapping, which vLLM hands us on the host.
     slot_mapping_device: torch.Tensor | None = None
 
-    # Device mirror of attention_mask_tiles, filled once per step by forward().
+    # Device mirror of attention_mask_tiles.
     attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
+
+    # --- Host-side scalars, resolved by the builder. ---
+    #
+    # `forward` runs inside the block's graph (`TorchSpyrePlatform.
+    # opaque_attention_op` is False), so it cannot call `.item()` on
+    # `query_start_loc` / `seq_lens` to recover these: a graph input's value is not
+    # known at trace time and `fullgraph=True` turns the read into a hard error.
+    # The builder runs on the host, before the graph, and already has the values.
+
+    # Per-sequence [start, end) offsets into the flat q/k/v buffer.
+    q_starts: tuple[int, ...] = ()
+    q_ends: tuple[int, ...] = ()
+
+    # Per-sequence KV lengths, the host mirror of `seq_lens`.
+    kv_lens: tuple[int, ...] = ()
+
+    # Per-sequence block indices the attention loop iterates, positionally aligned
+    # with `attention_mask_tiles[s]` and row `s` of `page_index_table_cpu`. Without
+    # a sliding window this is `range(ceil(kv_len / block_size))`; with one it is
+    # `active_block_indices[s]`, the blocks whose mask is not fully -inf.
+    loop_blocks: tuple[tuple[int, ...], ...] = ()
+
+    # Per-sequence, per-loop-block ALiBi relative positions, `kv_pos - context_len`
+    # shaped [1, 1, 1, block_size] on device, or None when no layer uses ALiBi.
+    # Slope-free so one set serves every layer; the impl scales by its own slopes.
+    alibi_rel_tiles_device: list[list[torch.Tensor]] | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:
@@ -374,6 +390,17 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # calls.
         self._zero_tile: torch.Tensor | None = None
         self._zero_tile_shape: tuple[int, int] = (0, 0)
+
+        # ALiBi's relative-position tiles are the one per-step host tensor whose need
+        # depends on the layers rather than the batch, so settle it once here instead
+        # of building tiles no model reads. The layers are already constructed by the
+        # time builders are: `initialize_kv_cache` runs after `load_model`.
+        static_ctx = vllm_config.compilation_config.static_forward_context
+        self._needs_alibi = any(
+            getattr(getattr(static_ctx.get(name), "impl", None), "alibi_slopes", None)
+            is not None
+            for name in layer_names
+        )
 
     def _get_zero_tile(self, aligned_max_query_len: int) -> torch.Tensor:
         """Return (or create) the shared all-zero mask tile for interior blocks.
@@ -706,6 +733,56 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             blocks_s = slice(n) if active_block_indices is None else active_block_indices[s]
             page_index_table_cpu[s, :n, 0] = block_table[s, blocks_s]
 
+        # --- Everything `forward` cannot do from inside the block's graph. ---
+        #
+        # Host scalars first. `forward` is traced, so `query_start_loc[s].item()` is a
+        # read of a graph input's value and `fullgraph=True` rejects it; the loop
+        # bounds have to be plain ints by the time the graph is built. They are
+        # trace-time constants, which is why the kernel cache is keyed on the shapes
+        # they imply -- the same specialisation the untraced path already had.
+        starts = query_start_loc.tolist()
+        q_starts = tuple(int(v) for v in starts[:-1])
+        q_ends = tuple(int(v) for v in starts[1:])
+        kv_lens = tuple(int(v) for v in seq_lens.tolist())
+
+        if active_block_indices is None:
+            loop_blocks = tuple(
+                tuple(range((kv_len + block_size - 1) // block_size)) for kv_len in kv_lens
+            )
+        else:
+            loop_blocks = tuple(tuple(bs) for bs in active_block_indices)
+
+        # Then the H2D mirrors. `convert` is an opaque custom op, so a mirror taken
+        # here is a host-side copy the graph never sees; taken inside `forward` it
+        # would be a node in every layer's graph, re-run per layer per step.
+        device = self.device
+        page_index_tables = [
+            convert(page_index_table_cpu[s].contiguous(), device=device)
+            for s in range(num_seqs)
+        ]
+        slot_mapping_device = convert(
+            slot_mapping[: common_attn_metadata.num_actual_tokens], device=device
+        )
+        attention_mask_tiles_device = [
+            [convert(t, device=device) for t in seq_tiles] for seq_tiles in attention_mask_tiles
+        ]
+
+        # ALiBi's kv-position term, `kv_pos - context_len`, is slope-free so one set of
+        # tiles serves every layer; each impl scales by its own slopes on device.
+        alibi_rel_tiles_device: list[list[torch.Tensor]] | None = None
+        if self._needs_alibi:
+            alibi_rel_tiles_device = []
+            for s in range(num_seqs):
+                context_len_s = kv_lens[s] - (q_ends[s] - q_starts[s])
+                seq_rel: list[torch.Tensor] = []
+                for b in loop_blocks[s]:
+                    kv_pos = torch.arange(
+                        b * block_size, (b + 1) * block_size, dtype=self.model_dtype
+                    )
+                    rel = (kv_pos - context_len_s).view(1, 1, 1, block_size)
+                    seq_rel.append(convert(rel, device=device))
+                alibi_rel_tiles_device.append(seq_rel)
+
         return SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             num_seqs=common_attn_metadata.num_reqs,
@@ -724,6 +801,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             page_index_table_cpu=page_index_table_cpu,
             aligned_max_query_len=aligned_max_query_len,
             aligned_max_seq_len=aligned_max_seq_len,
+            page_index_tables=page_index_tables,
+            slot_mapping_device=slot_mapping_device,
+            attention_mask_tiles_device=attention_mask_tiles_device,
+            q_starts=q_starts,
+            q_ends=q_ends,
+            kv_lens=kv_lens,
+            loop_blocks=loop_blocks,
+            alibi_rel_tiles_device=alibi_rel_tiles_device,
         )
 
 
@@ -821,8 +906,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # `== STOCK`, not `!= NONE`: a bare CompilationConfig (e.g. the unit-test
         # fixture) leaves mode unset (Python None), which `!= NONE` would wrongly
         # treat as compiled. The platform resolves compiled runs to STOCK.
+        #
+        # When compiled, `forward` runs inside the enclosing block graph
+        # (`TorchSpyrePlatform.opaque_attention_op` is False), so the page loop and
+        # the KV scatter are traced with the rest of the block and must NOT be
+        # wrapped in a graph of their own -- that is the fusing. Uncompiled there is
+        # no enclosing graph, and they run as they always did.
         _mode = get_current_vllm_config().compilation_config.mode
-        self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
+        self._inside_block_graph = _mode == CompilationMode.STOCK_TORCH_COMPILE
 
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
@@ -845,11 +936,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # soft-capping (kernel takes the same path as upstream).
         self.logits_soft_cap: float = 0.0 if logits_soft_cap is None else float(logits_soft_cap)
 
-        # Always compiled: eager index_copy_ rejects an int32 index and falls
-        # back to CPU with an int64 one.
-        self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
+        # Eager index_copy_ rejects an int32 index and falls back to CPU with an int64
+        # one, so uncompiled runs need their own graph for the scatter. Inside the
+        # block graph it is just traced along with everything else.
+        self._reshape_fn = (
+            _reshape_and_cache_kernel
+            if self._inside_block_graph
+            else torch.compile(_reshape_and_cache_kernel, dynamic=False)
+        )
 
-        # Compiled attention loops, keyed by (num_blocks, padded_query_len)
+        # Attention loops, keyed by (num_blocks, padded_query_len) -- the shapes the
+        # kernel bakes in. Still cached per key even when traced: the specialised
+        # closure is what gets traced, and building it is not free.
         self._attn_fns: dict[tuple[int, int], object] = {}
 
         logger.debug_once(
@@ -861,16 +959,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # has_alibi and logits_soft_cap don't need to be part of the cache key.
         key = (num_blocks, padded_query_len)
         if key not in self._attn_fns:
-            self._attn_fns[key] = _maybe_compile(
-                _create_compilable_page_attn(
-                    num_blocks,
-                    padded_query_len,
-                    self.num_heads,
-                    self.head_size,
-                    has_alibi=self.alibi_slopes is not None,
-                    logits_soft_cap=self.logits_soft_cap,
-                ),
-                self._compile_attn,
+            # Deliberately not wrapped in torch.compile: compiled runs trace this into
+            # the block's graph, uncompiled runs want it eager. The per-sequence loop
+            # traces because `build` resolved its bounds to plain ints.
+            self._attn_fns[key] = _create_compilable_page_attn(
+                num_blocks,
+                padded_query_len,
+                self.num_heads,
+                self.head_size,
+                has_alibi=self.alibi_slopes is not None,
+                logits_soft_cap=self.logits_soft_cap,
             )
         return self._attn_fns[key]
 
@@ -896,29 +994,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             return output
 
         k_pages, v_pages = kv_cache
-        _target_device = k_pages.device
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Only the first layer of a step pays for the device mirror.
-        if attn_metadata.page_index_tables is None:
-            table_cpu = attn_metadata.page_index_table_cpu
-            assert table_cpu is not None
-            attn_metadata.page_index_tables = [
-                convert(table_cpu[s].contiguous(), device=_target_device)
-                for s in range(table_cpu.shape[0])
-            ]
-        if attn_metadata.slot_mapping_device is None:
-            attn_metadata.slot_mapping_device = convert(
-                attn_metadata.slot_mapping[:num_actual_tokens], device=_target_device
-            )
-        if attn_metadata.attention_mask_tiles_device is None:
-            tiles_cpu = attn_metadata.attention_mask_tiles
-            assert tiles_cpu is not None, (
-                "attention_mask_tiles must be precomputed by the metadata builder"
-            )
-            attn_metadata.attention_mask_tiles_device = [
-                [convert(t, device=_target_device) for t in seq_tiles] for seq_tiles in tiles_cpu
-            ]
+        # Nothing here mirrors to device or reads a tensor's value: compiled, this
+        # body is traced into the block's graph and both would break it. `build`
+        # resolved the mirrors and the loop bounds on the host.
+        slot_mapping_device = attn_metadata.slot_mapping_device
+        assert slot_mapping_device is not None, (
+            "slot_mapping_device must be mirrored by SpyreAttentionMetadataBuilder.build"
+        )
 
         # Step 1: Reshape and cache — scatter new tokens into their slots
         self._reshape_and_cache(
@@ -926,7 +1010,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             value[:num_actual_tokens],
             k_pages,
             v_pages,
-            attn_metadata.slot_mapping_device,
+            slot_mapping_device,
         )
 
         # Step 2: Online softmax attention over pages (varlen)
@@ -936,7 +1020,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             v_pages,
             attn_metadata,
             output,
-            _target_device,
         )
 
         return output
@@ -974,20 +1057,22 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         v_pages: torch.Tensor,
         attn_metadata: SpyreAttentionMetadata,
         output: torch.Tensor,
-        _target_device: torch.device,
     ) -> torch.Tensor:
         """FlashAttention-style online softmax iterating over KV pages (varlen).
 
-        Handles multiple sequences using query_start_loc for the varlen layout.
+        Handles multiple sequences using the per-sequence offsets `build` resolved.
         k_pages/v_pages are dense [num_blocks, block_size, num_kv_heads,
         head_size] tensors on Spyre; each iteration gathers one page with a
         one-element int32 device index, then feeds it to bmm without slicing.
 
-        Writes results directly into the caller's output buffer in-place.
+        Writes results into the caller's output buffer with a single store.
 
         Query is assembled on device into the padded 4D tensor
         [num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size]
         the kernel expects.
+
+        Every loop bound comes from the metadata as a plain int, so the loop unrolls
+        at trace time and the whole body lands in the enclosing block's graph.
 
         Args:
             query_dev: Query on the target device, [num_tokens, num_heads, D].
@@ -995,27 +1080,31 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         head_size = self.head_size
         num_kv_heads = self.num_kv_heads
         num_queries_per_kv = self.num_queries_per_kv
-        block_size = attn_metadata.block_size
 
         num_seqs = attn_metadata.num_seqs
-        query_start_loc = attn_metadata.query_start_loc
-        seq_lens = attn_metadata.seq_lens
         mask_tiles_all = attn_metadata.attention_mask_tiles_device
-        active_block_indices_all = attn_metadata.active_block_indices
         aligned_max_query_len = attn_metadata.aligned_max_query_len
         page_index_tables = attn_metadata.page_index_tables
-        assert mask_tiles_all is not None, (
-            "attention_mask_tiles_device must be mirrored by forward()"
+        q_starts = attn_metadata.q_starts
+        q_ends = attn_metadata.q_ends
+        loop_blocks = attn_metadata.loop_blocks
+        alibi_rel_tiles = attn_metadata.alibi_rel_tiles_device
+        assert mask_tiles_all is not None and page_index_tables is not None, (
+            "device mirrors must be filled by SpyreAttentionMetadataBuilder.build"
         )
-        assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
+
+        # One [query_len, num_heads, head_size] piece per sequence, concatenated and
+        # stored once at the end. A store per sequence lowers to a slice_scatter per
+        # sequence over `output`, which vLLM allocated with torch.empty; the rows no
+        # sequence covers are then an undefined fill the backend cannot store.
+        parts: list[torch.Tensor] = []
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
             # over sequences or GQA optimization
-            q_start = int(query_start_loc[seq_idx].item())
-            q_end = int(query_start_loc[seq_idx + 1].item())
+            q_start = q_starts[seq_idx]
+            q_end = q_ends[seq_idx]
             query_len = q_end - q_start
-            kv_len = int(seq_lens[seq_idx].item())
 
             if query_len == 1:
                 # Decode: the single real token goes at row 0 of the padded
@@ -1044,20 +1133,22 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size
                 )
 
-            num_blocks_needed = (kv_len + block_size - 1) // block_size
-
-            # Restrict to active (non-fully-masked) blocks when sliding window
-            # is set. When active_block_indices_all is None (no sliding), all
-            # blocks are active in their natural order.
-            if active_block_indices_all is not None:
-                active_bs = active_block_indices_all[seq_idx]
-            else:
-                active_bs = list(range(num_blocks_needed))
+            # The blocks this sequence iterates: all of them, or -- with a sliding
+            # window -- the ones whose mask is not fully -inf. `build` resolved which.
+            active_bs = loop_blocks[seq_idx]
 
             if len(active_bs) == 0:
                 # Every KV position is outside every query's window. Attention
-                # over the empty set is undefined; write zeros.
-                output[q_start:q_end] = 0.0
+                # over the empty set is undefined; contribute zeros.
+                parts.append(
+                    torch.zeros(
+                        query_len,
+                        self.num_heads,
+                        head_size,
+                        dtype=output.dtype,
+                        device=query_dev.device,
+                    )
+                )
                 continue
 
             page_index_table = page_index_tables[seq_idx]
@@ -1079,19 +1170,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # (alibi_offset = seq_offset - context_len) — the production Triton path.
             #
             # Per-tile shape: [num_kv_heads, num_queries_per_kv, 1, block_size].
+            #
+            # `build` mirrored the slope-free `kv_pos - context_len` term, which is the
+            # part that needs host arithmetic and one set of which serves every layer.
+            # Scaling by this layer's slopes is a device multiply in the graph.
             alibi_bias_tiles: list[torch.Tensor] | None = None
             if self.alibi_slopes is not None:
-                context_len = kv_len - query_len
-                alibi_bias_tiles = []
-                for b in active_bs:
-                    kv_pos = torch.arange(
-                        b * block_size,
-                        (b + 1) * block_size,
-                        dtype=torch.float16,
-                    )
-                    rel = (kv_pos - context_len).view(1, 1, 1, block_size)
-                    bias = self.alibi_slopes * rel
-                    alibi_bias_tiles.append(convert(bias, device=_target_device))
+                assert alibi_rel_tiles is not None, (
+                    "a layer has ALiBi slopes but the builder saw none; "
+                    "SpyreAttentionMetadataBuilder reads them from static_forward_context"
+                )
+                slopes_dev = convert(self.alibi_slopes, device=query_dev.device)
+                alibi_bias_tiles = [slopes_dev * rel for rel in alibi_rel_tiles[seq_idx]]
 
             # Run attention on target device
             attn_fn = self._get_attn_fn(len(active_bs), aligned_max_query_len)
@@ -1107,10 +1197,19 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             assert result.dtype == output.dtype
             if query_len < aligned_max_query_len:
-                # Writing a prefix view copies its whole extent and overruns the
-                # destination (torch-spyre#3826), so copy it first.
-                output[q_start:q_end] = result[:query_len].clone()
+                # A prefix view copies its whole extent and overruns its destination
+                # (torch-spyre#3826), so materialise it before it is consumed.
+                parts.append(result[:query_len].clone())
             else:
-                output[q_start:q_end] = result
+                parts.append(result)
+
+        # One store covering every element. `output` is vLLM's torch.empty buffer and
+        # its width is the padded batch, so a batch with padding rows needs the tail
+        # covered too -- otherwise the uncovered rows keep the undefined fill.
+        assembled = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+        pad_rows = output.shape[0] - assembled.shape[0]
+        if pad_rows > 0:
+            assembled = torch.nn.functional.pad(assembled, (0, 0, 0, 0, 0, pad_rows))
+        output.copy_(assembled)
 
         return output
