@@ -19,9 +19,11 @@ weight physically transposed as `Wᵀ` (shape `[in, out]`, contiguous) in
 `process_weights_after_loading`, which is more efficient on Spyre.
 """
 
+import os
 from typing import cast
 
 import torch
+import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from vllm.logger import init_logger
@@ -36,14 +38,42 @@ from vllm.model_executor.layers.linear import (
 
 logger = init_logger(__name__)
 
+# Rows the PT block consumes per pass. A decode GEMM with fewer rows than this
+# measurably under-runs the weight stream on wide-output projections.
+_PT_ROWS = 8
+
+# Only projections whose per-core output tile would exceed the compiler's
+# preferred width (_TARGET_N_TILE_ELEMS=512 x 32 cores) benefit. Measured on
+# granite-3.3-8b: gate_up (N=25600) gains 1.26x, while qkv (6144), o and down
+# (4096) are neutral-to-worse, so keep the narrow ones on the unpadded path.
+_MIN_PADDED_N = 512 * 32
+
+_PAD_DECODE_M = os.environ.get("SPYRE_PAD_DECODE_M", "1") == "1"
+
 
 def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor | None):
     """Linear forward with a pre-transposed weight: `x @ Wᵀ (+ bias)`.
 
     `weight_t` is the physically-transposed weight of shape `[in, out]`, so the
     matmul is a plain `x @ A` (the Spyre-fast layout), not `F.linear`'s `x @ Aᵀ`.
+
+    At batch-1 decode the GEMM is purely weight-stream bound (1 MAC per weight
+    element), and on wide-output projections a single-row `x` streams the weight
+    ~1.26x slower than an 8-row one. Padding `x` up to `_PT_ROWS` and dropping
+    the extra rows costs nothing that matters: the weight read dominates, and
+    the padded rows add <0.2% traffic. Row 0 of the result is unaffected by the
+    zero rows, but the wider GEMM picks a different work division, so the fp16
+    accumulation order changes and the result is not bit-identical to the
+    unpadded path. Measured against an fp64 reference the padded result is no
+    worse (0.96x the max error, 0.99x the mean relative error), so this is
+    reduction-order noise rather than a loss of accuracy.
     """
-    out = torch.matmul(x, weight_t)
+    m = x.shape[0] if x.dim() == 2 else 0
+    if _PAD_DECODE_M and 0 < m < _PT_ROWS and weight_t.shape[-1] >= _MIN_PADDED_N:
+        x = F.pad(x, (0, 0, 0, _PT_ROWS - m))
+        out = torch.matmul(x, weight_t)[:m]
+    else:
+        out = torch.matmul(x, weight_t)
     if bias is not None:
         out = out + bias
     return out
