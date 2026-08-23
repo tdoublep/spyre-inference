@@ -105,6 +105,30 @@ one block however deep the model is, and a new shape (a fresh `KV_LENGTH_ALIGNME
 costs one block recompile rather than a whole-model one. Heterogeneous stacks specialize
 per variant — Gemma 3 alternates sliding-window and full attention, giving two artifacts.
 
+Attention is part of that graph rather than a hole in it. vLLM routes attention through
+`torch.ops.vllm.unified_attention_with_output`, which Dynamo cannot trace into, so a block
+would otherwise compile as prologue / attention / epilogue — three launches per layer, with
+the query padding, permutes and output copy around the kernel as eager dispatches on top.
+`Attention.forward` is traced Python, so the backend replaces its body (see
+`_patched_attention_forward`) and the scatter, page loop and softmax land in the block's
+graph. Two properties of the lowering make it possible:
+
+- The scatter and the page gathers go through the **same** tensor, the flat slot-major
+  view. Given the 4D pages and a 3D view of them as two graph inputs, Inductor sees no
+  dependency between the store and the loads and asserts on the store's stride map; with
+  one tensor the mutation orders the gathers after it.
+- Each page's slot indices arrive as their **own** 1D tensor (`slot_rows`, cached per page
+  for the process). Slicing an index row out of a 2D table inside the graph compiles but
+  returns corrupted rows.
+
+Per-step values reach the traced body through one `FusedAttentionStep` mutated in place and
+shared by every layer, published by `_arm_inline_kv_scatter` outside any graph — a traced
+body cannot mirror anything to device itself. Dynamo lifts its tensors to graph inputs
+guarded on metadata and bakes its ints as constants, so a block recompiles when a shape or
+a page count changes, not every step. Layers the traced path cannot serve — ALiBi, KV
+sharing, quantised query, encoder attention — and eager mode fall back to the opaque op,
+and `SPYRE_FUSE_ATTN=0` disables it outright.
+
 Embeddings and the final norm sit outside the block list and stay eager. `lm_head` was
 never in the compiled region; `compute_logits` is a separate call on the wrapper.
 
@@ -117,20 +141,25 @@ The `SpyreAttentionBackend` implements paged attention using pure PyTorch operat
 (no custom CUDA kernels). The KV cache is one dense tensor per layer on Spyre,
 `[num_blocks, block_size, num_kv_heads, head_size]` — the shape
 `SpyreAttentionBackend.get_kv_cache_shape` advertises. It runs a FlashAttention-style
-online softmax that iterates over pages without any compact-gather step, reading each
-page by indexing the dense tensor with a one-element int32 device tensor (an indirect
+online softmax that iterates over pages without any compact-gather step, reading each page
+from the flat slot-major view with that page's `block_size` slot indices (an indirect
 access, so the compiled bundle carries a real index rather than a constant slice) and
 permuting the token-major page to head-major on device before the matmuls. The cache is
-allocated with the slot axis outermost in the device layout (`slot_major_kv_layout`) so
-the write can scatter through a slot-major view of it:
+allocated with the slot axis outermost in the device layout (`slot_major_kv_layout`), so
+both the read and the write address it as one `[num_blocks * block_size, num_kv_heads,
+head_size]` tensor — which is what lets the two share a graph:
 
 | Step | Device | Operation |
 |---|---|---|
 | 1. q → CPU | CPU | Bring `q` to CPU when its layout cannot be assembled on device; `k`/`v` stay put |
 | 2. Reshape & cache | Spyre | Scatter new K/V into the cache through a slot-major view: a token's destination is one index, so it is a single `index_copy_` per tensor |
 | 3. Per-sequence varlen loop | CPU | Iterate sequences via `query_start_loc`, pad `query_len` to 32 |
-| 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, padded_query_len)` kernel: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
+| 4. Online softmax over pages | Spyre | Kernel specialized per `(num_blocks, padded_query_len)`: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 5. Write-back | CPU → Spyre | Stage each sequence's result into a CPU buffer, then one bulk copy into the Spyre output (per-token `spyre.overwrite` scatter doesn't scale) |
+
+Under compilation the same steps run inside the block's graph instead, so 3 and 5 are
+Python that Dynamo unrolls rather than host work per step, and the results are
+concatenated rather than staged through CPU.
 
 Key constraints:
 

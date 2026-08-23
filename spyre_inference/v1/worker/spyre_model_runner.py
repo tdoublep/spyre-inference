@@ -258,11 +258,13 @@ class _SpyreModelWrapper:
         model: nn.Module,
         spyre_device: torch.device,
         keep_outputs_on_device: bool = False,
+        fuse_attn_graph: bool = False,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
         object.__setattr__(self, "_spyre_device", spyre_device)
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
+        object.__setattr__(self, "_fuse_attn_graph", fuse_attn_graph)
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64
@@ -304,16 +306,21 @@ class _SpyreModelWrapper:
         return result
 
     def _arm_inline_kv_scatter(self) -> None:
-        """Publish this step's device slot mapping so the traced scatter can run.
+        """Publish this step's attention inputs to the layers, outside any graph.
 
-        Runs here, once per forward and outside any graph, because the scatter now
-        happens per layer *before* SpyreAttentionImpl.forward — which is where the
-        device mirror used to be built lazily.
+        Layers the traced path can serve get the whole step context and run
+        attention inside the block's graph; the rest get just the slot mapping and
+        scatter before the opaque attention op. Either way this has to happen
+        here, since a traced body cannot mirror anything to device itself.
         """
         from vllm.forward_context import get_forward_context
 
         from spyre_inference.v1.attention.backends.spyre_attn import (
             SpyreAttentionMetadata,
+            fusable_attention_layers,
+            fused_step_for,
+            publish_fused_attention,
+            step_kernels,
             publish_slot_mapping,
             wired_kv_scatter_layers,
         )
@@ -327,8 +334,9 @@ class _SpyreModelWrapper:
         except AssertionError:
             attn_metadata = None
         if not isinstance(attn_metadata, dict):
-            # Nothing to publish, but stale mappings must still be withdrawn.
+            # Nothing to publish, but stale state must still be withdrawn.
             publish_slot_mapping({})
+            publish_fused_attention({})
             return
 
         by_metadata: dict[int, tuple[SpyreAttentionMetadata, list[str]]] = {}
@@ -336,20 +344,33 @@ class _SpyreModelWrapper:
             if isinstance(md, SpyreAttentionMetadata):
                 by_metadata.setdefault(id(md), (md, []))[1].append(layer_name)
 
+        # One step context is shared by every layer, so it can only describe one
+        # metadata object; with more than one, nobody takes the traced path.
+        fusable = fusable_attention_layers() if len(by_metadata) == 1 else {}
+
         published: dict[str, torch.Tensor] = {}
+        fused: dict[str, tuple] = {}
         for md, layer_names in by_metadata.values():
             # All-or-nothing per metadata: the impl skips its scatter for every layer
             # sharing this metadata, so every one of them must be covered here.
             if not all(name in wired for name in layer_names):
                 md.inline_kv_scatter = False
                 continue
+            md.inline_kv_scatter = True
+            step = None
+            if self._fuse_attn_graph and all(name in fusable for name in layer_names):
+                step = fused_step_for(md, self._spyre_device)
+            if step is not None:
+                for name in layer_names:
+                    fused[name] = (step, step_kernels(fusable[name].impl, step))
+                continue
             if md.slot_mapping_device is None:
                 md.slot_mapping_device = convert(
                     md.slot_mapping[: md.num_actual_tokens], device=self._spyre_device
                 )
-            md.inline_kv_scatter = True
             published.update(dict.fromkeys(layer_names, md.slot_mapping_device))
         publish_slot_mapping(published)
+        publish_fused_attention(fused)
 
     def compute_logits(self, hidden_states, *args, **kwargs):
         """Move hidden_states onto Spyre for the lm_head custom op.
@@ -503,7 +524,20 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.model,
             self._spyre_device,
             keep_outputs_on_device=self._pooling_on_spyre,
+            fuse_attn_graph=self._fuse_attn_graph(),
         )
+
+    def _fuse_attn_graph(self) -> bool:
+        """Whether attention should be traced into the block graph.
+
+        Only under compilation: traced eagerly, the KV scatter would be an eager
+        index_copy_, which falls back to CPU.
+        """
+        if os.environ.get("SPYRE_FUSE_ATTN", "1") == "0":
+            return False
+        if self.vllm_config.model_config.enforce_eager:
+            return False
+        return self.compilation_config.mode is not CompilationMode.NONE
 
     def _compile_for_spyre(self) -> None:
         """Install torch.compile wrappers; tracing happens on the first forward.
@@ -801,10 +835,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         wired = install_inline_kv_scatter(self.compilation_config.static_forward_context, kv_caches)
         if wired:
+            from spyre_inference.v1.attention.backends.spyre_attn import (
+                fusable_attention_layers,
+            )
+
+            fusable = len(fusable_attention_layers()) if self._fuse_attn_graph() else 0
             logger.info(
-                "Wired %d attention layers for the in-graph KV scatter; "
-                "the write folds into the graph that produces K/V.",
+                "Wired %d attention layers for the in-graph KV scatter; %d of them "
+                "run attention inside the block's graph.",
                 wired,
+                fusable,
             )
         return kv_caches
 
