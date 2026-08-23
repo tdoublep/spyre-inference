@@ -42,11 +42,26 @@ logger = init_logger(__name__)
 # measurably under-runs the weight stream on wide-output projections.
 _PT_ROWS = 8
 
-# Only projections whose per-core output tile would exceed the compiler's
-# preferred width (_TARGET_N_TILE_ELEMS=512 x 32 cores) benefit. Measured on
-# granite-3.3-8b: gate_up (N=25600) gains 1.26x, while qkv (6144), o and down
-# (4096) are neutral-to-worse, so keep the narrow ones on the unpadded path.
+# Padding only pays inside a band of output widths, established by measurement
+# on granite-3.3-8b (isolated GEMM, M=1 vs padded):
+#
+#   o       N=4096    0.343 -> 0.370 ms   worse
+#   qkv     N=6144    0.463 -> 0.496 ms   worse
+#   down    N=4096    0.850 -> 0.870 ms   worse
+#   gate_up N=25600   1.937 -> 1.565 ms   1.24x better
+#   lm_head N~49152   worse end-to-end (see below); too large to isolate,
+#                     the unpadded shape alone busts the 256 MB span limit
+#
+# Below the lower bound a 32-core N-split already fits the compiler's preferred
+# per-core tile (_TARGET_N_TILE_ELEMS=512), so padding only adds M-split
+# pressure. Above the upper bound it turns out to hurt again. End-to-end, in=64
+# out=64 bs=1: no padding 9.974 s, gate_up+lm_head 9.443 s, gate_up only
+# 9.292 s -- so the lm_head must be excluded.
+#
+# Both bounds are empirical, not derived; re-measure for a model whose FFN or
+# vocab width differs materially, and note the lower bound assumes 32 cores.
 _MIN_PADDED_N = 512 * 32
+_MAX_PADDED_N = int(os.environ.get("SPYRE_PAD_DECODE_MAX_N", "32768"))
 
 _PAD_DECODE_M = os.environ.get("SPYRE_PAD_DECODE_M", "1") == "1"
 
@@ -69,7 +84,7 @@ def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor |
     reduction-order noise rather than a loss of accuracy.
     """
     m = x.shape[0] if x.dim() == 2 else 0
-    if _PAD_DECODE_M and 0 < m < _PT_ROWS and weight_t.shape[-1] >= _MIN_PADDED_N:
+    if _PAD_DECODE_M and 0 < m < _PT_ROWS and _MIN_PADDED_N <= weight_t.shape[-1] <= _MAX_PADDED_N:
         x = F.pad(x, (0, 0, 0, _PT_ROWS - m))
         out = torch.matmul(x, weight_t)[:m]
     else:
