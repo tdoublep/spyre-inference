@@ -16,6 +16,8 @@
 
 from functools import lru_cache
 
+from typing import cast
+
 import torch
 
 from vllm.distributed import tensor_model_parallel_all_reduce
@@ -27,7 +29,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .utils import convert
+from .utils import convert, row_gather_layout
 
 logger = init_logger(__name__)
 
@@ -43,6 +45,27 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
                 f"SpyreVocabParallelEmbedding does not support quantized "
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
+
+    def _apply(self, fn, recurse=True):
+        # The vocab table is only ever gathered from, so once it lands on device give it
+        # a layout whose gather reads the wanted rows instead of the whole table. Spyre
+        # requires the indexed dim outermost; the default layout puts it inwards.
+        from torch_spyre._C import get_elem_in_stick
+
+        cpu_weight = cast(torch.Tensor, self.weight).data
+        super()._apply(fn, recurse)
+        moved = cast(torch.Tensor, self.weight).data
+        if cpu_weight.device.type != "cpu" or moved.device.type != "spyre":
+            return self
+        num_rows, row_width = cpu_weight.shape
+        if row_width % get_elem_in_stick(moved.dtype):
+            # A partial trailing stick needs padding this layout cannot express.
+            return self
+        self.weight.data = cpu_weight.to(moved.dtype).to(  # ty: ignore[no-matching-overload]
+            moved.device,
+            device_layout=row_gather_layout(num_rows, row_width, moved.dtype),
+        )
+        return self
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:
