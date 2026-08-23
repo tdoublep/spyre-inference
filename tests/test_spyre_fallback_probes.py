@@ -321,8 +321,11 @@ def test_spyre_indirect_page_gather_one_element_index(spyre_device, head_size, m
     """Guard the page gather used by SpyreAttentionImpl.
 
     The index must be a one-element tensor taken as a row slice of a stick-wide
-    table (`table[b, 0:1]`), which is what SpyreAttentionMetadata.page_index_tables
-    provides. Two nearby index forms do NOT work and are deliberately not used:
+    table (`table[b, 0:1]`). The backend no longer indexes pages this way — it gathers
+    slots with one 1-D index tensor per page (`slot_rows`), because slicing a row out
+    of a shared table inside a traced graph returns corrupted rows — but the constraint
+    below still bounds what an indirect gather may look like. Two nearby index forms do
+    NOT work and are deliberately not used:
       - a 0-dim scalar index (see test_spyre_indirect_matmul_tensor_index), and
       - a slice of a plain 1-D index tensor, or of a shared table row, which
         fails to compile rather than returning wrong values.
@@ -665,7 +668,8 @@ def test_spyre_scatter_from_prefix_view_source(spyre_device, source):
     strict=True,
     reason=(
         "torch-spyre#3770: a device view with storage_offset != 0 is read from offset 0 "
-        "when passed into a compiled region; hence the per-sequence page_index_tables."
+        "when passed into a compiled region; hence one whole index tensor per page "
+        "(`slot_rows`) rather than slices of a shared table."
     ),
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.int32])

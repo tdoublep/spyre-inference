@@ -96,36 +96,65 @@ in the attention backend, where offset > 0 views still corrupt on transfer (see
 
 ## Compilation Granularity
 
-Under `CompilationMode.STOCK_TORCH_COMPILE`, `_compile_for_spyre` compiles each entry of
-the model's block `ModuleList` in place via `block.compile(backend="inductor",
-fullgraph=True, dynamic=False)`. In place matters: rebinding the list entry to the
-`OptimizedModule` that `torch.compile` returns would re-parent the block under an
-`_orig_mod` child and rename every parameter, breaking weight save/reload.
+Under `CompilationMode.STOCK_TORCH_COMPILE`, `_compile_for_spyre` replaces each entry of
+the model's block `ModuleList` with `torch.compile(block, backend="inductor",
+fullgraph=True, dynamic=False)`. Blocks are found structurally — a `ModuleList` whose
+non-`PPMissingLayer` entries share one type that owns an `Attention` — so decoder stacks
+(`model.layers`) and encoder stacks (`bert.encoder.layer`) are both covered.
 
-Blocks are found structurally — a `ModuleList` whose non-`PPMissingLayer` entries own an
-`Attention` somewhere, and are not themselves `Attention` layers — so decoder stacks
-(`model.layers`) and encoder stacks (`bert.encoder.layer`) are both covered, as are
-hybrid Mamba+attention stacks that mix layer classes in one list. A `ModuleList` of bare
-`Attention` layers (Zamba2's shared `dpa_list`) is skipped: it is not a block stack.
-Models whose attention is not a vLLM `Attention` — MLA (DeepSeek, Kimi), vision-tower
-attention — match nothing and fall back to a whole-model graph.
+The blocks share one `forward` code object, so Dynamo traces the first and the rest reuse
+that entry; whatever it re-traces hits the Inductor FX graph cache. The backend compiles
+one block however deep the model is, and a new shape (a fresh `KV_LENGTH_ALIGNMENT` tier)
+costs one block recompile rather than a whole-model one. Heterogeneous stacks specialize
+per variant — Gemma 3 alternates sliding-window and full attention, giving two artifacts.
 
-Blocks of one class share one `forward` code object, so Dynamo traces the first and the
-rest reuse that entry; whatever it re-traces hits the Inductor FX graph cache. The
-backend compile count is independent of depth, but it is not 1: layer 0 specializes
-separately because `residual is None` there, so a Llama-shaped stack yields two
-artifacts, and stacks that vary per layer yield more — Gemma 3 alternates sliding-window
-and full attention, giving four. A fresh `num_tokens` tier then costs one block recompile
-rather than a whole-model one. Note that `num_tokens` is the block graph's *only* shape
-dependence: kv-cache length and the `KV_LENGTH_ALIGNMENT` tiers live inside
-`unified_attention_with_output`, which is opaque to this graph and compiles its own
-kernels (see [Kineto profiling](../user_guide/kineto_profiling.md)).
+Attention is a hole in that graph, and the backend fills it. vLLM routes attention through
+`torch.ops.vllm.unified_attention_with_output`, which Dynamo cannot trace into, so a block
+compiles as prologue / attention / epilogue. `Attention.forward` is traced Python, so the
+backend replaces its body (see `_patched_attention_forward`) and puts the scatter, page loop
+and softmax in the block's graph instead — one graph per block, with the KV write inside it.
 
-Depth independence relies on vLLM hoisting the per-layer attention name out of the graph,
-which needs torch >= 2.11 and `VLLM_USE_LAYERNAME=1`. Without it each block bakes in its
-own layer name and compiles separately, which is worse than the whole-model graph; the
-runner logs a warning when it detects this. Inductor freezing (enabled by `max_autotune`)
-defeats sharing the same way, by folding each block's weights into its own graph.
+It pays because attention hands its result to `o_proj` with the head axis still outermost:
+granite-3.3-8b, 64 in / 64 out, batch 1, 148.1 ms/token against 154.8 ms/token through the
+opaque op, identical tokens.
+
+What the backend rejects is not the fusion of attention's epilogue into `o_proj`'s matmul (a
+pointwise epilogue fuses fine) but **collapsing a multi-axis value into the matmul's reduction
+operand**: folding `[num_heads, tokens, head_size]` down to `[tokens, num_heads * head_size]`
+mints a loop variable per collapsed axis, the matmul ends up with more than one reduction dim,
+and a bmm contracts exactly one (`out_reuse_dim.size() == 1` in `L3DlOpsScheduler`). Any
+collapse of two or more axes fails; an already-2-D operand compiles. So the fix is a shape
+choice, not a barrier: keep the head axis outermost and let `o_proj` contract each head against
+its own slice of `Wᵀ`, summing over heads (`spyre_linear_t`). `Wᵀ` is stored `[in, out]`
+contiguous, so those slices are already its rows and the split costs nothing.
+
+Three properties of the lowering constrain it:
+
+- The scatter and the page gathers go through the **same** tensor, the flat slot-major
+  view. Given the 4D pages and a 3D view of them as two graph inputs, Inductor sees no
+  dependency between the store and the loads and asserts on the store's stride map; with
+  one tensor the mutation orders the gathers after it.
+- Each page's slot indices arrive as their **own** 1D tensor (`slot_rows`, cached per page
+  for the process). Slicing an index row out of a 2D table inside the graph compiles but
+  returns corrupted rows.
+- Multi-sequence batches are **not correct yet**. The per-sequence stores lower to
+  `slice_scatter`, and with two or more sequences part of the output buffer is uncovered;
+  from `torch.empty` that base is a NaN fill the backend cannot store, so the program used
+  not to compile at all. `torch.zeros` compiles, but the tokens then come out shifted by one
+  position, which is a bug in the traced body itself and not in the o_proj lowering (the two
+  lowerings agree to 2e-6 in exact arithmetic, assembly included).
+
+Per-step values reach the traced body through one `FusedAttentionStep` mutated in place and
+shared by every layer, published by `_arm_traced_attention` outside any graph — a traced
+body cannot mirror anything to device itself. Dynamo lifts its tensors to graph inputs
+guarded on metadata and bakes its ints as constants, so a block recompiles when a shape or
+a page count changes, not every step.
+
+`install_traced_attention` wires only the layers this can serve. Layers left out — ALiBi, KV
+sharing, quantised query, encoder attention, or an `o_proj` that cannot contract per head
+because the model reshapes in between — keep the opaque op and scatter their own K/V in
+`SpyreAttentionImpl.forward`, as do sliding-window steps and eager mode. The two are
+independent per layer: whichever path runs does that layer's KV write.
 
 Embeddings and the final norm sit outside the block list and stay eager. `lm_head` was
 never in the compiled region; `compute_logits` is a separate call on the wrapper.
@@ -139,20 +168,25 @@ The `SpyreAttentionBackend` implements paged attention using pure PyTorch operat
 (no custom CUDA kernels). The KV cache is one dense tensor per layer on Spyre,
 `[num_blocks, block_size, num_kv_heads, head_size]` — the shape
 `SpyreAttentionBackend.get_kv_cache_shape` advertises. It runs a FlashAttention-style
-online softmax that iterates over pages without any compact-gather step, reading each
-page by indexing the dense tensor with a one-element int32 device tensor (an indirect
+online softmax that iterates over pages without any compact-gather step, reading each page
+from the flat slot-major view with that page's `block_size` slot indices (an indirect
 access, so the compiled bundle carries a real index rather than a constant slice) and
 permuting the token-major page to head-major on device before the matmuls. The cache is
-allocated with the slot axis outermost in the device layout (`slot_major_kv_layout`) so
-the write can scatter through a slot-major view of it:
+allocated with the slot axis outermost in the device layout (`slot_major_kv_layout`), so
+both the read and the write address it as one `[num_blocks * block_size, num_kv_heads,
+head_size]` tensor — which is what lets the two share a graph:
 
 | Step | Device | Operation |
 |---|---|---|
 | 1. q → CPU | CPU | Bring `q` to CPU when its layout cannot be assembled on device; `k`/`v` stay put |
 | 2. Reshape & cache | Spyre | Scatter new K/V into the cache through a slot-major view: a token's destination is one index, so it is a single `index_copy_` per tensor |
 | 3. Per-sequence varlen loop | CPU | Iterate sequences via `query_start_loc`, pad `query_len` to 32 |
-| 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, padded_query_len)` kernel: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
+| 4. Online softmax over pages | Spyre | Kernel specialized per `(num_blocks, padded_query_len)`: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
 | 5. Write-back | CPU → Spyre | Stage each sequence's result into a CPU buffer, then one bulk copy into the Spyre output (per-token `spyre.overwrite` scatter doesn't scale) |
+
+Under compilation the same steps run inside the block's graph instead, so 3 and 5 are
+Python that Dynamo unrolls rather than host work per step, and the results are
+concatenated rather than staged through CPU.
 
 Key constraints:
 
