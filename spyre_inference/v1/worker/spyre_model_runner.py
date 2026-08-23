@@ -75,7 +75,7 @@ from spyre_inference.custom_ops.head_pad import (
     verify_padded_head_dim,
 )
 from spyre_inference.custom_ops.rotary_embedding import bound_rope_position_cache
-from spyre_inference.v1.attention.backends.spyre_attn import install_inline_kv_scatter
+from spyre_inference.v1.attention.backends.spyre_attn import install_traced_attention
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.custom_ops.vocab_parallel_embedding import (
     place_embedding_weights_for_gather,
@@ -286,7 +286,7 @@ class _SpyreModelWrapper:
             val = kwargs.get(key)
             kwargs_converted[key] = _convert_int(val)
 
-        self._arm_inline_kv_scatter()
+        self._arm_traced_attention()
 
         t0 = time.time()
         result = self._model(*args_converted, **kwargs_converted)
@@ -305,13 +305,12 @@ class _SpyreModelWrapper:
 
         return result
 
-    def _arm_inline_kv_scatter(self) -> None:
+    def _arm_traced_attention(self) -> None:
         """Publish this step's attention inputs to the layers, outside any graph.
 
-        Layers the traced path can serve get the whole step context and run
-        attention inside the block's graph; the rest get just the slot mapping and
-        scatter before the opaque attention op. Either way this has to happen
-        here, since a traced body cannot mirror anything to device itself.
+        Layers the traced path can serve run attention inside the block's graph;
+        the rest keep the opaque attention op and scatter their own K/V. This has
+        to happen here, since a traced body cannot mirror anything to device itself.
         """
         from vllm.forward_context import get_forward_context
 
@@ -321,12 +320,10 @@ class _SpyreModelWrapper:
             fused_step_for,
             publish_fused_attention,
             step_kernels,
-            publish_slot_mapping,
-            wired_kv_scatter_layers,
         )
 
-        wired = wired_kv_scatter_layers()
-        if not wired:
+        fusable = fusable_attention_layers()
+        if not fusable or not self._fuse_attn_graph:
             return
 
         try:
@@ -335,7 +332,6 @@ class _SpyreModelWrapper:
             attn_metadata = None
         if not isinstance(attn_metadata, dict):
             # Nothing to publish, but stale state must still be withdrawn.
-            publish_slot_mapping({})
             publish_fused_attention({})
             return
 
@@ -346,30 +342,15 @@ class _SpyreModelWrapper:
 
         # One step context is shared by every layer, so it can only describe one
         # metadata object; with more than one, nobody takes the traced path.
-        fusable = fusable_attention_layers() if len(by_metadata) == 1 else {}
-
-        published: dict[str, torch.Tensor] = {}
         fused: dict[str, tuple] = {}
-        for md, layer_names in by_metadata.values():
-            # All-or-nothing per metadata: the impl skips its scatter for every layer
-            # sharing this metadata, so every one of them must be covered here.
-            if not all(name in wired for name in layer_names):
-                md.inline_kv_scatter = False
-                continue
-            md.inline_kv_scatter = True
-            step = None
-            if self._fuse_attn_graph and all(name in fusable for name in layer_names):
-                step = fused_step_for(md, self._spyre_device)
+        if len(by_metadata) == 1:
+            md, layer_names = next(iter(by_metadata.values()))
+            step = fused_step_for(md, self._spyre_device)
             if step is not None:
                 for name in layer_names:
-                    fused[name] = (step, step_kernels(fusable[name].impl, step))
-                continue
-            if md.slot_mapping_device is None:
-                md.slot_mapping_device = convert(
-                    md.slot_mapping[: md.num_actual_tokens], device=self._spyre_device
-                )
-            published.update(dict.fromkeys(layer_names, md.slot_mapping_device))
-        publish_slot_mapping(published)
+                    layer = fusable.get(name)
+                    if layer is not None:
+                        fused[name] = (step, step_kernels(layer.impl, step))
         publish_fused_attention(fused)
 
     def compute_logits(self, hidden_states, *args, **kwargs):
@@ -530,18 +511,16 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _fuse_attn_graph(self) -> bool:
         """Whether attention should be traced into the block graph.
 
-        Faster than the opaque op now that o_proj takes the head axis outermost:
-        granite-3.3-8b, 64 in / 64 out, batch 1, STOCK_TORCH_COMPILE measured
-        148.1 ms/token traced against 154.8 ms/token, identical tokens. Still off by
-        default because the traced body is wrong for batches of more than one
-        sequence (tokens come out shifted by one position). Set SPYRE_FUSE_ATTN=1 to
-        trace it; SPYRE_ATTN_HEADS_OUTER=0 restores the boundary op, at 157.1 ms/token.
+        Faster than the opaque op now that o_proj contracts each head: granite-3.3-8b,
+        64 in / 64 out, batch 1, STOCK_TORCH_COMPILE measured 148.1 ms/token traced
+        against 154.8 ms/token, identical tokens.
 
-        Only under compilation either way: traced eagerly, the KV scatter would be
-        an eager index_copy_, which falls back to CPU.
+        Only under compilation: traced eagerly, the KV scatter would be an eager
+        index_copy_, which falls back to CPU.
+
+        TODO: the traced body is still wrong for batches of more than one sequence
+        (tokens come out shifted by one position).
         """
-        if os.environ.get("SPYRE_FUSE_ATTN", "0") != "1":
-            return False
         if self.vllm_config.model_config.enforce_eager:
             return False
         return self.compilation_config.mode is not CompilationMode.NONE
@@ -840,25 +819,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.kv_caches,
         )
 
-        wired = install_inline_kv_scatter(
-            self.compilation_config.static_forward_context, kv_caches, self.model
-        )
-        if wired:
-            from spyre_inference.v1.attention.backends.spyre_attn import (
-                fusable_attention_layers,
-                heads_outer_attention_layers,
+        if self._fuse_attn_graph():
+            wired = install_traced_attention(
+                self.compilation_config.static_forward_context, kv_caches, self.model
             )
-
-            traced = self._fuse_attn_graph()
-            fusable = len(fusable_attention_layers()) if traced else 0
-            heads_outer = len(heads_outer_attention_layers()) if traced else 0
             logger.info(
-                "Wired %d attention layers for the in-graph KV scatter; %d of them "
-                "run attention inside the block's graph, %d of those handing o_proj "
-                "the head axis outermost.",
+                "Wired %d of %d attention layers to run inside the block's graph; "
+                "the rest keep the opaque attention op.",
                 wired,
-                fusable,
-                heads_outer,
+                len(kv_caches),
             )
         return kv_caches
 

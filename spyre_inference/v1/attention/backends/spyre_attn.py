@@ -16,7 +16,6 @@
 
 import functools
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import ClassVar, NamedTuple
 
 import os
@@ -27,7 +26,6 @@ from spyre_inference.custom_ops.utils import convert
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
-from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.config.cache import CacheDType
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.v1.attention.backend import (
@@ -70,16 +68,6 @@ def _record_function(name: str):
 # on Spyre, where CompilationMode.NONE otherwise makes _maybe_compile a no-op.
 # Default: off (unset or "0").
 _FORCE_COMPILE_ATTN = os.environ.get("SPYRE_FORCE_COMPILE_ATTN", "0") == "1"
-
-# In the traced path, attend to this step's own K/V from the tensors holding it and
-# let the cache pages cover only the context, instead of reading back the slots the
-# same graph writes. Costs extra tiles; only needed if Inductor stops ordering the
-# scatter before the gathers (it does order them today: both address one tensor).
-_FUSE_FRESH_TILES = os.environ.get("SPYRE_FUSE_ATTN_FRESH_TILES", "0") == "1"
-
-# Hand attention's result to o_proj with the head axis still outermost, so neither
-# side has to fold it into the hidden axis. Set to 0 to restore the boundary op.
-_OPROJ_HEADS_OUTER = os.environ.get("SPYRE_ATTN_HEADS_OUTER", "1") == "1"
 
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
@@ -195,14 +183,12 @@ def _reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
 # as constants, so a block recompiles when a shape or a block count changes, not
 # every step. A fresh object per layer would risk an identity guard, and with it
 # a recompile per layer.
-_SLOT_MAPPING_ATTR = "_spyre_slot_mapping"
 _K_SLOTS_ATTR = "_spyre_k_slots"
 _V_SLOTS_ATTR = "_spyre_v_slots"
 _FUSED_STEP_ATTR = "_spyre_fused_step"
 _ATTN_KERNELS_ATTR = "_spyre_attn_kernels"
 
-_inline_scatter_installed = False
-_wired_layers: dict[str, Attention] = {}
+_traced_attention_installed = False
 _fusable_layers: dict[str, Attention] = {}
 
 
@@ -219,7 +205,6 @@ class FusedAttentionStep:
         "mask_tiles",
         "slot_mapping",
         "block_size",
-        "num_fresh",
     )
 
     def __init__(self) -> None:
@@ -232,148 +217,42 @@ class FusedAttentionStep:
         self.mask_tiles: list[list[torch.Tensor]] = []
         self.slot_mapping: torch.Tensor | None = None
         self.block_size = 0
-        self.num_fresh: tuple[int, ...] = ()
 
 
 _fused_step = FusedAttentionStep()
 
-
-def _attn_out_barrier_impl(x: torch.Tensor) -> torch.Tensor:
-    # Folding the head axis into the hidden axis is a relayout under Spyre's stick
-    # layouts, and in a graph it needs a flat index split by two Mods, which the
-    # coordinate mapper rejects ("variable d2 ... appears in multiple Mod
-    # expressions"). Eagerly it is just a retile, which is how the untraced path
-    # has always done it.
-    #
-    # clone, because a custom op must return a fresh tensor: reshape hands back a
-    # view, and Inductor assumes the result is its own buffer.
-    return x.reshape(x.shape[0], -1).clone()
-
-
-def _attn_out_barrier_fake(x: torch.Tensor) -> torch.Tensor:
-    return torch.empty(x.shape[0], x.shape[1] * x.shape[2], dtype=x.dtype, device=x.device)
-
-
-@lru_cache(maxsize=1)
-def register_attn_out_barrier() -> None:
-    direct_register_custom_op(
-        op_name="spyre_attn_out",
-        op_func=_attn_out_barrier_impl,
-        fake_impl=_attn_out_barrier_fake,
-        dispatch_key="CompositeExplicitAutograd",
-    )
-
-
-_fused_mask_cache: dict[tuple, torch.Tensor] = {}
-
-
-def _fused_mask_tile(
-    valid_cols, padded_query_len, query_len, block_size, causal_from, dtype, device
-):
-    """One additive mask tile for the traced path, cached by its content.
-
-    ``valid_cols`` columns of the tile hold real KV. ``causal_from`` is the absolute
-    position of column 0 within this step's own tokens, or None for a context page,
-    which needs no causal constraint — every context position precedes every query.
-    Rows past ``query_len`` are query padding and are masked out entirely.
-    """
-    key = (valid_cols, padded_query_len, query_len, block_size, causal_from, str(device))
-    tile = _fused_mask_cache.get(key)
-    if tile is None:
-        cols = torch.arange(block_size)
-        rows = torch.arange(padded_query_len)
-        attend = (cols < valid_cols).unsqueeze(0) & (rows < query_len).unsqueeze(1)
-        if causal_from is not None:
-            attend = attend & ((causal_from + cols).unsqueeze(0) <= rows.unsqueeze(1))
-        tile = convert(
-            torch.where(
-                attend,
-                torch.tensor(0.0, dtype=dtype),
-                torch.tensor(torch.finfo(dtype).min, dtype=dtype),
-            ),
-            device=device,
-        )
-        _fused_mask_cache[key] = tile
-    return tile
-
-
-def _fused_masks_for_seq(context_len, query_len, padded_query_len, block_size, dtype, device):
-    """Mask tiles for one sequence: context pages first, then its own K/V."""
-    tiles = []
-    num_prefix = (context_len + block_size - 1) // block_size
-    for b in range(num_prefix):
-        valid = min(max(context_len - b * block_size, 0), block_size)
-        tiles.append(
-            _fused_mask_tile(valid, padded_query_len, query_len, block_size, None, dtype, device)
-        )
-    num_fresh = (padded_query_len + block_size - 1) // block_size
-    for t in range(num_fresh):
-        tiles.append(
-            _fused_mask_tile(
-                query_len - t * block_size,
-                padded_query_len,
-                query_len,
-                block_size,
-                t * block_size,
-                dtype,
-                device,
-            )
-        )
-    return num_prefix, num_fresh, tiles
-
-
-def _attn_out_barrier(x: torch.Tensor) -> torch.Tensor:
-    """Keep attention's result out of o_proj's matmul.
-
-    Handed the value, Inductor fuses attention's epilogue — the softmax divide and
-    the head-to-token relayout — into o_proj's matmul, and the backend scheduler
-    rejects the resulting batchmatmul (`out_reuse_dim.size() == 1` in
-    L3DlOpsScheduler). Every in-graph way of forcing a materialization is undone
-    by functionalization, which rewrites a store-then-read of the same buffer back
-    into the value, so the boundary has to be an op Inductor cannot see through.
-
-    It costs one dispatch per layer. Everything before it — norm, QKV, RoPE, the KV
-    scatter, the page loop, the softmax — still compiles as one program, where the
-    eager path spends a launch per step on the query padding and the output copy.
-    """
-    return torch.ops.vllm.spyre_attn_out(x)
 
 
 def _traced_attention(impl, step, kernels, query, key, value, k_slots, v_slots):
     """Scatter this step's K/V and attend over the cache, in the caller's graph.
 
     query/key/value are [num_tokens, heads, head_size] views of this layer's
-    projection output. The result is [num_heads, num_tokens, head_size] when o_proj
-    takes the head axis outermost, and [num_tokens, num_heads * head_size] otherwise.
+    projection output. The result is [num_heads, num_tokens, head_size]: o_proj
+    contracts each head against its own slice of Wt, so the head axis never has to
+    be folded into the hidden axis.
 
-    Pages cover the context only. This step's own K/V is attended to from the
-    tensors that hold it, so nothing here reads a slot this graph is writing —
-    Inductor defers a graph input's mutation, so a gather of those slots can run
-    before the scatter lands.
+    The scatter and the page gathers both address ``k_slots``/``v_slots``, so
+    Inductor orders the gathers after the mutation and the pages already hold this
+    step's own K/V by the time they are read.
     """
     num_tokens = step.num_actual_tokens
     k_slots.index_copy_(0, step.slot_mapping, key[:num_tokens])
     v_slots.index_copy_(0, step.slot_mapping, value[:num_tokens])
 
-    block_size = step.block_size
     num_kv_heads = impl.num_kv_heads
     num_queries_per_kv = impl.num_queries_per_kv
     head_size = impl.head_size
     padded_query_len = step.aligned_max_query_len
 
-    heads_outer = impl.oproj_heads_outer
-    shape = (
-        (impl.num_heads, query.shape[0], head_size)
-        if heads_outer
-        else (query.shape[0], impl.num_heads, head_size)
-    )
     # zeros, not empty: the per-sequence stores lower to slice_scatter, and with more
     # than one sequence they leave part of the buffer uncovered. Inductor models the
     # uncovered part of an uninitialized buffer as a NaN fill, and the backend cannot
     # store a bare constant ("store value of unexpected type Constant"), so a batch of
     # two or more sequences fails to compile. A zero fill lowers, and where one sequence
     # covers every row the base is dead and drops out.
-    out = torch.zeros(*shape, dtype=query.dtype, device=query.device)
+    out = torch.zeros(
+        impl.num_heads, query.shape[0], head_size, dtype=query.dtype, device=query.device
+    )
     for seq_idx in range(step.num_seqs):
         q_start = step.q_starts[seq_idx]
         q_end = step.q_ends[seq_idx]
@@ -398,19 +277,6 @@ def _traced_attention(impl, step, kernels, query, key, value, k_slots, v_slots):
                 .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
             )
 
-        # This step's K/V for this sequence, laid out like a gathered page and
-        # padded to whole tiles so every tile the kernel sees is block_size wide.
-        kv_rows = step.num_fresh[seq_idx] * block_size
-        fresh_k = []
-        fresh_v = []
-        for src in (key, value):
-            tile = src[q_start:q_end].permute(1, 0, 2).unsqueeze(1)
-            if kv_rows > query_len:
-                tile = torch.nn.functional.pad(tile, (0, 0, 0, kv_rows - query_len))
-            dest = fresh_k if src is key else fresh_v
-            for t in range(step.num_fresh[seq_idx]):
-                dest.append(tile[:, :, t * block_size : (t + 1) * block_size, :])
-
         result = kernels[seq_idx](
             q_dev,
             k_slots,
@@ -418,21 +284,14 @@ def _traced_attention(impl, step, kernels, query, key, value, k_slots, v_slots):
             step.slot_row_tables[seq_idx],
             step.mask_tiles[seq_idx],
             impl.scale,
-            fresh_k=fresh_k,
-            fresh_v=fresh_v,
         )
         # A prefix view copies its whole extent and overruns the destination
         # (torch-spyre#3826), so copy it first.
-        if heads_outer:
-            out[:, q_start:q_end] = (
-                result[:, :query_len].clone() if query_len < padded_query_len else result
-            )
-        elif query_len < padded_query_len:
-            out[q_start:q_end] = result[:query_len].clone()
-        else:
-            out[q_start:q_end] = result
+        out[:, q_start:q_end] = (
+            result[:, :query_len].clone() if query_len < padded_query_len else result
+        )
 
-    return out if heads_outer else _attn_out_barrier(out)
+    return out
 
 
 def _layer_is_fusable(layer) -> bool:
@@ -464,54 +323,16 @@ def fused_step_for(attn_metadata, device) -> FusedAttentionStep | None:
     if len(starts) != md.num_seqs + 1:
         return None
 
-    if md.slot_mapping_device is None:
-        md.slot_mapping_device = convert(md.slot_mapping[: md.num_actual_tokens], device=device)
-
-    register_attn_out_barrier()
-
-    padded_query_len = md.aligned_max_query_len
-    block_size = md.block_size
-    dtype = md.attention_mask_tiles[0][0].dtype
-    seq_lens = md.seq_lens.tolist()
-
-    rows_per_seq = []
-    masks_per_seq = []
-    num_fresh_per_seq = []
-    for s in range(md.num_seqs):
-        query_len = starts[s + 1] - starts[s]
-        context_len = seq_lens[s] - query_len
-        if _FUSE_FRESH_TILES:
-            num_prefix, num_fresh, tiles = _fused_masks_for_seq(
-                context_len, query_len, padded_query_len, block_size, dtype, device
-            )
-            if num_prefix > len(md.page_indices[s]):
-                return None
-            pages = md.page_indices[s][:num_prefix]
-        else:
-            num_fresh = 0
-            pages = md.page_indices[s]
-            if md.attention_mask_tiles_device is None:
-                tiles_cpu = md.attention_mask_tiles
-                assert tiles_cpu is not None, "attention_mask_tiles must be precomputed"
-                md.attention_mask_tiles_device = [
-                    [convert(t, device=device) for t in seq] for seq in tiles_cpu
-                ]
-            tiles = md.attention_mask_tiles_device[s]
-        rows_per_seq.append([slot_rows(p, block_size, device) for p in pages])
-        masks_per_seq.append(tiles)
-        num_fresh_per_seq.append(num_fresh)
-
     step = _fused_step
     step.num_seqs = md.num_seqs
     step.num_actual_tokens = md.num_actual_tokens
-    step.aligned_max_query_len = padded_query_len
-    step.block_size = block_size
+    step.aligned_max_query_len = md.aligned_max_query_len
+    step.block_size = md.block_size
     step.q_starts = tuple(starts[:-1])
     step.q_ends = tuple(starts[1:])
-    step.slot_row_tables = rows_per_seq
-    step.mask_tiles = masks_per_seq
-    step.num_fresh = tuple(num_fresh_per_seq)
-    step.slot_mapping = md.slot_mapping_device
+    step.slot_row_tables = slot_row_tables(md, device)
+    step.mask_tiles = mask_tiles_device(md, device)
+    step.slot_mapping = slot_mapping_device(md, device)
     return step
 
 
@@ -519,48 +340,32 @@ def _patched_attention_forward(orig_forward):
     def forward(self, query, key, value, *args, **kwargs):
         step = getattr(self, _FUSED_STEP_ATTR, None)
         if step is not None and not args and not kwargs:
-            num_heads = self.num_heads
             head_size = self.head_size
-            # Returns what this layer's o_proj consumes: [num_heads, num_tokens,
-            # head_size] where o_proj contracts per head, else [num_tokens,
-            # num_heads * head_size] with the head axis folded by the boundary op.
+            # Returns [num_heads, num_tokens, head_size], which this layer's o_proj
+            # contracts per head.
             return _traced_attention(
                 self.impl,
                 step,
                 getattr(self, _ATTN_KERNELS_ATTR),
-                query.view(-1, num_heads, head_size),
+                query.view(-1, self.num_heads, head_size),
                 key.view(-1, self.num_kv_heads, head_size),
                 value.view(-1, self.num_kv_heads, head_size),
                 getattr(self, _K_SLOTS_ATTR),
                 getattr(self, _V_SLOTS_ATTR),
-            )
-
-        slot_mapping = getattr(self, _SLOT_MAPPING_ATTR, None)
-        if slot_mapping is not None and key is not None and value is not None:
-            num_tokens = slot_mapping.shape[0]
-            getattr(self, _K_SLOTS_ATTR).index_copy_(
-                0,
-                slot_mapping,
-                key.view(-1, self.num_kv_heads, self.head_size)[:num_tokens],
-            )
-            getattr(self, _V_SLOTS_ATTR).index_copy_(
-                0,
-                slot_mapping,
-                value.view(-1, self.num_kv_heads, self.head_size)[:num_tokens],
             )
         return orig_forward(self, query, key, value, *args, **kwargs)
 
     return forward
 
 
-def _oproj_heads_outer_layers(model) -> set[int]:
-    """`id()` of every Attention whose result may reach o_proj heads-outer.
+def _layers_with_per_head_oproj(model) -> set[int]:
+    """`id()` of every Attention whose result reaches an o_proj that contracts per head.
 
     The consumer has to be the sibling ``o_proj`` running the Spyre transposed path,
     whose stored `Wᵀ` is `[num_heads * head_size, out]` — the per-head slices the bmm
     needs are then already its rows. This relies on the model handing attention's
     result straight to ``o_proj``, which is the vLLM idiom; anything that reshapes in
-    between would need the head axis folded and must keep the boundary op.
+    between needs the head axis folded, which only the opaque op does.
     """
     from spyre_inference.custom_ops.linear import SpyreUnquantizedLinearMethod
 
@@ -581,22 +386,23 @@ def _oproj_heads_outer_layers(model) -> set[int]:
     return allowed
 
 
-def install_inline_kv_scatter(static_forward_context, kv_caches, model=None) -> int:
-    """Move the KV scatter into the graph that produces K/V, for layers we can.
+def install_traced_attention(static_forward_context, kv_caches, model=None) -> int:
+    """Trace attention into the graph of the block that produces K/V, where we can.
 
-    Attaches the flattened slot-major views of each layer's pages, then wraps
-    ``Attention.forward`` so it scatters before delegating. Layers left without
-    the views fall back to ``SpyreAttentionImpl._reshape_and_cache``.
+    Attaches the flattened slot-major view of each servable layer's pages, then wraps
+    ``Attention.forward`` so it runs the attention body inline instead of delegating
+    to the opaque op. Layers left out — ALiBi, KV sharing, or an o_proj that cannot
+    contract per head — keep ``SpyreAttentionImpl.forward``.
 
     Returns the number of layers wired up.
     """
-    global _inline_scatter_installed
+    global _traced_attention_installed
 
-    _wired_layers.clear()
+    per_head_oproj = _layers_with_per_head_oproj(model)
     _fusable_layers.clear()
     for layer_name, cache in kv_caches.items():
         layer = static_forward_context.get(layer_name)
-        if layer is None:
+        if layer is None or not _layer_is_fusable(layer) or id(layer) not in per_head_oproj:
             continue
         # A view keeps the slot-outermost device layout; taken here rather than in
         # the traced graph, where an in-graph view of the 4D pages makes inductor
@@ -604,44 +410,60 @@ def install_inline_kv_scatter(static_forward_context, kv_caches, model=None) -> 
         slots = (-1, cache.k_pages.shape[2], cache.k_pages.shape[3])
         setattr(layer, _K_SLOTS_ATTR, cache.k_pages.view(slots))
         setattr(layer, _V_SLOTS_ATTR, cache.v_pages.view(slots))
-        _wired_layers[layer_name] = layer
-        if _layer_is_fusable(layer):
-            _fusable_layers[layer_name] = layer
+        _fusable_layers[layer_name] = layer
 
-    if _OPROJ_HEADS_OUTER:
-        allowed = _oproj_heads_outer_layers(model)
-        for layer in _fusable_layers.values():
-            layer.impl.oproj_heads_outer = id(layer) in allowed
-
-    if _wired_layers and not _inline_scatter_installed:
+    if _fusable_layers and not _traced_attention_installed:
         Attention.forward = _patched_attention_forward(  # ty: ignore[invalid-assignment]
             Attention.forward
         )
-        _inline_scatter_installed = True
-    return len(_wired_layers)
+        _traced_attention_installed = True
+    return len(_fusable_layers)
 
 
-def build_slot_row_tables(attn_metadata, device) -> list[list[torch.Tensor]]:
+# --- Per-step device mirrors -------------------------------------------------
+#
+# vLLM hands the metadata to us on the host. Each mirror is built by whichever
+# path reaches it first and cached on the metadata, so only the first layer of a
+# step pays for it. The traced body cannot build them itself.
+
+
+def slot_row_tables(attn_metadata, device) -> list[list[torch.Tensor]]:
     """Slot-index tensors for every active block of every sequence."""
-    page_indices = attn_metadata.page_indices
-    assert page_indices is not None, "page_indices must be set by the metadata builder"
-    block_size = attn_metadata.block_size
-    return [[slot_rows(p, block_size, device) for p in seq] for seq in page_indices]
+    if attn_metadata.slot_row_tables is None:
+        page_indices = attn_metadata.page_indices
+        assert page_indices is not None, "page_indices must be set by the metadata builder"
+        block_size = attn_metadata.block_size
+        attn_metadata.slot_row_tables = [
+            [slot_rows(p, block_size, device) for p in seq] for seq in page_indices
+        ]
+    return attn_metadata.slot_row_tables
 
 
-def wired_kv_scatter_layers() -> dict[str, Attention]:
-    """Layers whose KV write the traced scatter can take over."""
-    return _wired_layers
+def mask_tiles_device(attn_metadata, device) -> list[list[torch.Tensor]]:
+    """Device mirror of the pre-tiled additive attention mask."""
+    if attn_metadata.attention_mask_tiles_device is None:
+        tiles_cpu = attn_metadata.attention_mask_tiles
+        assert tiles_cpu is not None, (
+            "attention_mask_tiles must be precomputed by the metadata builder"
+        )
+        attn_metadata.attention_mask_tiles_device = [
+            [convert(t, device=device) for t in seq_tiles] for seq_tiles in tiles_cpu
+        ]
+    return attn_metadata.attention_mask_tiles_device
+
+
+def slot_mapping_device(attn_metadata, device) -> torch.Tensor:
+    """Device mirror of this step's token-to-slot mapping."""
+    if attn_metadata.slot_mapping_device is None:
+        attn_metadata.slot_mapping_device = convert(
+            attn_metadata.slot_mapping[: attn_metadata.num_actual_tokens], device=device
+        )
+    return attn_metadata.slot_mapping_device
 
 
 def fusable_attention_layers() -> dict[str, Attention]:
     """Layers the traced attention path can serve."""
     return _fusable_layers
-
-
-def heads_outer_attention_layers() -> list[str]:
-    """Layers handing their result to o_proj with the head axis outermost."""
-    return [n for n, layer in _fusable_layers.items() if layer.impl.oproj_heads_outer]
 
 
 def step_kernels(impl, step) -> tuple:
@@ -651,9 +473,7 @@ def step_kernels(impl, step) -> tuple:
     is tracing would put a function definition in the middle of the graph.
     """
     return tuple(
-        impl.traced_attn_fn(
-            len(step.slot_row_tables[s]), step.aligned_max_query_len, step.num_fresh[s]
-        )
+        impl.traced_attn_fn(len(step.slot_row_tables[s]), step.aligned_max_query_len)
         for s in range(step.num_seqs)
     )
 
@@ -664,7 +484,7 @@ def publish_fused_attention(step_by_layer) -> None:
     Values are (step, kernels) pairs. A context left from an earlier step would be
     applied to this step's K/V with the wrong token count and slot mapping.
     """
-    for layer_name, layer in _wired_layers.items():
+    for layer_name, layer in _fusable_layers.items():
         armed = step_by_layer.get(layer_name)
         if armed is None:
             if hasattr(layer, _FUSED_STEP_ATTR):
@@ -673,23 +493,6 @@ def publish_fused_attention(step_by_layer) -> None:
         step, kernels = armed
         setattr(layer, _FUSED_STEP_ATTR, step)
         setattr(layer, _ATTN_KERNELS_ATTR, kernels)
-
-
-def publish_slot_mapping(slot_mapping_by_layer) -> None:
-    """Hand this step's device slot mappings to the traced scatter.
-
-    Every wired layer is visited, every step: a mapping left over from another
-    step would be applied to this step's K/V, and it is the wrong length as soon
-    as the token count changes — an out-of-bounds device write, not an error. Any
-    layer absent from ``slot_mapping_by_layer`` falls back to the impl's scatter.
-    """
-    for layer_name, layer in _wired_layers.items():
-        slot_mapping = slot_mapping_by_layer.get(layer_name)
-        if slot_mapping is None:
-            if hasattr(layer, _SLOT_MAPPING_ATTR):
-                delattr(layer, _SLOT_MAPPING_ATTR)
-        else:
-            setattr(layer, _SLOT_MAPPING_ATTR, slot_mapping)
 
 
 # ---------------------------------------------------------------------------
@@ -704,25 +507,16 @@ def _create_compilable_page_attn(
     head_size: int,
     has_alibi: bool = False,
     logits_soft_cap: float = 0.0,
-    fused_store: bool = False,
-    num_fresh: int = 0,
     heads_outer: bool = False,
 ):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
     Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi,
-    logits_soft_cap, fused_store and num_fresh are closure constants.
+    logits_soft_cap and heads_outer are closure constants.
 
-    ``num_fresh`` appends tiles the caller passes in directly rather than gathering
-    them from the cache — this step's own K/V, still in registers. The traced path
-    uses it so attention never reads the slots the same graph is writing: Inductor
-    defers a graph input's mutation, so a gather of those slots can run before the
-    scatter lands. Pages then only have to cover the context, and the mask tiles
-    for them stop at its end.
-
-    With ``fused_store``, the kernel scatters its result into the caller's output
-    buffer instead of returning it, so the store lands in the same jobplan rather
-    than costing an extra eager dispatch and launch per layer.
+    ``heads_outer`` stops the epilogue at [num_heads, padded_query_len, head_size]
+    for the traced path, whose o_proj contracts each head separately. The opaque op
+    needs the token axis outermost to fill vLLM's output buffer.
     """
 
     def specialized_paged_attn_kernel(
@@ -733,9 +527,6 @@ def _create_compilable_page_attn(
         mask_tiles,
         scale,
         alibi_bias_tiles=None,
-        out=None,
-        fresh_k=None,
-        fresh_v=None,
     ):
         """
         This kernels specializes for num_blocks and padded_query_len.
@@ -746,38 +537,27 @@ def _create_compilable_page_attn(
             v_slots: [num_blocks_total * block_size, num_kv_heads, head_size]
             slot_rows_per_block: one [block_size] int32 device tensor per active
                 block, holding that page's slot indices.
-            mask_tiles: [num_blocks + num_fresh]
-            fresh_k, fresh_v: only with num_fresh — one
-                [num_kv_heads, 1, width, head_size] tile each, this step's own K/V
+            mask_tiles: one [padded_query_len, block_size] tile per active block.
             alibi_bias_tiles: list of [num_kv_heads, num_queries_per_kv, 1, block_size]
                 (only when has_alibi=True; None otherwise). The query-axis dim
                 is 1 because softmax absorbs per-query-row constants — see
                 the derivation at the bias-tile construction site in
                 _online_softmax_attention.
-            out: only with fused_store — the caller's output buffer, which this
-                sequence owns in full ([padded_query_len, num_heads, head_size]).
 
-        Returns [padded_query_len, num_heads, head_size], or ``out`` when
-        fused_store scattered the result in place. With ``heads_outer``, returns
-        [num_heads, padded_query_len, head_size] instead.
+        Returns [padded_query_len, num_heads, head_size], or
+        [num_heads, padded_query_len, head_size] with ``heads_outer``.
         """
-        assert not (heads_outer and fused_store), "heads_outer has no fused_store form"
         tile_max = None
         tile_sum = None
         tile_output = None
 
-        for i in range(num_blocks + num_fresh):
-            if i < num_blocks:
-                # index_select, not `k_slots[rows]`: subscripting lowers to
-                # aten.index, which upcasts the int32 index to int64 and fails eager.
-                rows = slot_rows_per_block[i]
-                # Token-major page to head-major for the matmuls; permutes on device.
-                k_page_4d = k_slots.index_select(0, rows).permute(1, 0, 2).unsqueeze(1)
-                v_page_4d = v_slots.index_select(0, rows).permute(1, 0, 2).unsqueeze(1)
-            else:
-                assert fresh_k is not None and fresh_v is not None
-                k_page_4d = fresh_k[i - num_blocks]
-                v_page_4d = fresh_v[i - num_blocks]
+        for i in range(num_blocks):
+            # index_select, not `k_slots[rows]`: subscripting lowers to
+            # aten.index, which upcasts the int32 index to int64 and fails eager.
+            rows = slot_rows_per_block[i]
+            # Token-major page to head-major for the matmuls; permutes on device.
+            k_page_4d = k_slots.index_select(0, rows).permute(1, 0, 2).unsqueeze(1)
+            v_page_4d = v_slots.index_select(0, rows).permute(1, 0, 2).unsqueeze(1)
 
             mask_tile = mask_tiles[i]
 
@@ -824,16 +604,7 @@ def _create_compilable_page_attn(
             # padded_query_len, head_size], and the first two multiply to num_heads.
             return attn.reshape(num_heads, padded_query_len, head_size)
         attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
-        attn = attn.reshape(padded_query_len, num_heads, head_size)
-        if fused_store:
-            # A full copy, not an indirect store: a compiled index_copy_ writes
-            # nothing at all when the destination has a single row, which is every
-            # batch-1 decode. The caller only enables fused_store when this
-            # sequence owns every row of `out`, so the shapes match exactly.
-            assert out is not None
-            out.copy_(attn)
-            return out
-        return attn
+        return attn.reshape(padded_query_len, num_heads, head_size)
 
     return specialized_paged_attn_kernel
 
@@ -915,18 +686,17 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # Physical page index of each active block, per sequence.
     page_indices: list[list[int]] | None = None
 
-    # Device slot indices for those pages, one [block_size] int32 tensor per
+    # Per-step device mirrors, each filled on first use by whichever path reaches
+    # it first; see the mirror helpers above.
+    #
+    # Device slot indices for the pages above, one [block_size] int32 tensor per
     # active block. Taken from the process-wide cache on first use.
     slot_row_tables: list[list[torch.Tensor]] | None = None
 
     # Device mirror of slot_mapping, which vLLM hands us on the host.
     slot_mapping_device: torch.Tensor | None = None
 
-    # True once the traced scatter in Attention.forward has taken over the KV write
-    # for this step, so forward() must not do it again. See install_inline_kv_scatter.
-    inline_kv_scatter: bool = False
-
-    # Device mirror of attention_mask_tiles, filled once per step by forward().
+    # Device mirror of attention_mask_tiles.
     attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
 
     @property
@@ -1445,25 +1215,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # back to CPU with an int64 one.
         self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
 
-        # Compiled attention loops, keyed by (num_blocks, padded_query_len, fused_store)
-        self._attn_fns: dict[tuple[int, int, bool], object] = {}
+        # Compiled attention loops, keyed by (num_blocks, padded_query_len).
+        self._attn_fns: dict[tuple[int, int], object] = {}
 
         # Same loops for the traced path, left uncompiled: they are traced into
         # the block's graph, and a nested torch.compile there buys nothing.
-        self._traced_attn_fns: dict[tuple[int, int, int], object] = {}
-
-        # Set at wiring time, once the consuming o_proj is known to accept the head
-        # axis outermost (see ``install_inline_kv_scatter``).
-        self.oproj_heads_outer = False
+        self._traced_attn_fns: dict[tuple[int, int], object] = {}
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
         )
 
-    def _get_attn_fn(self, num_blocks: int, padded_query_len: int, fused_store: bool = False):
+    def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
         # self.alibi_slopes and self.logits_soft_cap are fixed per instance, so
         # has_alibi and logits_soft_cap don't need to be part of the cache key.
-        key = (num_blocks, padded_query_len, fused_store)
+        key = (num_blocks, padded_query_len)
         if key not in self._attn_fns:
             self._attn_fns[key] = _maybe_compile(
                 _create_compilable_page_attn(
@@ -1473,13 +1239,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     self.head_size,
                     has_alibi=self.alibi_slopes is not None,
                     logits_soft_cap=self.logits_soft_cap,
-                    fused_store=fused_store,
                 )
             )
         return self._attn_fns[key]
 
-    def traced_attn_fn(self, num_blocks: int, padded_query_len: int, num_fresh: int):
-        key = (num_blocks, padded_query_len, num_fresh)
+    def traced_attn_fn(self, num_blocks: int, padded_query_len: int):
+        """Same loop as ``_get_attn_fn``, stopping at the head-outermost shape."""
+        key = (num_blocks, padded_query_len)
         fn = self._traced_attn_fns.get(key)
         if fn is None:
             fn = _create_compilable_page_attn(
@@ -1488,8 +1254,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 self.num_heads,
                 self.head_size,
                 logits_soft_cap=self.logits_soft_cap,
-                num_fresh=num_fresh,
-                heads_outer=self.oproj_heads_outer,
+                heads_outer=True,
             )
             self._traced_attn_fns[key] = fn
         return fn
@@ -1519,33 +1284,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         _target_device = k_pages.device
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Only the first layer of a step pays for the device mirror.
-        if attn_metadata.slot_row_tables is None:
-            attn_metadata.slot_row_tables = build_slot_row_tables(attn_metadata, _target_device)
-        if attn_metadata.slot_mapping_device is None:
-            attn_metadata.slot_mapping_device = convert(
-                attn_metadata.slot_mapping[:num_actual_tokens], device=_target_device
-            )
-        if attn_metadata.attention_mask_tiles_device is None:
-            tiles_cpu = attn_metadata.attention_mask_tiles
-            assert tiles_cpu is not None, (
-                "attention_mask_tiles must be precomputed by the metadata builder"
-            )
-            attn_metadata.attention_mask_tiles_device = [
-                [convert(t, device=_target_device) for t in seq_tiles] for seq_tiles in tiles_cpu
-            ]
+        # Only the first layer of a step pays for the device mirrors.
+        slot_row_tables(attn_metadata, _target_device)
+        mask_tiles_device(attn_metadata, _target_device)
 
-        # Step 1: Reshape and cache — scatter new tokens into their slots, unless the
-        # traced scatter in Attention.forward already folded it into the graph that
-        # produced K/V (see install_inline_kv_scatter).
-        if not attn_metadata.inline_kv_scatter:
-            self._reshape_and_cache(
-                key[:num_actual_tokens],
-                value[:num_actual_tokens],
-                k_pages,
-                v_pages,
-                attn_metadata.slot_mapping_device,
-            )
+        # Step 1: Reshape and cache — scatter new tokens into their slots.
+        self._reshape_and_cache(
+            key[:num_actual_tokens],
+            value[:num_actual_tokens],
+            k_pages,
+            v_pages,
+            slot_mapping_device(attn_metadata, _target_device),
+        )
 
         # Step 2: Online softmax attention over pages (varlen). The kernel reads
         # the flat slot-major view, the same tensor the scatter writes.
@@ -1623,23 +1373,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         mask_tiles_all = attn_metadata.attention_mask_tiles_device
         active_block_indices_all = attn_metadata.active_block_indices
         aligned_max_query_len = attn_metadata.aligned_max_query_len
-        slot_row_tables = attn_metadata.slot_row_tables
-        # The kernel can store into `output` itself only when this step's single
-        # sequence owns every row of it, so the store is a plain copy of matching
-        # shape. A compiled kernel also reads its arguments from offset 0
-        # (torch-spyre#3770), and vLLM hands out a fresh buffer per layer, so the
-        # buffer is re-checked every call.
-        fused_store_ok = (
-            num_seqs == 1
-            and aligned_max_query_len == attn_metadata.max_query_len
-            and output.shape[0] == aligned_max_query_len
-            and output.storage_offset() == 0
-            and output.is_contiguous()
-        )
+        slot_rows_all = attn_metadata.slot_row_tables
         assert mask_tiles_all is not None, (
             "attention_mask_tiles_device must be mirrored by forward()"
         )
-        assert slot_row_tables is not None, "slot_row_tables must be filled by forward()"
+        assert slot_rows_all is not None, "slot_row_tables must be filled by forward()"
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
@@ -1692,7 +1430,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 output[q_start:q_end] = 0.0
                 continue
 
-            rows_per_block = slot_row_tables[seq_idx]
+            rows_per_block = slot_rows_all[seq_idx]
             # mask_tiles_all[seq_idx] is indexed by position within active_bs.
             mask_tiles = mask_tiles_all[seq_idx][: len(active_bs)]
 
@@ -1725,12 +1463,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     bias = self.alibi_slopes * rel
                     alibi_bias_tiles.append(convert(bias, device=_target_device))
 
-            # Run attention on target device. When the kernel can scatter straight
-            # into `output`, the store joins its jobplan instead of costing a
-            # separate eager dispatch and launch per layer.
-            attn_fn = self._get_attn_fn(
-                len(active_bs), aligned_max_query_len, fused_store=fused_store_ok
-            )
+            # Run attention on target device.
+            attn_fn = self._get_attn_fn(len(active_bs), aligned_max_query_len)
             result = attn_fn(
                 q_dev,
                 k_slots,
@@ -1739,12 +1473,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 mask_tiles,
                 self.scale,
                 alibi_bias_tiles=alibi_bias_tiles,
-                out=output if fused_store_ok else None,
             )
 
             assert result.dtype == output.dtype
-            if fused_store_ok:
-                continue
             if query_len < aligned_max_query_len:
                 # Writing a prefix view copies its whole extent and overruns the
                 # destination (torch-spyre#3826), so copy it first.

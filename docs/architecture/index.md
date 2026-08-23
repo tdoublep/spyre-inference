@@ -105,16 +105,15 @@ one block however deep the model is, and a new shape (a fresh `KV_LENGTH_ALIGNME
 costs one block recompile rather than a whole-model one. Heterogeneous stacks specialize
 per variant — Gemma 3 alternates sliding-window and full attention, giving two artifacts.
 
-Attention is a hole in that graph by default, and `SPYRE_FUSE_ATTN=1` fills it. vLLM routes
-attention through `torch.ops.vllm.unified_attention_with_output`, which Dynamo cannot trace
-into, so a block compiles as prologue / attention / epilogue. `Attention.forward` is traced
-Python, so the backend can replace its body (see `_patched_attention_forward`) and put the
-scatter, page loop and softmax in the block's graph instead.
+Attention is a hole in that graph, and the backend fills it. vLLM routes attention through
+`torch.ops.vllm.unified_attention_with_output`, which Dynamo cannot trace into, so a block
+compiles as prologue / attention / epilogue. `Attention.forward` is traced Python, so the
+backend replaces its body (see `_patched_attention_forward`) and puts the scatter, page loop
+and softmax in the block's graph instead — one graph per block, with the KV write inside it.
 
-It pays when attention hands its result to `o_proj` with the head axis still outermost:
+It pays because attention hands its result to `o_proj` with the head axis still outermost:
 granite-3.3-8b, 64 in / 64 out, batch 1, 148.1 ms/token against 154.8 ms/token through the
-opaque op, identical tokens. `SPYRE_ATTN_HEADS_OUTER=0` restores the boundary op instead,
-which measured 157.1 ms/token — slower than not fusing at all.
+opaque op, identical tokens.
 
 What the backend rejects is not the fusion of attention's epilogue into `o_proj`'s matmul (a
 pointwise epilogue fuses fine) but **collapsing a multi-axis value into the matmul's reduction
@@ -126,10 +125,7 @@ choice, not a barrier: keep the head axis outermost and let `o_proj` contract ea
 its own slice of `Wᵀ`, summing over heads (`spyre_linear_t`). `Wᵀ` is stored `[in, out]`
 contiguous, so those slices are already its rows and the split costs nothing.
 
-It stays off by default because the traced path is still wrong for batches of more than one
-sequence — see below.
-
-Four properties of the lowering constrain it:
+Three properties of the lowering constrain it:
 
 - The scatter and the page gathers go through the **same** tensor, the flat slot-major
   view. Given the 4D pages and a 3D view of them as two graph inputs, Inductor sees no
@@ -138,30 +134,24 @@ Four properties of the lowering constrain it:
 - Each page's slot indices arrive as their **own** 1D tensor (`slot_rows`, cached per page
   for the process). Slicing an index row out of a 2D table inside the graph compiles but
   returns corrupted rows.
-- Layers whose result does not reach a Spyre `o_proj` unreshaped keep the opaque op
-  (`vllm::spyre_attn_out`), which folds the head axis on the host. Every in-graph
-  materialization is undone by functionalization, which rewrites a store-then-read of one
-  buffer back into the value, so that boundary has to be an op Inductor cannot see through.
-  It returns a **clone**: a custom op must not return an alias of its input, which Inductor
-  miscompiles.
 - Multi-sequence batches are **not correct yet**. The per-sequence stores lower to
   `slice_scatter`, and with two or more sequences part of the output buffer is uncovered;
   from `torch.empty` that base is a NaN fill the backend cannot store, so the program used
   not to compile at all. `torch.zeros` compiles, but the tokens then come out shifted by one
   position, which is a bug in the traced body itself and not in the o_proj lowering (the two
   lowerings agree to 2e-6 in exact arithmetic, assembly included).
-- That same op folds the head axis into hidden. Under Spyre's stick layouts a flat hidden
-  index splits into two `Mod` expressions the coordinate mapper rejects (`variable d2
-  (range 4096) appears in multiple Mod expressions`); eagerly it is just a retile, which is
-  how the untraced path has always done it.
 
 Per-step values reach the traced body through one `FusedAttentionStep` mutated in place and
-shared by every layer, published by `_arm_inline_kv_scatter` outside any graph — a traced
+shared by every layer, published by `_arm_traced_attention` outside any graph — a traced
 body cannot mirror anything to device itself. Dynamo lifts its tensors to graph inputs
 guarded on metadata and bakes its ints as constants, so a block recompiles when a shape or
-a page count changes, not every step. Layers the traced path cannot serve — ALiBi, KV
-sharing, quantised query, encoder attention — plus sliding-window steps and eager mode fall
-back to the opaque op.
+a page count changes, not every step.
+
+`install_traced_attention` wires only the layers this can serve. Layers left out — ALiBi, KV
+sharing, quantised query, encoder attention, or an `o_proj` that cannot contract per head
+because the model reshapes in between — keep the opaque op and scatter their own K/V in
+`SpyreAttentionImpl.forward`, as do sliding-window steps and eager mode. The two are
+independent per layer: whichever path runs does that layer's KV write.
 
 Embeddings and the final norm sit outside the block list and stay eager. `lm_head` was
 never in the compiled region; `compute_logits` is a separate call on the wrapper.
