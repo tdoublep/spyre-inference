@@ -23,6 +23,7 @@ import os
 import torch
 
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.attention import attn_layer
 
 from vllm.config import CompilationMode, VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
@@ -45,10 +46,6 @@ logger = init_logger(__name__)
 # When set, wraps forward() and _online_softmax_attention()
 # in torch.profiler.record_function spans for kineto trace capture.
 _ATTN_PROFILING = os.environ.get("SPYRE_ATTN_PROFILING", "0") == "1"
-
-# 0 restores the previous path, where the KV scatter ran as its own compiled graph
-# launched from inside the opaque attention op.
-KV_WRITE_IN_GRAPH = os.environ.get("SPYRE_KV_WRITE_IN_GRAPH", "1") == "1"
 
 
 def _record_function(name: str):
@@ -325,9 +322,6 @@ class SpyreAttentionMetadata(AttentionMetadata):
     page_index_table_cpu: torch.Tensor | None = None
     page_index_tables: list[torch.Tensor] | None = None
 
-    # Device mirror of slot_mapping, which vLLM hands us on the host.
-    slot_mapping_device: torch.Tensor | None = None
-
     # Device mirror of attention_mask_tiles, filled once per step by forward().
     attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
 
@@ -386,6 +380,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         static_ctx = vllm_config.compilation_config.static_forward_context
         self._kv_layers = [static_ctx[name] for name in layer_names if name in static_ctx]
         self._slots_device: torch.device | None = None
+        self._slot_mapping = attn_layer.install(self._kv_layers)
 
     def _get_zero_tile(self, aligned_max_query_len: int) -> torch.Tensor:
         """Return (or create) the shared all-zero mask tile for interior blocks.
@@ -619,15 +614,19 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         return active_bs, tiles
 
     def _publish_slot_mapping(self, slot_mapping: torch.Tensor, num_actual_tokens: int) -> None:
-        """Mirror this step's slot mapping to device as a plain attribute, so no
+        """Mirror this step's slot mapping to device on the shared holder, so no
         transfer is traced into the per-block graph."""
         if not self._kv_layers:
             return
         if self._slots_device is None:
             self._slots_device = self._kv_layers[0].kv_cache[0].device
-        slots = convert(slot_mapping[:num_actual_tokens], device=self._slots_device)
-        for layer in self._kv_layers:
-            layer.spyre_slot_mapping = slots
+            # Must exist before tracing; see SpyreAttentionImpl.kv_slot_views.
+            for layer in self._kv_layers:
+                if hasattr(layer.impl, "kv_slot_views"):
+                    layer.impl.kv_slot_views(layer.kv_cache)
+        self._slot_mapping.slots = convert(
+            slot_mapping[:num_actual_tokens], device=self._slots_device
+        )
 
     def build(
         self,
@@ -729,8 +728,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             blocks_s = slice(n) if active_block_indices is None else active_block_indices[s]
             page_index_table_cpu[s, :n, 0] = block_table[s, blocks_s]
 
-        if KV_WRITE_IN_GRAPH:
-            self._publish_slot_mapping(slot_mapping, common_attn_metadata.num_actual_tokens)
+        self._publish_slot_mapping(slot_mapping, common_attn_metadata.num_actual_tokens)
 
         return SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
@@ -757,8 +755,9 @@ class SpyreAttentionBackend(AttentionBackend):
     """Paged KV-cache attention backend for Spyre."""
 
     accept_output_buffer: bool = True
-    # False tells upstream the attention op does not write KV; attn_layer.py does.
-    forward_includes_kv_cache_update: bool = not KV_WRITE_IN_GRAPH
+    # False tells upstream the attention op does not write KV; attn_layer.py does, and
+    # upstream inserts its own unified_kv_cache_update for layers attn_layer declines.
+    forward_includes_kv_cache_update: bool = False
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
     ]
@@ -946,23 +945,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 [convert(t, device=_target_device) for t in seq_tiles] for seq_tiles in tiles_cpu
             ]
 
-        # Step 1: Reshape and cache — scatter new tokens into their slots
-        if not KV_WRITE_IN_GRAPH:
-            slot_mapping = attn_metadata.slot_mapping_device
-            if slot_mapping is None:
-                slot_mapping = convert(
-                    attn_metadata.slot_mapping[:num_actual_tokens], device=_target_device
-                )
-                attn_metadata.slot_mapping_device = slot_mapping
-            self.do_kv_cache_update(
-                layer,
-                key[:num_actual_tokens],
-                value[:num_actual_tokens],
-                kv_cache,
-                slot_mapping,
-            )
-
-        # Step 2: Online softmax attention over pages (varlen)
+        # The KV write is not here: attn_layer.py traces it for the layers it splits,
+        # and upstream's own unified_kv_cache_update op covers the rest.
         output = self._online_softmax_attention(
             query[:num_actual_tokens],
             k_pages,
@@ -1005,13 +989,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
 
         k_slots, v_slots = self.kv_slot_views(kv_cache)
-        if torch.compiler.is_compiling():
-            k_slots.index_copy_(0, slot_mapping, key)
-            v_slots.index_copy_(0, slot_mapping, value)
-        else:
-            # Eager index_copy_ rejects an int32 index and silently falls back to CPU
-            # with an int64 one, so the eager path needs its own compiled artifact.
-            self._reshape_fn(key, value, k_slots, v_slots, slot_mapping)
+        # Eager index_copy_ rejects an int32 index and silently falls back to CPU with an
+        # int64 one, so this always goes through the compiled artifact; inside the outer
+        # graph dynamo inlines it rather than launching a second region.
+        self._reshape_fn(key, value, k_slots, v_slots, slot_mapping)
         return k_slots
 
     @_record_function("spyre_attn::online_softmax")
