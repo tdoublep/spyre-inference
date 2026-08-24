@@ -20,10 +20,9 @@ which is all-or-nothing. The online-softmax core must stay opaque: its per-seque
 Python loop cannot be captured with ``fullgraph=True``.
 """
 
-from typing import cast
+from collections.abc import Iterable
 
 import torch
-from torch import nn
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
@@ -34,6 +33,15 @@ logger = init_logger(__name__)
 _original_forward = Attention.forward
 
 
+class SlotMapping:
+    """This step's slot mapping, shared by every split layer so a step publishes once."""
+
+    __slots__ = ("slots",)
+
+    def __init__(self) -> None:
+        self.slots: torch.Tensor | None = None
+
+
 def _spyre_attention_forward(
     self: Attention,
     query: torch.Tensor,
@@ -42,7 +50,9 @@ def _spyre_attention_forward(
     output_shape: torch.Size | None = None,
     output_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
-    if not self.spyre_kv_write_in_graph:
+    # forward is patched on the class, so layers install() never saw (a different kv-cache
+    # group, encoder-only attention) must fall back rather than trip over the attribute.
+    if not getattr(self, "spyre_kv_write_in_graph", False):
         return _original_forward(self, query, key, value, output_shape, output_dtype)
 
     if output_dtype is None:
@@ -61,7 +71,7 @@ def _spyre_attention_forward(
     # "scatter before read" a real data dependency, which is otherwise invisible
     # because the op reaches its cache through the forward context.
     # No slot mapping: warmup and profile runs have no attention metadata.
-    slots = cast(torch.Tensor | None, self.spyre_slot_mapping)
+    slots = self.spyre_slots.slots
     dep = None
     if slots is not None:
         num_kv_tokens = slots.shape[0]
@@ -94,17 +104,22 @@ def _can_split(layer: Attention) -> bool:
     )
 
 
-def install(model: nn.Module, enabled: bool) -> int:
-    """Opt eligible Spyre attention layers into the traced KV write; returns how many."""
+def install(layers: Iterable[Attention]) -> SlotMapping:
+    """Opt eligible layers into the traced KV write; returns their shared slot holder."""
     if Attention.forward is not _spyre_attention_forward:
         Attention.forward = _spyre_attention_forward  # ty: ignore[invalid-assignment]
 
+    slot_mapping = SlotMapping()
     num_split = 0
-    for module in model.modules():
-        if not isinstance(module, Attention):
-            continue
-        split = enabled and _can_split(module)
-        module.spyre_kv_write_in_graph = split
-        module.spyre_slot_mapping = None
+    for layer in layers:
+        split = _can_split(layer)
+        layer.spyre_kv_write_in_graph = split
+        layer.spyre_slots = slot_mapping
         num_split += split
-    return num_split
+
+    if num_split:
+        logger.info(
+            "Scattering the KV cache inside the outer graph for %d attention layers.",
+            num_split,
+        )
+    return slot_mapping
