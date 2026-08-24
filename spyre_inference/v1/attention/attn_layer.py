@@ -21,6 +21,7 @@ Python loop cannot be captured with ``fullgraph=True``.
 """
 
 from collections.abc import Iterable
+from typing import cast
 
 import torch
 
@@ -72,7 +73,8 @@ def _spyre_attention_forward(
     # "scatter before read" a real data dependency, which is otherwise invisible
     # because the op reaches its cache through the forward context.
     # No slot mapping: warmup and profile runs have no attention metadata.
-    slots = self.spyre_slots.slots
+    # Cast: install() sets this on the Module, so it resolves via Module.__getattr__.
+    slots = cast(SlotMapping, self.spyre_slots).slots
     dep = None
     if slots is not None:
         num_kv_tokens = slots.shape[0]
