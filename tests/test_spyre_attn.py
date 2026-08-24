@@ -1360,8 +1360,8 @@ def test_kv_cache_update_traced_by_caller(default_vllm_config, configure_device:
         k_expected[slot // block_size][slot % block_size] = key[t]
         v_expected[slot // block_size][slot % block_size] = value[t]
 
-    k_actual = _to_cache_device(fresh_pages(), cache_device)
-    v_actual = _to_cache_device(fresh_pages(), cache_device)
+    k_actual = fresh_pages().to(cache_device)
+    v_actual = fresh_pages().to(cache_device)
 
     attn_impl = SpyreAttentionImpl(
         num_heads=num_kv_heads,
