@@ -45,7 +45,7 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
             )
 
     def _apply(self, fn, recurse=True):
-        # Wrapping fn keeps this to one transfer; super() still does the Parameter swap.
+        # `weight.data = <spyre tensor>` is rejected across backends, so super() does the swap.
         weight = self._parameters.get("weight")
 
         def place(tensor: torch.Tensor) -> torch.Tensor:
