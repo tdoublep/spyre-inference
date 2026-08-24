@@ -641,6 +641,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         if not self._kv_layers:
             return
         if self._slots_device is None:
+            # Encoder-only groups reach this builder too (SpyreEncoderAttentionBackend
+            # inherits it) and never get a cache bound: `Attention.kv_cache` keeps its
+            # `torch.tensor([])` default, so indexing it raises. Nothing to publish for
+            # them, and clearing the layer list makes that decision once per builder.
+            self._kv_layers = [layer for layer in self._kv_layers if len(layer.kv_cache) > 0]
+            if not self._kv_layers:
+                return
             self._slots_device = self._kv_layers[0].kv_cache[0].device
             # Must exist before tracing; see SpyreAttentionImpl.kv_slot_views.
             for layer in self._kv_layers:
