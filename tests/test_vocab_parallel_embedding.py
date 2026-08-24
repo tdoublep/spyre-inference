@@ -248,3 +248,125 @@ def test_lm_head_weight_not_relaid_out(tp_group):
     )
 
     assert not issubclass(SpyreParallelLMHead, SpyreVocabParallelEmbedding)
+
+
+@pytest.mark.vocab_parallel_embedding
+def test_vocab_table_crosses_to_device_once(tp_group):
+    """The table must not be moved by super()._apply and then re-moved with the gather
+    layout. Only the one-row probe is handed to fn; the table itself is placed directly."""
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    vocab_size, embedding_dim = 1024, 128
+    layer = VocabParallelEmbedding(vocab_size, embedding_dim, params_dtype=torch.float16)
+
+    moved = []
+
+    def fn(tensor):
+        moved.append(tuple(tensor.shape))
+        return tensor.to("spyre")
+
+    layer._apply(fn)
+
+    assert moved == [(1, embedding_dim)], (
+        f"expected only the one-row probe to go through fn, got {moved}"
+    )
+
+
+@pytest.mark.vocab_parallel_embedding
+def test_unaligned_row_width_keeps_default_device_layout(tp_group, monkeypatch):
+    """A row width that is not a whole number of sticks cannot be expressed in the
+    gather layout. The table still lands on device and still gathers correctly -- only
+    the speedup is lost -- and a warning names the table so it is not lost silently."""
+    from torch_spyre._C import get_elem_in_stick, get_spyre_tensor_layout
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    from spyre_inference.custom_ops import utils
+
+    vocab_size, embedding_dim = 256, 96
+    assert embedding_dim % get_elem_in_stick(torch.float16), "dim must be stick-unaligned"
+
+    torch.manual_seed(7)
+    layer = VocabParallelEmbedding(vocab_size, embedding_dim, params_dtype=torch.float16)
+    layer.weight.data.normal_(std=0.02)
+
+    input_ids = torch.randint(0, vocab_size, (8,), dtype=torch.int64)
+    expected = F.embedding(input_ids, layer.weight)
+
+    warned: list[str] = []
+    monkeypatch.setattr(utils.logger, "warning_once", lambda msg, *a: warned.append(msg % a))
+
+    layer = layer.to("spyre")
+
+    assert layer.weight.device.type == "spyre", "the table must still move to device"
+    device_size = list(get_spyre_tensor_layout(layer.weight.data).device_size)
+    assert device_size[0] != vocab_size, (
+        f"unaligned rows cannot be outermost, got device_size={device_size}"
+    )
+    assert len(warned) == 1 and "vocab table" in warned[0], warned
+
+    actual = layer(input_ids.to("spyre"))
+    torch.testing.assert_close(actual.cpu().float(), expected.float(), atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.vocab_parallel_embedding
+def test_tied_lm_head_table_is_row_gathered(tp_group):
+    """With tie_word_embeddings the LM head's `weight` starts out as the embedding's
+    Parameter. The embedding lookup must still get the gather layout, and the head must
+    still project through its own `padded_weight_t`, which stays a matmul operand."""
+    from torch_spyre._C import get_elem_in_stick, get_spyre_tensor_layout
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        ParallelLMHead,
+        VocabParallelEmbedding,
+    )
+
+    torch.manual_seed(5)
+    vocab_size, embedding_dim, num_tokens = 1024, 128, 8
+
+    embed = VocabParallelEmbedding(vocab_size, embedding_dim, params_dtype=torch.float16)
+    embed.weight.data.normal_(std=0.02)
+    head = ParallelLMHead(vocab_size, embedding_dim, params_dtype=torch.float16)
+    head = head.tie_weights(embed)
+    assert head.weight is embed.weight, "tie_weights should share the Parameter"
+
+    # As the loader does: build the head's transposed operand from the tied table.
+    head.quant_method.process_weights_after_loading(head)
+
+    input_ids = torch.randint(0, vocab_size, (num_tokens,), dtype=torch.int64)
+    hidden = torch.randn(num_tokens, embedding_dim, dtype=torch.float16)
+    table = embed.weight.data.clone()
+    expected_embedding = F.embedding(input_ids, table)
+    expected_logits = hidden.float() @ table.float().t()
+
+    # Mirror `model.to(device)` over a tied model: the embedding is reached first.
+    model = torch.nn.Module()
+    model.embed = embed
+    model.lm_head = head
+    model.to("spyre")
+
+    eps = get_elem_in_stick(torch.float16)
+    assert list(get_spyre_tensor_layout(model.embed.weight.data).device_size) == [
+        vocab_size,
+        embedding_dim // eps,
+        eps,
+    ], "the tied table must still be placed rows-outermost for the embedding lookup"
+
+    # The projection operand is separate storage and must not get the gather layout.
+    weight_t = model.lm_head.padded_weight_t.data
+    rows, width = weight_t.shape
+    assert list(get_spyre_tensor_layout(weight_t).device_size) != [rows, width // eps, eps], (
+        "padded_weight_t is a matmul operand, not a gather source"
+    )
+
+    actual_embedding = model.embed(input_ids.to("spyre"))
+    torch.testing.assert_close(
+        actual_embedding.cpu().float(), expected_embedding.float(), atol=1e-3, rtol=1e-3
+    )
+
+    actual_logits = model.lm_head.quant_method.apply(model.lm_head, hidden.to("spyre"))
+    assert actual_logits.shape == (num_tokens, vocab_size)
+    # Spyre matmul accumulation order diverges from the CPU reference in fp16.
+    torch.testing.assert_close(actual_logits.cpu().float(), expected_logits, atol=1e-1, rtol=5e-2)

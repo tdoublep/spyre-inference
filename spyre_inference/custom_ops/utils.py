@@ -119,18 +119,51 @@ def register():
     logger.debug_once("Registered custom op: spyre_convert")
 
 
-def row_gather_layout(num_rows: int, row_width: int, dtype: torch.dtype):
-    """Row-axis-outermost device layout for a tensor that is only gathered from.
+def place_row_gathered(src: torch.Tensor, fn, name: str) -> torch.Tensor:
+    """Move a 2D source that is only ever gathered from to device, rows-outermost.
 
     Spyre requires a gather's indexed dimension at device position 0. The default
-    layout places it inwards, which makes the gather read the whole source rather
-    than the rows it indexes. ``row_width`` must be a whole number of sticks.
+    layout places it inwards, and the gather then reads the whole source instead of
+    the rows it indexes -- cost linear in source size, flat in index count.
+
+    ``fn`` is an ``nn.Module._apply`` callable, which cannot express a
+    ``device_layout``, so it is probed on a single row to learn the destination and
+    ``src`` is then placed in one transfer (the H2D copy casts and stickifies in the
+    requested layout). Falls back to plain ``fn(src)`` -- same device, default layout
+    -- when the destination is not Spyre, or when a row is not a whole number of
+    sticks and the layout would need padding it cannot express.
+
+    Reaches into ``torch_spyre._C`` for the layout primitives; a natural candidate to
+    move into torch-spyre once it grows a gather-friendly layout helper of its own.
     """
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
 
-    eps = get_elem_in_stick(dtype)
-    return SpyreTensorLayout(
-        device_size=[num_rows, row_width // eps, eps],
-        stride_map=[row_width, eps, 1],
-        device_dtype=get_device_dtype(dtype),
+    probe = fn(src[:1])
+    if probe.device.type != "spyre":
+        return fn(src)
+
+    num_rows, row_width = src.shape
+    elems_per_stick = get_elem_in_stick(probe.dtype)
+    if row_width % elems_per_stick:
+        logger.warning_once(
+            "%s: row width %d is not a multiple of the %d-element %s stick, so the "
+            "rows-outermost layout cannot be applied and every gather will read the "
+            "whole %dx%d source. Pad the row width to recover the fast path.",
+            name,
+            row_width,
+            elems_per_stick,
+            probe.dtype,
+            num_rows,
+            row_width,
+        )
+        return fn(src)
+
+    return src.to(  # ty: ignore[no-matching-overload]
+        probe.device,
+        dtype=probe.dtype,
+        device_layout=SpyreTensorLayout(
+            device_size=[num_rows, row_width // elems_per_stick, elems_per_stick],
+            stride_map=[row_width, elems_per_stick, 1],
+            device_dtype=get_device_dtype(probe.dtype),
+        ),
     )

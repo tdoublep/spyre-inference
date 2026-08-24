@@ -16,8 +16,6 @@
 
 from functools import lru_cache
 
-from typing import cast
-
 import torch
 
 from vllm.distributed import tensor_model_parallel_all_reduce
@@ -29,7 +27,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 
-from .utils import convert, row_gather_layout
+from .utils import convert, place_row_gathered
 
 logger = init_logger(__name__)
 
@@ -47,25 +45,21 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
             )
 
     def _apply(self, fn, recurse=True):
-        # The vocab table is only ever gathered from, so once it lands on device give it
-        # a layout whose gather reads the wanted rows instead of the whole table. Spyre
-        # requires the indexed dim outermost; the default layout puts it inwards.
-        from torch_spyre._C import get_elem_in_stick
+        # The vocab table is only ever gathered from, so place it rows-outermost. Wrap fn
+        # rather than relayouting after super()._apply: the table then crosses to device
+        # once instead of being moved and immediately re-moved, and super() still does the
+        # CPU->device Parameter swap itself (a plain `weight.data = <spyre tensor>` is
+        # rejected across backends). A tied lm head starts out sharing this table but
+        # projects through its own `padded_weight_t`, so this layout is never a matmul
+        # operand.
+        weight = self._parameters.get("weight")
 
-        cpu_weight = cast(torch.Tensor, self.weight).data
-        super()._apply(fn, recurse)
-        moved = cast(torch.Tensor, self.weight).data
-        if cpu_weight.device.type != "cpu" or moved.device.type != "spyre":
-            return self
-        num_rows, row_width = cpu_weight.shape
-        if row_width % get_elem_in_stick(moved.dtype):
-            # A partial trailing stick needs padding this layout cannot express.
-            return self
-        self.weight.data = cpu_weight.to(moved.dtype).to(  # ty: ignore[no-matching-overload]
-            moved.device,
-            device_layout=row_gather_layout(num_rows, row_width, moved.dtype),
-        )
-        return self
+        def place(tensor: torch.Tensor) -> torch.Tensor:
+            if tensor is weight:
+                return place_row_gathered(tensor.data, fn, "vocab table")
+            return fn(tensor)
+
+        return super()._apply(place, recurse)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         if self.tp_size > 1:

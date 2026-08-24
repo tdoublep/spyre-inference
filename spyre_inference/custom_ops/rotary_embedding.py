@@ -23,10 +23,11 @@ The cache must be materialized on-device *before* compile: building it inside th
 forward (host chunk/stack/view then device transfer) segfaults libsenlib during warmup.
 ``_apply`` primes it when the module moves to Spyre, ahead of ``torch.compile``.
 
-The device cache is 2D and stickified with the position axis outermost. Spyre requires
-the indexed dimension of a gather to sit at device position 0; under the default layout
-a ``[max_pos, 2, 2, inner]`` cache puts it second-to-last, and the gather degenerates
-into a pass over the whole cache instead of the rows it indexes.
+The device cache is flattened to 2D ``[max_pos, 4 * inner]`` and stickified with the
+position axis outermost, so ``index_select`` reads only the rows it indexes. Spyre
+requires a gather's indexed dimension at device position 0, and the default layout of
+the natural ``[max_pos, 2, 2, inner]`` cache does not put it there, which turns each
+gather into a pass over all ``max_pos`` rows.
 
 Only neox-style full rotary is supported; other configs raise ``NotImplementedError``.
 """
@@ -45,7 +46,7 @@ from vllm.model_executor.layers.rotary_embedding.yarn_scaling_rope import (
     YaRNScalingRotaryEmbedding,
 )
 
-from .utils import row_gather_layout
+from .utils import place_row_gathered
 
 logger = init_logger(__name__)
 
@@ -95,14 +96,8 @@ class _SpyreRotaryMixin:
         # Skip super()._apply: cos_sin_cache is intentionally CPU-pinned and this module
         # holds no other movable tensor, so there is nothing to relocate. We instead prime
         # the device rotation cache here (before torch.compile traces forward_oot).
-        cache = self._get_device_rotation_cache()
-        # fn cannot express a device_layout, so use it on a single row to learn the
-        # destination, then place the cache in the gather layout ourselves.
-        probe = fn(cache[:1])
-        num_rows, row_width = cache.shape
-        self._device_rotation_cache = cache.to(probe.dtype).to(  # ty: ignore[no-matching-overload]
-            probe.device,
-            device_layout=row_gather_layout(num_rows, row_width, probe.dtype),
+        self._device_rotation_cache = place_row_gathered(
+            self._get_device_rotation_cache(), fn, "RoPE rotation cache"
         )
         return self
 
