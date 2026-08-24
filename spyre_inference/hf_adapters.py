@@ -71,7 +71,6 @@ class _SpyreRotaryEmbedding(nn.Module):
         return self._pre(x, position_ids), None
 
 
-@torch.no_grad()
 def _spyre_apply_rotary(q, k, cos, sin=None, *args, **kwargs):
     """Matmul RoPE; ``cos`` carries [B, L, 2, 2, D/2] rotation matrices, ``sin`` unused."""
     return apply_rope_matmul(q, cos), apply_rope_matmul(k, cos)
