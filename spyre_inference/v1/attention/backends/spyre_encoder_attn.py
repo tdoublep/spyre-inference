@@ -283,11 +283,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 class SpyreEncoderAttentionBackend(SpyreAttentionBackend):
     """Encoder-only (no KV cache) variant of the Spyre backend."""
 
-    # True so upstream's `Attention.forward` skips `unified_kv_cache_update` entirely.
     # These layers have no KV cache, but vLLM still hands encoder-only specs a
-    # (zero-filled) slot mapping, which is enough for the paged backend's False here to
-    # send upstream looking for a scatter, and `SpyreEncoderAttentionImpl` inherits
-    # `do_kv_cache_update`, so nothing downstream declines it.
+    # zero-filled slot mapping, so upstream must skip `unified_kv_cache_update` entirely.
     forward_includes_kv_cache_update: bool = True
 
     @staticmethod
