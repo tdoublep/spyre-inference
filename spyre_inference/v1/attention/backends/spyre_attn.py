@@ -27,6 +27,13 @@ from spyre_inference.custom_ops.utils import convert
 from vllm.config import CompilationMode, VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.config.cache import CacheDType
+from vllm.model_executor.layers.attention.attention import get_attention_context
+from vllm.utils.torch_utils import (
+    LayerNameType,
+    _encode_layer_name,
+    _resolve_layer_name,
+    direct_register_custom_op,
+)
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -42,7 +49,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
-# When set, wraps forward(), _reshape_and_cache(), and _online_softmax_attention()
+# When set, wraps forward() and _online_softmax_attention()
 # in torch.profiler.record_function spans for kineto trace capture.
 _ATTN_PROFILING = os.environ.get("SPYRE_ATTN_PROFILING", "0") == "1"
 
@@ -128,6 +135,76 @@ def _maybe_compile(fn, compile_enabled: bool):
 def _reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
     k_slots.index_copy_(0, slot_mapping, key)
     v_slots.index_copy_(0, slot_mapping, value)
+
+
+# ---------------------------------------------------------------------------
+# The opaque attention-core boundary
+# ---------------------------------------------------------------------------
+#
+# `TorchSpyrePlatform.opaque_attention_op()` is False, so dynamo traces straight
+# through `Attention.forward` and `unified_kv_cache_update`, and the outer per-block
+# graph owns the KV scatter. This op is where that trace has to stop.
+
+
+def _attention_core_op(
+    query: torch.Tensor,
+    output: torch.Tensor,
+    key: torch.Tensor | None,
+    value: torch.Tensor | None,
+    kv_dep: torch.Tensor | None,
+    layer_name: LayerNameType,
+) -> None:
+    """Run the attention core as one opaque node in the caller's graph.
+
+    Everything reached from here runs eagerly: the paged path's per-sequence Python loop
+    and its device-to-host reads of `query_start_loc`/`seq_lens`, the encoder path's
+    `.tolist()` bookkeeping, and the per-step host-to-device mask and page-table mirrors.
+    None of it survives `fullgraph=True` capture.
+
+    Metadata arrives through the forward context rather than the op schema, and
+    deliberately so. Were it handed to a traced caller instead, dynamo would read its
+    per-step Python ints (`num_actual_tokens`) and guard on their values, recompiling the
+    enclosing block graph on every step — tensors pulled off the context are lifted as
+    graph inputs and cost nothing, but Python scalars get baked in.
+
+    `kv_dep` is unused, and is the slot-major K view that `do_kv_cache_update` just
+    scattered into. Taking it as an input makes "scatter before read" a real
+    read-after-write edge for Inductor. Nothing else would: this op reaches the pages
+    through the forward context, so the dependency is otherwise invisible, and upstream's
+    own `kv_cache_dummy_dep` does not help here — on this path `unified_kv_cache_update`
+    is inlined rather than an op, so its dummy return carries no edge back to the scatter.
+    """
+    del kv_dep
+    attn_metadata, layer, kv_cache, _ = get_attention_context(_resolve_layer_name(layer_name))
+    # Warmup and profile runs have no attention metadata.
+    if attn_metadata is None:
+        return
+    layer.impl._attention_core(query, key, value, output, kv_cache, attn_metadata)
+
+
+def _attention_core_op_fake(
+    query: torch.Tensor,
+    output: torch.Tensor,
+    key: torch.Tensor | None,
+    value: torch.Tensor | None,
+    kv_dep: torch.Tensor | None,
+    layer_name: LayerNameType,
+) -> None:
+    return None
+
+
+@functools.lru_cache(maxsize=1)
+def _register_attention_core_op() -> None:
+    # CompositeExplicitAutograd so the op dispatches on Spyre tensors without being
+    # tied to the platform's PrivateUse1 key, matching `spyre_convert`.
+    direct_register_custom_op(
+        op_name="spyre_attention_core",
+        op_func=_attention_core_op,
+        fake_impl=_attention_core_op_fake,
+        mutates_args=["output"],
+        dispatch_key="CompositeExplicitAutograd",
+    )
+    logger.debug_once("Registered custom op: spyre_attention_core")
 
 
 # ---------------------------------------------------------------------------
@@ -318,9 +395,6 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # its inputs from offset 0, ignoring storage_offset (torch-spyre#3770).
     page_index_table_cpu: torch.Tensor | None = None
     page_index_tables: list[torch.Tensor] | None = None
-
-    # Device mirror of slot_mapping, which vLLM hands us on the host.
-    slot_mapping_device: torch.Tensor | None = None
 
     # Device mirror of attention_mask_tiles, filled once per step by forward().
     attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
@@ -731,6 +805,11 @@ class SpyreAttentionBackend(AttentionBackend):
     """Paged KV-cache attention backend for Spyre."""
 
     accept_output_buffer: bool = True
+    # False tells upstream that `forward()` does not write KV, so `Attention.forward`
+    # emits `unified_kv_cache_update` ahead of the attention call. With
+    # `opaque_attention_op()` False that call is plain Python, so the outer graph traces
+    # our `do_kv_cache_update` and Inductor fuses the scatter into the block kernel.
+    forward_includes_kv_cache_update: bool = False
     supported_dtypes: ClassVar[list[torch.dtype]] = [
         torch.float16,
     ]
@@ -852,6 +931,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Compiled attention loops, keyed by (num_blocks, padded_query_len)
         self._attn_fns: dict[tuple[int, int], object] = {}
 
+        self._kv_slots: SpyrePagedKVCache | None = None
+
+        _register_attention_core_op()
+
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
         )
@@ -892,79 +975,144 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        del output_scale, output_block_scale
+
+        # The KV write is not here. `opaque_attention_op()` is False, so upstream's
+        # `Attention.forward` has already emitted `unified_kv_cache_update` ahead of this
+        # call, inside the outer graph.
+        if torch.compiler.is_compiling():
+            # Emit the op unconditionally, including when `attn_metadata is None`. The op
+            # declares that it mutates `output`, which is upstream's `torch.empty(...)`;
+            # returning early here instead would leave that buffer with no writer in the
+            # graph, and Inductor folds an unwritten buffer to a NaN constant. The o_proj
+            # matmul consuming it then has one operand instead of two, which trips
+            # torch-spyre's layout pass (`identify_matmul_inputs` asserts exactly 2). The
+            # op's own body handles absent metadata, out of the graph's sight — which is
+            # exactly how the opaque-op path gets this right for free.
+            #
+            # Read nothing off `attn_metadata` in this branch either: it is being traced,
+            # and a Python scalar read would guard the block graph on it. The op re-fetches
+            # the metadata from the forward context.
+            #
+            # `kv_dep` is the K view the scatter mutated, passed as an ordering edge; see
+            # the op's docstring. None only where no scatter ran, so nothing to order.
+            kv_dep = None if self._kv_slots is None else self._kv_slots.k_pages
+            # ty types a custom op's __call__ as taking EllipsisType, so every argument
+            # needs a suppression.
+            torch.ops.vllm.spyre_attention_core(
+                query,  # ty: ignore[invalid-argument-type]
+                output,  # ty: ignore[invalid-argument-type]
+                key,  # ty: ignore[invalid-argument-type]
+                value,  # ty: ignore[invalid-argument-type]
+                kv_dep,  # ty: ignore[invalid-argument-type]
+                _encode_layer_name(layer.layer_name),  # ty: ignore[invalid-argument-type]
+            )
+            return output
+
         if attn_metadata is None:
             return output
 
-        k_pages, v_pages = kv_cache
-        _target_device = k_pages.device
-        num_actual_tokens = attn_metadata.num_actual_tokens
+        # Not being traced, so there is no trace for the op to stop: run the core
+        # directly. This is the eager path — `--enforce-eager`, and tests and bench
+        # harnesses that call the impl with metadata in hand.
+        self._attention_core(query, key, value, output, kv_cache, attn_metadata)
+        return output
 
-        # Only the first layer of a step pays for the device mirror.
+    def _attention_core(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+        kv_cache: SpyrePagedKVCache,
+        attn_metadata: SpyreAttentionMetadata,
+    ) -> None:
+        """The untraceable core, run only from `spyre_attention_core` or an eager caller.
+
+        Writes into `output` in place. The encoder impl overrides this with its packed
+        SDPA; `key`/`value` are unused here because the paged path reads them back out of
+        the cache the scatter just wrote.
+        """
+        del key, value
+        k_pages, v_pages = kv_cache
+        target_device = k_pages.device
+        self._mirror_metadata_to_device(attn_metadata, target_device)
+        self._online_softmax_attention(
+            query[: attn_metadata.num_actual_tokens],
+            k_pages,
+            v_pages,
+            attn_metadata,
+            output,
+            target_device,
+        )
+
+    def _mirror_metadata_to_device(
+        self, attn_metadata: SpyreAttentionMetadata, target_device: torch.device
+    ) -> None:
+        """Mirror this step's host-built page tables and mask tiles to the device.
+
+        Runs eagerly, never inside a graph: only the first layer of a step pays, and the
+        builder cannot do it because its own device is CPU.
+        """
         if attn_metadata.page_index_tables is None:
             table_cpu = attn_metadata.page_index_table_cpu
             assert table_cpu is not None
             attn_metadata.page_index_tables = [
-                convert(table_cpu[s].contiguous(), device=_target_device)
+                convert(table_cpu[s].contiguous(), device=target_device)
                 for s in range(table_cpu.shape[0])
             ]
-        if attn_metadata.slot_mapping_device is None:
-            attn_metadata.slot_mapping_device = convert(
-                attn_metadata.slot_mapping[:num_actual_tokens], device=_target_device
-            )
         if attn_metadata.attention_mask_tiles_device is None:
             tiles_cpu = attn_metadata.attention_mask_tiles
             assert tiles_cpu is not None, (
                 "attention_mask_tiles must be precomputed by the metadata builder"
             )
             attn_metadata.attention_mask_tiles_device = [
-                [convert(t, device=_target_device) for t in seq_tiles] for seq_tiles in tiles_cpu
+                [convert(t, device=target_device) for t in seq_tiles] for seq_tiles in tiles_cpu
             ]
 
-        # Step 1: Reshape and cache — scatter new tokens into their slots
-        self._reshape_and_cache(
-            key[:num_actual_tokens],
-            value[:num_actual_tokens],
-            k_pages,
-            v_pages,
-            attn_metadata.slot_mapping_device,
-        )
+    def kv_slot_views(self, kv_cache: SpyrePagedKVCache) -> SpyrePagedKVCache:
+        """Slot-major views of the pages, built once outside any graph.
 
-        # Step 2: Online softmax attention over pages (varlen)
-        output = self._online_softmax_attention(
-            query[:num_actual_tokens],
-            k_pages,
-            v_pages,
-            attn_metadata,
-            output,
-            _target_device,
-        )
+        Inductor cannot lower a store through a view of a Spyre-layout tensor created
+        inside a graph. Valid because a view keeps the slot-outermost device layout.
+        """
+        if self._kv_slots is None:
+            k_pages, v_pages = kv_cache
+            shape = (-1, k_pages.shape[2], k_pages.shape[3])
+            self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
+        return self._kv_slots
 
-        return output
-
-    @_record_function("spyre_attn::reshape_and_cache")
-    def _reshape_and_cache(
+    def do_kv_cache_update(
         self,
+        layer: AttentionLayer | None,
         key: torch.Tensor,
         value: torch.Tensor,
-        k_pages: torch.Tensor,
-        v_pages: torch.Tensor,
+        kv_cache: SpyrePagedKVCache,
         slot_mapping: torch.Tensor,
-    ) -> None:
+    ) -> torch.Tensor:
         """Scatter new K/V tokens into their cache slots.
 
-        key, value: [num_tokens, num_kv_heads, head_size] on the pages' device,
-            strided last-dim views of the fused QKV output
-        k_pages, v_pages: [num_blocks, block_size, num_kv_heads, head_size]
-        slot_mapping: [num_tokens] on the pages' device
+        Called by upstream's `unified_kv_cache_update`, which the outer per-block graph
+        inlines, so this body is traced and Inductor fuses the scatter into the block
+        kernel. Returns the mutated slot-major K view; upstream discards it, and
+        `_online_softmax_op` passes it to the attention op as the ordering edge.
         """
         # A source on the wrong device falls back to CPU silently, without raising.
-        assert key.device.type == k_pages.device.type, (
-            f"reshape_and_cache source is on {key.device.type}, pages on {k_pages.device.type}"
+        assert key.device.type == kv_cache[0].device.type, (
+            f"kv cache update source is on {key.device.type}, pages on {kv_cache[0].device.type}"
         )
 
-        # Valid because a view keeps the slot-outermost device layout.
-        slots = (-1, k_pages.shape[2], k_pages.shape[3])
-        self._reshape_fn(key, value, k_pages.view(slots), v_pages.view(slots), slot_mapping)
+        k_slots, v_slots = self.kv_slot_views(kv_cache)
+        # The runner publishes an unpadded slot mapping, while upstream hands us the full
+        # padded key/value. Trim by its shape rather than by metadata's num_actual_tokens:
+        # a tensor shape is already a graph guard, a Python int would add a new one and
+        # recompile this block every step.
+        num_kv_tokens = slot_mapping.shape[0]
+        # Eager index_copy_ rejects an int32 index and silently falls back to CPU with an
+        # int64 one, so this always goes through the compiled artifact; inside the outer
+        # graph dynamo inlines it rather than launching a second region.
+        self._reshape_fn(key[:num_kv_tokens], value[:num_kv_tokens], k_slots, v_slots, slot_mapping)
+        return k_slots
 
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(

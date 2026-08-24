@@ -27,7 +27,6 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from vllm.v1.attention.backend import AttentionLayer
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -180,21 +179,21 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
     unpacks with gather.
     """
 
-    def forward(  # ty: ignore[invalid-method-override]
+    def _attention_core(
         self,
-        layer: AttentionLayer,
         query: torch.Tensor,  # [num_tokens, num_heads, head_size]
         key: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
         value: torch.Tensor,  # [num_tokens, num_kv_heads, head_size]
+        output: torch.Tensor,  # [num_tokens, num_heads, head_size]
         kv_cache: SpyrePagedKVCache,
         attn_metadata: SpyreAttentionMetadata,
-        output: torch.Tensor,  # [num_tokens, num_heads, head_size]
-        output_scale: torch.Tensor | None = None,
-        output_block_scale: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        del layer, kv_cache, output_scale, output_block_scale
-        if attn_metadata is None:
-            return output
+    ) -> None:
+        """Packed bidirectional SDPA, run only from `spyre_attention_core` or eagerly.
+
+        The `.cpu()`/`.tolist()` bookkeeping below is why this needs the op boundary at
+        all: none of it can be captured with `fullgraph=True`.
+        """
+        del kv_cache
 
         n = attn_metadata.num_actual_tokens
         query = query[:n]
@@ -277,11 +276,15 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 result = convert(result, output.device)
             output.copy_(result)
 
-        return output
-
 
 class SpyreEncoderAttentionBackend(SpyreAttentionBackend):
     """Encoder-only (no KV cache) variant of the Spyre backend."""
+
+    # True so upstream's `Attention.forward` skips `unified_kv_cache_update` entirely.
+    # These layers have no KV cache to write, but vLLM still hands encoder-only specs a
+    # (zero-filled) slot mapping, which is enough to make the paged backend's False here
+    # send upstream looking for a scatter that must not happen.
+    forward_includes_kv_cache_update: bool = True
 
     @staticmethod
     def get_impl_cls() -> type[SpyreEncoderAttentionImpl]:

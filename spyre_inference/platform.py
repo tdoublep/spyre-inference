@@ -272,6 +272,19 @@ class TorchSpyrePlatform(CpuPlatform):
         return True
 
     @classmethod
+    def opaque_attention_op(cls) -> bool:
+        # CpuPlatform, our base, returns True, which hides the whole attention forward
+        # behind `torch.ops.vllm.unified_attention_with_output`. Spyre wants the
+        # opposite: with this False, `Attention.forward` takes its `use_direct_call`
+        # branch and calls `unified_kv_cache_update` / `unified_attention_with_output`
+        # as plain Python, so the outer per-block graph traces the KV scatter down to
+        # `index_copy_` and Inductor fuses it into the block kernel. Only the
+        # online-softmax core stays opaque, behind our own
+        # `torch.ops.vllm.spyre_online_softmax_attention` — its per-sequence Python
+        # loop cannot be captured with `fullgraph=True`.
+        return False
+
+    @classmethod
     def _maybe_pad_head_dim(cls, vllm_config: VllmConfig) -> None:
         """Override hf_config.head_dim to a 128-multiple when the native head_dim
         is not stick-aligned, stashing the original as ``_spyre_orig_head_dim``.

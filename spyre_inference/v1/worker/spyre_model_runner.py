@@ -770,7 +770,55 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.compilation_config.static_forward_context,
             self.kv_caches,
         )
+
+        # Build the slot-major views now, while we are still outside any graph: the
+        # traced KV scatter stores through them, and Inductor cannot lower a store
+        # through a view of a Spyre-layout tensor that was created inside a graph.
+        for layer_name, page_cache in kv_caches.items():
+            impl = self.compilation_config.static_forward_context[layer_name].impl
+            if hasattr(impl, "kv_slot_views"):
+                impl.kv_slot_views(page_cache)
+
         return kv_caches
+
+    def _get_slot_mappings(
+        self,
+        num_tokens_padded: int,
+        num_reqs_padded: int,
+        num_tokens_unpadded: int,
+        ubatch_slices=None,
+    ):
+        """Publish a Spyre-device slot mapping on the forward context.
+
+        Upstream fills the per-layer mapping from `block_table.slot_mapping.gpu`, which
+        `_make_buffer` keeps on CPU for int dtypes. That mapping now feeds
+        `unified_kv_cache_update` from inside the traced per-block graph, so it has to be
+        on device already — converting it there would trace one host-to-device copy per
+        layer per step, which is the cost this whole arrangement exists to remove.
+
+        Trimmed to the unpadded length: upstream fills the padded tail with -1 as a skip
+        marker for CUDA reshape kernels, but `index_copy_` has no such convention and
+        would scatter to a wrong row. `do_kv_cache_update` trims key/value to match.
+        """
+        by_gid, by_layer = super()._get_slot_mappings(
+            num_tokens_padded, num_reqs_padded, num_tokens_unpadded, ubatch_slices
+        )
+        if not by_layer:
+            return by_gid, by_layer
+        assert isinstance(by_layer, dict), (
+            "microbatched slot mappings are unsupported on Spyre (DP>1 is rejected)"
+        )
+
+        # Layers in one KV cache group share a mapping tensor; mirror each once per step.
+        mirrors: dict[int, torch.Tensor] = {}
+        on_device = {}
+        for layer_name, slots in by_layer.items():
+            mirror = mirrors.get(id(slots))
+            if mirror is None:
+                mirror = convert(slots[:num_tokens_unpadded], device=self._spyre_device)
+                mirrors[id(slots)] = mirror
+            on_device[layer_name] = mirror
+        return by_gid, on_device
 
     # --- Stubs copied from CPUModelRunner ---
     # These are trivial overrides that GPUModelRunner expects.
