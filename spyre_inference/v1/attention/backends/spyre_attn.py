@@ -24,7 +24,7 @@ import torch
 
 from spyre_inference.custom_ops.utils import convert
 
-from vllm.config import VllmConfig
+from vllm.config import CompilationMode, VllmConfig, get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.config.cache import CacheDType
 from vllm.v1.attention.backend import (
@@ -62,12 +62,6 @@ def _record_function(name: str):
     return decorator
 
 
-# Force torch.compile(dynamic=False) on the Spyre attention/reshape kernels
-# regardless of the vLLM compilation config. Used to evaluate the compiled path
-# on Spyre, where CompilationMode.NONE otherwise makes _maybe_compile a no-op.
-# Default: off (unset or "0").
-_FORCE_COMPILE_ATTN = os.environ.get("SPYRE_FORCE_COMPILE_ATTN", "0") == "1"
-
 # TODO: Make these hyperparameters configurable
 # KV length alignment: KV tensors are padded to the next multiple of this value.
 # Because torch.compile treats shapes as static constants, every distinct kv_len
@@ -76,15 +70,10 @@ _FORCE_COMPILE_ATTN = os.environ.get("SPYRE_FORCE_COMPILE_ATTN", "0") == "1"
 # rather than recompiling on every decode step.
 KV_LENGTH_ALIGNMENT = 256
 
-# Query chunk size for padding - ensures consistent tensor sizes for Spyre compilation
-# TODO: decode tokens (max_query_len=1) are always padded to 32, which is wasteful.
-# Explore a separate decode kernel path that doesn't need query padding, or use
-# a smaller alignment (e.g. QUERY_CHUNK_SIZE=1) for single-token decode steps.
+# Query chunk size for padding - ensures consistent tensor sizes for Spyre compilation.
+# TODO: decode sequences in a mixed batch still pad to this; only decode-only
+# batches skip it.
 QUERY_CHUNK_SIZE = 32
-
-# On-device query overwrite only compiles for head_size multiples of 128; 64
-# yields an unsupported Mod(var, 32) stick coord. Otherwise fall back to CPU.
-ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE = 128
 
 # Elements per stick for int32 (128-byte stick / 4 bytes). Page-index rows are
 # padded to this width so each row starts on a stick boundary; see
@@ -127,30 +116,11 @@ def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtyp
     )
 
 
-def _overwrite(
-    input: torch.Tensor,
-    output: torch.Tensor,
-    dims: list[int],
-    offsets: list[int],
-) -> None:
-    """Write input into output starting at ``offsets`` along ``dims`` (in-place).
-
-    narrow().copy_() at a concrete offset works on both CPU and Spyre. The extent
-    along each dim comes from ``input``, matching ``torch.ops.spyre.overwrite``.
+def _maybe_compile(fn, compile_enabled: bool):
+    """Compile `fn` when enabled. Attention compiles separately from the model's
+    fullgraph capture, which can't hold its per-sequence Python loop.
     """
-    sliced_t = output
-    for i, dim in enumerate(dims):
-        sliced_t = torch.narrow(sliced_t, dim, offsets[i], input.size(dim))
-    sliced_t.copy_(input)
-
-
-def _maybe_compile(fn):
-    """Triggers compilation when SPYRE_FORCE_COMPILE_ATTN=1.
-
-    Used only for the online-softmax attention kernel; the reshape/cache
-    kernel is compiled unconditionally instead (see _reshape_and_cache).
-    """
-    if _FORCE_COMPILE_ATTN:
+    if compile_enabled:
         return torch.compile(fn, dynamic=False)
     return fn
 
@@ -168,6 +138,8 @@ def _reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
 def _create_compilable_page_attn(
     num_blocks: int,
     padded_query_len: int,
+    num_heads: int,
+    head_size: int,
     has_alibi: bool = False,
     logits_soft_cap: float = 0.0,
 ):
@@ -190,6 +162,7 @@ def _create_compilable_page_attn(
         This kernels specializes for num_blocks and padded_query_len.
 
         Expected shapes:
+            q: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
             k_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
             v_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
             page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
@@ -201,8 +174,9 @@ def _create_compilable_page_attn(
                 is 1 because softmax absorbs per-query-row constants — see
                 the derivation at the bias-tile construction site in
                 _online_softmax_attention.
-        """
 
+        Returns [padded_query_len, num_heads, head_size].
+        """
         tile_max = None
         tile_sum = None
         tile_output = None
@@ -254,7 +228,9 @@ def _create_compilable_page_attn(
                 tile_max = new_max
 
         assert tile_output is not None and tile_sum is not None
-        return tile_output / tile_sum
+        attn = tile_output / tile_sum
+        attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
+        return attn.reshape(padded_query_len, num_heads, head_size)
 
     return specialized_paged_attn_kernel
 
@@ -345,6 +321,9 @@ class SpyreAttentionMetadata(AttentionMetadata):
 
     # Device mirror of slot_mapping, which vLLM hands us on the host.
     slot_mapping_device: torch.Tensor | None = None
+
+    # Device mirror of attention_mask_tiles, filled once per step by forward().
+    attention_mask_tiles_device: list[list[torch.Tensor]] | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:
@@ -653,9 +632,13 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         # the causal mask to them is a correct no-op.
         apply_causal_mask = causal and max_query_len > 1
 
-        aligned_max_query_len = (
-            (max_query_len + QUERY_CHUNK_SIZE - 1) // QUERY_CHUNK_SIZE * QUERY_CHUNK_SIZE
-        )
+        # A decode-only batch needs no padding at all: every query_len is 1.
+        if max_query_len == 1:
+            aligned_max_query_len = 1
+        else:
+            aligned_max_query_len = (
+                (max_query_len + QUERY_CHUNK_SIZE - 1) // QUERY_CHUNK_SIZE * QUERY_CHUNK_SIZE
+            )
         aligned_max_seq_len = (
             (max_seq_len + KV_LENGTH_ALIGNMENT - 1) // KV_LENGTH_ALIGNMENT * KV_LENGTH_ALIGNMENT
         )
@@ -835,6 +818,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self.kv_cache_dtype = kv_cache_dtype
         self.attn_type = attn_type
 
+        # `== STOCK`, not `!= NONE`: a bare CompilationConfig (e.g. the unit-test
+        # fixture) leaves mode unset (Python None), which `!= NONE` would wrongly
+        # treat as compiled. The platform resolves compiled runs to STOCK.
+        _mode = get_current_vllm_config().compilation_config.mode
+        self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
+
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
         # Reshape once to [num_kv_heads, num_queries_per_kv, 1, 1] so the
         # per-block bias construction in _online_softmax_attention broadcasts
@@ -876,9 +865,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 _create_compilable_page_attn(
                     num_blocks,
                     padded_query_len,
+                    self.num_heads,
+                    self.head_size,
                     has_alibi=self.alibi_slopes is not None,
                     logits_soft_cap=self.logits_soft_cap,
-                )
+                ),
+                self._compile_attn,
             )
         return self._attn_fns[key]
 
@@ -904,8 +896,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             return output
 
         k_pages, v_pages = kv_cache
-        # Derive target device from the KV pages — query may arrive on CPU
-        # (e.g. in unit tests) while pages live on the real Spyre device.
         _target_device = k_pages.device
         num_actual_tokens = attn_metadata.num_actual_tokens
 
@@ -921,21 +911,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.slot_mapping_device = convert(
                 attn_metadata.slot_mapping[:num_actual_tokens], device=_target_device
             )
-
-        # Query handling depends on whether we can stay on device:
-        #   - Single-sequence decode: on-device assembly works (offset 0), but
-        #     only when the head_size keeps the overwrite layout representable
-        #     (see ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE); otherwise CPU path.
-        #   - Batch decode / prefill: needs the CPU path because the per-seq
-        #     query densification slices/transposes at offset > 0, which
-        #     corrupts on Spyre.
-        ondevice_overwrite_ok = self.head_size % ONDEVICE_OVERWRITE_HEAD_SIZE_MULTIPLE == 0
-        needs_query_cpu = (
-            attn_metadata.max_query_len > 1
-            or attn_metadata.num_seqs > 1
-            or not ondevice_overwrite_ok
-        )
-        query_cpu = convert(query, "cpu") if needs_query_cpu else None
+        if attn_metadata.attention_mask_tiles_device is None:
+            tiles_cpu = attn_metadata.attention_mask_tiles
+            assert tiles_cpu is not None, (
+                "attention_mask_tiles must be precomputed by the metadata builder"
+            )
+            attn_metadata.attention_mask_tiles_device = [
+                [convert(t, device=_target_device) for t in seq_tiles] for seq_tiles in tiles_cpu
+            ]
 
         # Step 1: Reshape and cache — scatter new tokens into their slots
         self._reshape_and_cache(
@@ -946,13 +929,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             attn_metadata.slot_mapping_device,
         )
 
-        # Step 2: Online softmax attention over pages (varlen).
-        # Pass on-device query for single-sequence decode (assembled at offset 0
-        # without a CPU round-trip); everything else goes through query_cpu.
-        query_dev = convert(query, _target_device) if not needs_query_cpu else None
+        # Step 2: Online softmax attention over pages (varlen)
         output = self._online_softmax_attention(
-            query_dev,
-            query_cpu[:num_actual_tokens] if query_cpu is not None else None,
+            query[:num_actual_tokens],
             k_pages,
             v_pages,
             attn_metadata,
@@ -990,8 +969,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(
         self,
-        query_dev: torch.Tensor | None,
-        query_cpu: torch.Tensor | None,
+        query_dev: torch.Tensor,
         k_pages: torch.Tensor,
         v_pages: torch.Tensor,
         attn_metadata: SpyreAttentionMetadata,
@@ -1007,17 +985,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         Writes results directly into the caller's output buffer in-place.
 
-        Query assembly builds the same padded 4D tensor
+        Query is assembled on device into the padded 4D tensor
         [num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size]
-        the kernel expects. Single-sequence decode assembles it directly on
-        device (offset 0 is a safe Spyre write, so no CPU round-trip); batch
-        decode / prefill build it on CPU and transfer.
+        the kernel expects.
 
         Args:
-            query_dev: Query on target device (for single-seq decode), or None.
-            query_cpu: Query on CPU (for batch/prefill), or None.
+            query_dev: Query on the target device, [num_tokens, num_heads, D].
         """
-        num_heads = self.num_heads
         head_size = self.head_size
         num_kv_heads = self.num_kv_heads
         num_queries_per_kv = self.num_queries_per_kv
@@ -1026,12 +1000,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         num_seqs = attn_metadata.num_seqs
         query_start_loc = attn_metadata.query_start_loc
         seq_lens = attn_metadata.seq_lens
-        mask_tiles_all = attn_metadata.attention_mask_tiles
+        mask_tiles_all = attn_metadata.attention_mask_tiles_device
         active_block_indices_all = attn_metadata.active_block_indices
         aligned_max_query_len = attn_metadata.aligned_max_query_len
         page_index_tables = attn_metadata.page_index_tables
         assert mask_tiles_all is not None, (
-            "attention_mask_tiles must be precomputed by the metadata builder"
+            "attention_mask_tiles_device must be mirrored by forward()"
         )
         assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
 
@@ -1043,31 +1017,16 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             query_len = q_end - q_start
             kv_len = int(seq_lens[seq_idx].item())
 
-            if query_dev is not None and query_len == 1:
-                # Single-sequence decode: assemble the padded 4D query on device.
-                # The one real token is written at offset 0 (a safe Spyre write);
-                # padded query rows are masked out and dropped from the result.
-                # Layout matches the CPU path: [KV, QPK, aligned_max_query_len, D].
-                q_row = query_dev.unbind(dim=0)[q_start].reshape(
+            if query_len == 1:
+                # Decode: the single real token goes at row 0 of the padded
+                # buffer; the trailing padded rows are masked out downstream.
+                q_dev = query_dev.unbind(dim=0)[q_start].reshape(
                     num_kv_heads, num_queries_per_kv, 1, head_size
                 )
                 if aligned_max_query_len > 1:
-                    q = torch.zeros(
-                        num_kv_heads,
-                        num_queries_per_kv,
-                        aligned_max_query_len,
-                        head_size,
-                        dtype=q_row.dtype,
-                        device=q_row.device,
-                    )
-                    _overwrite(q_row, q, [2], [0])
-                else:
-                    q = q_row
-                q_dev = q
+                    q_dev = torch.nn.functional.pad(q_dev, (0, 0, 0, aligned_max_query_len - 1))
             else:
-                # Batch decode / prefill: build on CPU, transfer to device.
-                assert query_cpu is not None
-                q_seq = query_cpu[q_start:q_end]
+                q_seq = query_dev[q_start:q_end]
 
                 # Pad query to global aligned_max_query_len (uniform for all seqs)
                 if aligned_max_query_len > query_len:
@@ -1081,8 +1040,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 # Reshape: [padded_query_len, num_heads, head_size]
                 #   → [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
                 q = q_seq.unsqueeze(0).transpose(1, 2).contiguous()
-                q = q.reshape(num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size)
-                q_dev = convert(q, device=_target_device)
+                q_dev = q.reshape(
+                    num_kv_heads, num_queries_per_kv, aligned_max_query_len, head_size
+                )
 
             num_blocks_needed = (kv_len + block_size - 1) // block_size
 
@@ -1102,10 +1062,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             page_index_table = page_index_tables[seq_idx]
             # mask_tiles_all[seq_idx] is indexed by position within active_bs.
-            mask_tiles = [
-                convert(mask_tiles_all[seq_idx][i], device=_target_device)
-                for i in range(len(active_bs))
-            ]
+            mask_tiles = mask_tiles_all[seq_idx][: len(active_bs)]
 
             # ALiBi bias tiles: slope[h] * (kv_pos - context_len), one per block.
             #
@@ -1148,14 +1105,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 alibi_bias_tiles=alibi_bias_tiles,
             )
 
-            # Reshape back: [num_kv_heads, num_queries_per_kv, padded_query_len, head_size]
-            #   → [query_len, num_heads, head_size]. The transpose+contiguous and
-            # the slice-assign into `output` both run on-device; q_start is a
-            # Python int, so the dim-0 write offset is a concrete constant.
-            result = convert(result, dtype=output.dtype)
-            result = result.reshape(1, num_heads, aligned_max_query_len, head_size)
-            result = result.transpose(1, 2).contiguous()
-            # Keep the .clone() until torch-spyre#3826 is fixed.
-            output[q_start:q_end] = result[0, :query_len, :, :].clone()
+            assert result.dtype == output.dtype
+            if query_len < aligned_max_query_len:
+                # Writing a prefix view copies its whole extent and overruns the
+                # destination (torch-spyre#3826), so copy it first.
+                output[q_start:q_end] = result[:query_len].clone()
+            else:
+                output[q_start:q_end] = result
 
         return output
