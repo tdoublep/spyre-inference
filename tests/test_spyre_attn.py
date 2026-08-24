@@ -186,6 +186,18 @@ def assert_close_outliers(
         outlier_rtol: relative tolerance for outlier elements.
         msg: additional context for the failure message.
     """
+    # Non-finite values must be rejected before the outlier arithmetic: `NaN > tol`
+    # is False, so a NaN would produce *zero* outliers and return as acceptable
+    # below. Attention output is always finite (a fully-masked row writes zeros,
+    # and -inf mask entries reach the caller only through exp()), so any NaN or inf
+    # here is a real failure — including an output buffer a store never landed in.
+    n_nonfinite = int((~torch.isfinite(actual)).sum())
+    if n_nonfinite:
+        raise AssertionError(
+            f"{n_nonfinite}/{actual.numel()} element(s) of actual are non-finite "
+            f"(NaN or inf); the value was never written or the kernel diverged."
+        )
+
     diff = (actual - expected).abs()
     tol = atol + rtol * expected.abs()
     outlier_mask = diff > tol
