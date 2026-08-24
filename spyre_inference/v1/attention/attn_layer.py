@@ -14,10 +14,8 @@
 
 """Spyre ``Attention.forward``: the KV write is traced, the attention core stays opaque.
 
-Upstream has the same split (``forward_includes_kv_cache_update`` plus the
-``kv_cache_dummy_dep`` ordering token) but gates it on ``opaque_attention_op()``,
-which is all-or-nothing. The online-softmax core must stay opaque: its per-sequence
-Python loop cannot be captured with ``fullgraph=True``.
+The core must stay opaque: its per-sequence Python loop cannot be captured with
+``fullgraph=True``.
 """
 
 from collections.abc import Iterable
@@ -69,11 +67,9 @@ def _spyre_attention_forward(
     key = key.view(-1, self.num_kv_heads, self.head_size)
     value = value.view(-1, self.num_kv_heads, self.head_size_v)
 
-    # `dep` aliases the mutated pages: passing it to the attention op makes
-    # "scatter before read" a real data dependency, which is otherwise invisible
-    # because the op reaches its cache through the forward context.
+    # `dep` makes "scatter before read" a real data dependency, which is otherwise
+    # invisible because the op reaches its cache through the forward context.
     # No slot mapping: warmup and profile runs have no attention metadata.
-    # Cast: install() sets this on the Module, so it resolves via Module.__getattr__.
     slots = cast(SlotMapping, self.spyre_slots).slots
     dep = None
     if slots is not None:
@@ -100,10 +96,8 @@ def _spyre_attention_forward(
 def _can_split(layer: Attention) -> bool:
     """Only Spyre paged attention, and only where upstream's own prologue is a no-op."""
     return (
-        # Encoder-only layers have no KV cache to write, and their impl subclasses the
-        # paged one, so they inherit `do_kv_cache_update` and would otherwise qualify
-        # here and scatter into an unbound cache. `attn_type` is set at construction,
-        # unlike `kv_cache`, which is not yet bound when install() runs.
+        # Encoder-only impls inherit `do_kv_cache_update` from the paged one and would
+        # otherwise scatter into an unbound cache; `kv_cache` is not bound yet here.
         layer.attn_type == AttentionType.DECODER
         and hasattr(layer.impl, "do_kv_cache_update")
         and layer.kv_sharing_target_layer_name is None

@@ -614,15 +614,12 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         return active_bs, tiles
 
     def _publish_slot_mapping(self, slot_mapping: torch.Tensor, num_actual_tokens: int) -> None:
-        """Mirror this step's slot mapping to device on the shared holder, so no
-        transfer is traced into the per-block graph."""
+        """Mirror this step's slot mapping to device, keeping the transfer out of the graph."""
         if not self._kv_layers:
             return
         if self._slots_device is None:
-            # Encoder-only groups reach this builder too (SpyreEncoderAttentionBackend
-            # inherits it) and never get a cache bound: `Attention.kv_cache` keeps its
-            # `torch.tensor([])` default, so indexing it raises. Nothing to publish for
-            # them, and clearing the layer list makes that decision once per builder.
+            # Encoder-only groups reach this builder too and never get a cache bound, so
+            # `Attention.kv_cache` keeps its empty default and indexing it would raise.
             self._kv_layers = [layer for layer in self._kv_layers if len(layer.kv_cache) > 0]
             if not self._kv_layers:
                 return
@@ -969,7 +966,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Slot-major views of the pages, built once outside any graph.
 
         Inductor cannot lower a store through a view of a Spyre-layout tensor created
-        inside a graph. Valid because a view keeps the slot-outermost device layout.
+        inside a graph.
         """
         if self._kv_slots is None:
             k_pages, v_pages = kv_cache
@@ -997,8 +994,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         k_slots, v_slots = self.kv_slot_views(kv_cache)
         # Eager index_copy_ rejects an int32 index and silently falls back to CPU with an
-        # int64 one, so this always goes through the compiled artifact; inside the outer
-        # graph dynamo inlines it rather than launching a second region.
+        # int64 one, so this always goes through the compiled artifact.
         self._reshape_fn(key, value, k_slots, v_slots, slot_mapping)
         return k_slots
 
