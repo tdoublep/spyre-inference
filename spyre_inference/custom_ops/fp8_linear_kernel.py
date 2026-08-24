@@ -215,6 +215,16 @@ if FP8ScaledMMLinearKernel is not None:
                 layer._fp8_n_weight_splits = splits
             return splits
 
+        # Not an untraceable op. The GEMM is already Dynamo/Inductor:
+        # ``_compiled_fp8_scaled_mm`` (qfp8ch + qfp8wt + aten._scaled_mm).
+        # ``recursive=False`` keeps that nested compile. This wrapper stays
+        # eager because (1) SuperDSC only accepts M∈{1,4} and N∈{4096,1024,128},
+        # so Granite QKV/gate_up is a Python tile/split loop with clone()'d
+        # views (storage_offset is ignored); (2) first-forward CPU float8→fp16
+        # for qfp8wt is not Spyre-graphable; (3) inlining this into the outer
+        # torch.compile fuses Granite-sized qfp8wt+_scaled_mm and SuperDSC
+        # aborts (distributeElemArrToTemporalLoops / Dynamo skip-inline).
+        # Drop this when those shapes compile as one graph.
         @torch._dynamo.disable(recursive=False)
         def apply_weights(
             self,
@@ -276,15 +286,15 @@ if FP8ScaledMMLinearKernel is not None:
             bias: torch.Tensor | None,
             output_shape: list,
         ) -> torch.Tensor:
-            out = torch.ops.aten._scaled_mm(
-                A,  # ty: ignore[invalid-argument-type]
-                B,  # ty: ignore[invalid-argument-type]
-                scale_a=As,  # ty: ignore[invalid-argument-type]
-                scale_b=Bs,  # ty: ignore[invalid-argument-type]
-                bias=bias,  # ty: ignore[invalid-argument-type]
-                out_dtype=out_dtype or torch.float16,  # ty: ignore[invalid-argument-type]
+            # Required: FP8ScaledMMLinearKernel marks this abstract. Unused on Spyre.
+            # Upstream Torch only overrides this hook because parent apply_weights
+            # quantizes then calls it with already-FP8 A/B. We replace apply_weights
+            # (tiling + in-graph qfp8ch/qfp8wt), so this is never entered. Do not
+            # wrap _fp8_mm here: that helper expects FP16 x/W, not pre-quantized A/B.
+            raise RuntimeError(
+                "SpyreFp8LinearKernel runs only through apply_weights "
+                "(tiled qfp8ch/qfp8wt graph). apply_scaled_mm is unused."
             )
-            return out.reshape(*output_shape) if output_shape else out
 
     SpyreFp8DequantLinearKernel = SpyreFp8LinearKernel
 
