@@ -26,6 +26,7 @@ import torch
 
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.attention import Attention
+from vllm.v1.attention.backend import AttentionType
 from vllm.utils.torch_utils import _encode_layer_name
 
 logger = init_logger(__name__)
@@ -97,7 +98,12 @@ def _spyre_attention_forward(
 def _can_split(layer: Attention) -> bool:
     """Only Spyre paged attention, and only where upstream's own prologue is a no-op."""
     return (
-        hasattr(layer.impl, "do_kv_cache_update")
+        # Encoder-only layers have no KV cache to write, and their impl subclasses the
+        # paged one, so they inherit `do_kv_cache_update` and would otherwise qualify
+        # here and scatter into an unbound cache. `attn_type` is set at construction,
+        # unlike `kv_cache`, which is not yet bound when install() runs.
+        layer.attn_type == AttentionType.DECODER
+        and hasattr(layer.impl, "do_kv_cache_update")
         and layer.kv_sharing_target_layer_name is None
         and layer.query_quant is None
         and not layer.calculate_kv_scales
