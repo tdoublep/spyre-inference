@@ -144,11 +144,16 @@ def _create_compilable_page_attn(
     head_size: int,
     has_alibi: bool = False,
     logits_soft_cap: float = 0.0,
+    fused_store: bool = False,
 ):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
-    Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi, and
-    logits_soft_cap are closure constants.
+    Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi,
+    logits_soft_cap, and fused_store are closure constants.
+
+    With ``fused_store``, the kernel copies its result into the caller's output
+    buffer instead of returning it, so the store joins the attention jobplan
+    rather than costing a separate eager dispatch and launch per layer.
     """
 
     def specialized_paged_attn_kernel(
@@ -159,6 +164,7 @@ def _create_compilable_page_attn(
         mask_tiles,
         scale,
         alibi_bias_tiles=None,
+        out=None,
     ):
         """
         This kernels specializes for num_blocks and padded_query_len.
@@ -177,7 +183,11 @@ def _create_compilable_page_attn(
                 the derivation at the bias-tile construction site in
                 _online_softmax_attention.
 
-        Returns [padded_query_len, num_heads, head_size].
+            out: only with fused_store — the caller's output buffer, which this
+                sequence owns in full ([padded_query_len, num_heads, head_size]).
+
+        Returns [padded_query_len, num_heads, head_size], or ``out`` when
+        fused_store copied the result in place.
         """
         tile_max = None
         tile_sum = None
@@ -232,7 +242,19 @@ def _create_compilable_page_attn(
         assert tile_output is not None and tile_sum is not None
         attn = tile_output / tile_sum
         attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
-        return attn.reshape(padded_query_len, num_heads, head_size)
+        attn = attn.reshape(padded_query_len, num_heads, head_size)
+        if fused_store:
+            # A whole-tensor copy_, not an indirect index_copy_. A compiled
+            # index_copy_ needs a row-outermost destination and writes nothing at
+            # all when the destination has a single row — which is every batch-1
+            # decode, so the store silently never landed. That sank the first
+            # attempt at this (e73c953, reverted in 41dbd14). The caller only
+            # enables fused_store when this sequence owns every row of `out`, so
+            # the shapes match exactly and a plain copy_ is all that is needed.
+            assert out is not None
+            out.copy_(attn)
+            return out
+        return attn
 
     return specialized_paged_attn_kernel
 
@@ -851,17 +873,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # back to CPU with an int64 one.
         self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
 
-        # Compiled attention loops, keyed by (num_blocks, padded_query_len)
-        self._attn_fns: dict[tuple[int, int], object] = {}
+        # Compiled attention loops, keyed by (num_blocks, padded_query_len, fused_store)
+        self._attn_fns: dict[tuple[int, int, bool], object] = {}
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
         )
 
-    def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
+    def _get_attn_fn(self, num_blocks: int, padded_query_len: int, fused_store: bool = False):
         # self.alibi_slopes and self.logits_soft_cap are fixed per instance, so
         # has_alibi and logits_soft_cap don't need to be part of the cache key.
-        key = (num_blocks, padded_query_len)
+        key = (num_blocks, padded_query_len, fused_store)
         if key not in self._attn_fns:
             self._attn_fns[key] = _maybe_compile(
                 _create_compilable_page_attn(
@@ -871,6 +893,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     self.head_size,
                     has_alibi=self.alibi_slopes is not None,
                     logits_soft_cap=self.logits_soft_cap,
+                    fused_store=fused_store,
                 ),
                 self._compile_attn,
             )
@@ -1006,6 +1029,22 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         active_block_indices_all = attn_metadata.active_block_indices
         aligned_max_query_len = attn_metadata.aligned_max_query_len
         page_index_tables = attn_metadata.page_index_tables
+        # The kernel can store into `output` itself — folding the store into its
+        # jobplan instead of an eager slice-assign per layer — only when this
+        # step's single sequence owns every row of the buffer, so the store is a
+        # plain copy_ of matching shape. A compiled kernel also reads its
+        # arguments from offset 0 (torch-spyre#3770), and vLLM hands out a fresh
+        # buffer per layer, so the buffer is re-checked on every call. Only worth
+        # it when attention is compiled; eager keeps the slice-assign.
+        fused_store_ok = (
+            self._compile_attn
+            and num_seqs == 1
+            and aligned_max_query_len == attn_metadata.max_query_len
+            and output.shape[0] == aligned_max_query_len
+            and output.dtype == query_dev.dtype
+            and output.storage_offset() == 0
+            and output.is_contiguous()
+        )
         assert mask_tiles_all is not None, (
             "attention_mask_tiles_device must be mirrored by forward()"
         )
@@ -1095,8 +1134,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     bias = self.alibi_slopes * rel
                     alibi_bias_tiles.append(convert(bias, device=_target_device))
 
-            # Run attention on target device
-            attn_fn = self._get_attn_fn(len(active_bs), aligned_max_query_len)
+            # Run attention on target device. When the kernel can copy straight
+            # into `output`, the store joins its jobplan instead of costing a
+            # separate eager dispatch and launch per layer.
+            attn_fn = self._get_attn_fn(
+                len(active_bs), aligned_max_query_len, fused_store=fused_store_ok
+            )
             result = attn_fn(
                 q_dev,
                 k_pages,
@@ -1105,9 +1148,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 mask_tiles,
                 self.scale,
                 alibi_bias_tiles=alibi_bias_tiles,
+                out=output if fused_store_ok else None,
             )
 
             assert result.dtype == output.dtype
+            if fused_store_ok:
+                # The kernel wrote `output` itself; `result` is that same buffer.
+                continue
             output[q_start:q_end] = result[:query_len]
 
         return output

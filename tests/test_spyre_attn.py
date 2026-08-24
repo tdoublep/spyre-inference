@@ -329,8 +329,14 @@ def _run_spyre_attn_test(
     num_query_heads: int = 32,
     num_kv_heads: int = 8,
     head_size: int = 128,
+    expect_fused_store: bool | None = None,
 ) -> None:
-    """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
+    """Shared test body: validate SpyreAttentionImpl against a reference implementation.
+
+    ``expect_fused_store`` asserts whether the backend took the fused output store
+    (the kernel writing ``output`` itself) or the eager slice-assign. Left None,
+    either is accepted.
+    """
     # The compiled attention kernel targets the Spyre device. On CPU it routes
     # through Inductor's C++ backend, whose codegen for the kernel's indirect
     # index_select + transpose pattern is broken ("use of undeclared identifier
@@ -421,7 +427,10 @@ def _run_spyre_attn_test(
         logits_soft_cap=soft_cap,
     )
 
-    output = torch.empty_like(query).to(cache_device)
+    # NaN rather than empty_like: every row is expected to be written, so a store
+    # that silently lands nowhere fails the comparison below instead of passing on
+    # whatever the allocator happened to hand back.
+    output = torch.full_like(query, float("nan")).to(cache_device)
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
     key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
     # The impl expects q/k/v already on device, as in production (QKV runs
@@ -435,6 +444,15 @@ def _run_spyre_attn_test(
         attn_metadata=attn_metadata,
         output=output,
     )
+
+    if expect_fused_store is not None:
+        # Keyed (num_blocks, padded_query_len, fused_store); a True key exists iff
+        # the kernel was built to store its own result and so was handed `output`.
+        fused_used = any(key[2] for key in attn_impl._attn_fns)
+        assert fused_used == expect_fused_store, (
+            f"fused output store: expected {expect_fused_store}, got {fused_used} "
+            f"(kernel cache keys: {sorted(attn_impl._attn_fns)})"
+        )
 
     ref_output = ref_attn(
         query=query,
@@ -557,6 +575,55 @@ def test_spyre_attn_compiled_multi_seq(
         sliding_window=None,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [pytest.param("spyre", id="device_spyre")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    ("configure_compilation", "seq_lens", "expect_fused_store"),
+    [
+        pytest.param("STOCK_TORCH_COMPILE", [(1, 512)], True, id="STOCK-decode(1seq)-fused"),
+        pytest.param("STOCK_TORCH_COMPILE", [(32, 256)], True, id="STOCK-prefill(1seq)-fused"),
+        pytest.param(
+            "STOCK_TORCH_COMPILE",
+            [(1, 256), (1, 512)],
+            False,
+            id="STOCK-decode(2seqs)-eager",
+        ),
+        pytest.param("NONE", [(1, 512)], False, id="NONE-decode(1seq)-eager"),
+    ],
+    indirect=["configure_compilation"],
+)
+def test_spyre_attn_fused_output_store(
+    default_vllm_config,
+    seq_lens: list[tuple[int, int]],
+    expect_fused_store: bool,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """The compiled kernel storing its own result must land in the output buffer.
+
+    A compiled index_copy_ writes nothing at all when the destination has a single
+    row — every batch-1 decode — so the first version of this store silently never
+    landed (e73c953, reverted in 41dbd14). It went unnoticed because every
+    compiled-on-device combination was skipped at the time, and the fused store
+    only engages when compiled and on device: nothing in this file executed it.
+
+    So this asserts both halves. That the output is correct, and that the path
+    under test is the one that actually ran — otherwise a guard that quietly stops
+    engaging leaves these cases passing while covering only the eager store.
+    """
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        expect_fused_store=expect_fused_store,
     )
 
 
