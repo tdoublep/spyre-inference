@@ -23,11 +23,7 @@ The cache must be materialized on-device *before* compile: building it inside th
 forward (host chunk/stack/view then device transfer) segfaults libsenlib during warmup.
 ``_apply`` primes it when the module moves to Spyre, ahead of ``torch.compile``.
 
-The device cache is flattened to 2D ``[max_pos, 4 * inner]`` and stickified with the
-position axis outermost, so ``index_select`` reads only the rows it indexes. Spyre
-requires a gather's indexed dimension at device position 0, and the default layout of
-the natural ``[max_pos, 2, 2, inner]`` cache does not put it there, which turns each
-gather into a pass over all ``max_pos`` rows.
+The cache is flattened to 2D and placed rows-outermost (see ``place_row_gathered``).
 
 Only neox-style full rotary is supported; other configs raise ``NotImplementedError``.
 """

@@ -252,8 +252,7 @@ def test_lm_head_weight_not_relaid_out(tp_group):
 
 @pytest.mark.vocab_parallel_embedding
 def test_vocab_table_crosses_to_device_once(tp_group):
-    """The table must not be moved by super()._apply and then re-moved with the gather
-    layout. Only the one-row probe is handed to fn; the table itself is placed directly."""
+    """Only the one-row probe goes through fn; the table itself is placed directly."""
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         VocabParallelEmbedding,
     )
@@ -276,9 +275,7 @@ def test_vocab_table_crosses_to_device_once(tp_group):
 
 @pytest.mark.vocab_parallel_embedding
 def test_unaligned_row_width_keeps_default_device_layout(tp_group, monkeypatch):
-    """A row width that is not a whole number of sticks cannot be expressed in the
-    gather layout. The table still lands on device and still gathers correctly -- only
-    the speedup is lost -- and a warning names the table so it is not lost silently."""
+    """Unaligned rows keep the default layout: still on device, still correct."""
     from torch_spyre._C import get_elem_in_stick, get_spyre_tensor_layout
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         VocabParallelEmbedding,
@@ -314,9 +311,7 @@ def test_unaligned_row_width_keeps_default_device_layout(tp_group, monkeypatch):
 
 @pytest.mark.vocab_parallel_embedding
 def test_tied_lm_head_table_is_row_gathered(tp_group):
-    """With tie_word_embeddings the LM head's `weight` starts out as the embedding's
-    Parameter. The embedding lookup must still get the gather layout, and the head must
-    still project through its own `padded_weight_t`, which stays a matmul operand."""
+    """A tied LM head shares the table, which must still be row-gathered for the lookup."""
     from torch_spyre._C import get_elem_in_stick, get_spyre_tensor_layout
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         ParallelLMHead,
@@ -332,7 +327,6 @@ def test_tied_lm_head_table_is_row_gathered(tp_group):
     head = head.tie_weights(embed)
     assert head.weight is embed.weight, "tie_weights should share the Parameter"
 
-    # As the loader does: build the head's transposed operand from the tied table.
     head.quant_method.process_weights_after_loading(head)
 
     input_ids = torch.randint(0, vocab_size, (num_tokens,), dtype=torch.int64)
@@ -341,7 +335,6 @@ def test_tied_lm_head_table_is_row_gathered(tp_group):
     expected_embedding = F.embedding(input_ids, table)
     expected_logits = hidden.float() @ table.float().t()
 
-    # Mirror `model.to(device)` over a tied model: the embedding is reached first.
     model = torch.nn.Module()
     model.embed = embed
     model.lm_head = head
@@ -352,9 +345,8 @@ def test_tied_lm_head_table_is_row_gathered(tp_group):
         vocab_size,
         embedding_dim // eps,
         eps,
-    ], "the tied table must still be placed rows-outermost for the embedding lookup"
+    ], "tied table must stay rows-outermost"
 
-    # The projection operand is separate storage and must not get the gather layout.
     weight_t = model.lm_head.padded_weight_t.data
     rows, width = weight_t.shape
     assert list(get_spyre_tensor_layout(weight_t).device_size) != [rows, width // eps, eps], (

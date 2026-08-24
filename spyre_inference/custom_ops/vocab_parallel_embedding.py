@@ -45,13 +45,7 @@ class SpyreVocabParallelEmbedding(VocabParallelEmbedding):
             )
 
     def _apply(self, fn, recurse=True):
-        # The vocab table is only ever gathered from, so place it rows-outermost. Wrap fn
-        # rather than relayouting after super()._apply: the table then crosses to device
-        # once instead of being moved and immediately re-moved, and super() still does the
-        # CPU->device Parameter swap itself (a plain `weight.data = <spyre tensor>` is
-        # rejected across backends). A tied lm head starts out sharing this table but
-        # projects through its own `padded_weight_t`, so this layout is never a matmul
-        # operand.
+        # Wrapping fn keeps this to one transfer; super() still does the Parameter swap.
         weight = self._parameters.get("weight")
 
         def place(tensor: torch.Tensor) -> torch.Tensor:

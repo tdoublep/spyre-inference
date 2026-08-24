@@ -120,41 +120,25 @@ def register():
 
 
 def place_row_gathered(src: torch.Tensor, fn, name: str) -> torch.Tensor:
-    """Move a 2D source that is only ever gathered from to device, rows-outermost.
-
-    Spyre requires a gather's indexed dimension at device position 0. The default
-    layout places it inwards, and the gather then reads the whole source instead of
-    the rows it indexes -- cost linear in source size, flat in index count.
-
-    ``fn`` is an ``nn.Module._apply`` callable, which cannot express a
-    ``device_layout``, so it is probed on a single row to learn the destination and
-    ``src`` is then placed in one transfer (the H2D copy casts and stickifies in the
-    requested layout). Falls back to plain ``fn(src)`` -- same device, default layout
-    -- when the destination is not Spyre, or when a row is not a whole number of
-    sticks and the layout would need padding it cannot express.
-
-    Reaches into ``torch_spyre._C`` for the layout primitives; a natural candidate to
-    move into torch-spyre once it grows a gather-friendly layout helper of its own.
-    """
+    """Move a 2D gather source to device with its rows outermost."""
+    # TODO(tdoublep): can this be moved upstream?
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
 
+    # fn cannot carry a device_layout, so probe it on one row to learn the destination.
     probe = fn(src[:1])
     if probe.device.type != "spyre":
         return fn(src)
 
     num_rows, row_width = src.shape
+    # Spyre needs a gather's indexed dim at device position 0, and a row must fill
+    # whole sticks: 64 elements for fp16 (128-byte stick / 2 bytes per element).
     elems_per_stick = get_elem_in_stick(probe.dtype)
     if row_width % elems_per_stick:
         logger.warning_once(
-            "%s: row width %d is not a multiple of the %d-element %s stick, so the "
-            "rows-outermost layout cannot be applied and every gather will read the "
-            "whole %dx%d source. Pad the row width to recover the fast path.",
+            "%s: row width %d is not a multiple of %d, keeping the default layout (slower gather).",
             name,
             row_width,
             elems_per_stick,
-            probe.dtype,
-            num_rows,
-            row_width,
         )
         return fn(src)
 
