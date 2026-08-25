@@ -29,9 +29,7 @@ from vllm.model_executor.layers.activation import NewGELU
 class SpyreNewGELU(NewGELU):
     """`gelu_new` for Spyre, cubing by multiplication instead of `torch.pow`."""
 
-    # `torch.pow(x, 3.0)` returns `|x| ** 4` on Spyre (torch-spyre#4009), which saturates
-    # the tanh term to +1 and makes gelu_new the identity for negative x. Overriding
-    # forward_native rather than forward_oot also covers the custom-op-disabled path.
+    # `torch.pow(x, 3.0)` returns `|x| ** 4` on Spyre (torch-spyre#4009).
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         c = math.sqrt(2.0 / math.pi)
         return 0.5 * x * (1.0 + torch.tanh(c * (x + 0.044715 * x * x * x)))
