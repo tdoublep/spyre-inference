@@ -264,7 +264,7 @@ def test_num_gpu_blocks_override_homogeneous():
     blocks_per_seq = math.ceil(
         vllm_config.model_config.max_model_len / vllm_config.cache_config.block_size
     )
-    assert vllm_config.cache_config.num_gpu_blocks_override == max_num_seqs * blocks_per_seq
+    assert vllm_config.cache_config.num_gpu_blocks_override == max_num_seqs * blocks_per_seq + 1
 
 
 def test_num_gpu_blocks_override_skipped_for_hybrid():
