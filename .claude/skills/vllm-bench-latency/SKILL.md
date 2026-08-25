@@ -2,7 +2,7 @@
 name: vllm-bench-latency
 description: Run `vllm bench latency` for a user-specified model on Spyre from within this checkout, then report avg latency + percentiles. If the user asks to compare, re-run the identical benchmark on `main` (via a throwaway git worktree, non-destructive to the working tree) and print a side-by-side comparison. Use when the user wants Spyre latency numbers for a model, or wants to see how the current branch's latency compares to main. Assumes you are already on the Spyre host with spyre-inference installed editable.
 user-invocable: true
-argument-hint: "<model> [--compare-main] [--input-len N] [--output-len N] [--batch-size N] [--max-model-len N] [--num-iters N] [--num-iters-warmup N] [--mode MODE]"
+argument-hint: "<model> [--compare-main] [--input-len N] [--output-len N] [--batch-size N] [--max-model-len N] [--num-iters N] [--num-iters-warmup N] [--enforce-eager]"
 ---
 
 # Latency benchmark on Spyre
@@ -20,7 +20,8 @@ Run `vllm bench latency` for a model the user names against **this** `spyre-infe
 
 - **`<model>`** (required): HF model id or locally-cached path. If omitted, default to `ibm-granite/granite-3.3-8b-instruct` and say so in the report.
 - **`--compare-main`**: after the current-branch run, run the **identical** benchmark on local `main` and print a comparison. Only when the user asks to compare.
-- Benchmark params (optional; defaults in parens): `--input-len` (64), `--output-len` (64), `--batch-size` (1), `--max-model-len` (128), `--num-iters` (10), `--num-iters-warmup` (2), `--mode` (`STOCK_TORCH_COMPILE`, passed as `-cc.mode`).
+- Benchmark params (optional; defaults in parens): `--input-len` (64), `--output-len` (64), `--batch-size` (1), `--max-model-len` (128), `--num-iters` (10), `--num-iters-warmup` (2).
+- **`--enforce-eager`**: benchmark the uncompiled path. Only pass it if the user asks — compiled (`STOCK_TORCH_COMPILE`) is the platform default.
 
 ## Steps
 
@@ -38,21 +39,20 @@ Fix the params in one block so a compare run is identical, then run and read bac
 
 ```bash
 MODEL="<model>"; INPUT_LEN=64; OUTPUT_LEN=64; BATCH_SIZE=1
-MAX_LEN=128; ITERS=10; WARMUP=2; MODE=STOCK_TORCH_COMPILE
+MAX_LEN=128; ITERS=10; WARMUP=2; EAGER=""   # EAGER="--enforce-eager" only if asked
 TAG=branch
 OUT=.claude/skills/vllm-bench-latency/logs; mkdir -p "$OUT"   # artifacts live here, not the repo root
 
-VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800 SPYRE_FORCE_COMPILE_ATTN=1 \
 uv run --no-sync vllm bench latency \
   --model "$MODEL" \
   --input-len $INPUT_LEN --output-len $OUTPUT_LEN --batch-size $BATCH_SIZE \
   --num-iters-warmup $WARMUP --num-iters $ITERS --max-model-len $MAX_LEN \
-  -cc.mode $MODE \
+  $EAGER \
   --output-json "$OUT/latency_${TAG}.json" 2>&1 | tee "$OUT/latency_${TAG}.log"
 cat "$OUT/latency_${TAG}.json"
 ```
 
-The JSON has `avg_latency` (s), `latencies` (per-iter), `percentiles` (keys 10/25/50/75/90/99). First run is slow (eager + cold compile — the `1800`s timeout is deliberately generous); `FallbackWarning` lines are normal. On error, report the tail of `$OUT/latency_${TAG}.log`, not a fake number.
+The JSON has `avg_latency` (s), `latencies` (per-iter), `percentiles` (keys 10/25/50/75/90/99). First run is slow (cold compile); `FallbackWarning` lines are normal. On error, report the tail of `$OUT/latency_${TAG}.log`, not a fake number.
 
 ### 2. Compare against `main` (only if `--compare-main`)
 
@@ -64,12 +64,11 @@ MAIN_SHA=$(git rev-parse --short main)
 uv pip install --no-deps -e "$WT"            # repoint editable install at main
 
 TAG=main
-VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=1800 SPYRE_FORCE_COMPILE_ATTN=1 \
 uv run --no-sync vllm bench latency \
   --model "$MODEL" \
   --input-len $INPUT_LEN --output-len $OUTPUT_LEN --batch-size $BATCH_SIZE \
   --num-iters-warmup $WARMUP --num-iters $ITERS --max-model-len $MAX_LEN \
-  -cc.mode $MODE \
+  $EAGER \
   --output-json "$OUT/latency_${TAG}.json" 2>&1 | tee "$OUT/latency_${TAG}.log"
 cat "$OUT/latency_${TAG}.json"
 
@@ -87,7 +86,7 @@ Report the model + exact params, then numbers from the JSON:
 - **Compare mode**: a small table (branch vs main) of avg latency + key percentiles, the absolute and % change (`(branch − main) / main × 100`), and which is faster. Label each column with its branch/sha.
 
 ```text
-model: <model>   params: in<N>/out<N>/bs<N>/max<N>/iters<N>/warmup<N>/<MODE>
+model: <model>   params: in<N>/out<N>/bs<N>/max<N>/iters<N>/warmup<N>/<compiled|eager>
                         main (<sha>)   <branch> (<sha>)   Δ
 avg latency (s)         <a>            <b>                <b−a>  (<pct>%, <faster/slower>)
 p50 (s)                 <a>            <b>                <b−a>
@@ -97,6 +96,7 @@ p90 (s)                 <a>            <b>                <b−a>
 ## Notes & pitfalls
 
 - **First run is slow.** A cold cache forces a recompile even with a shared cache PVC, so the cold compile can take many minutes — *most of it during the first warmup iteration*. The `Fast Path Debug] SUCCESS` spam is per-decode-shape compilation and keeps going well after `Warming up...` prints, so reaching warmup is **not** "almost done"; don't promise an ETA while those lines still emit. In `--compare-main` mode the `main` leg often compiles cheaper (reuses the shapes the first leg warmed) — so compile cost doesn't explain latency deltas; those live in the timed iters.
-- **`-cc.mode` isn't universally safe.** `STOCK_TORCH_COMPILE` is a good default (granite, llama), but some models crash *natively* at warmup under it (gemma-class here). If warmup dies natively rather than raising a Python error, retry with a different `-cc.mode` before calling it a regression.
+- **No compile env vars.** `--enforce-eager` is the only compile switch. `SPYRE_FORCE_COMPILE_ATTN`, `-cc.mode` and a bumped `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` show up in older logs and notes here — they are stale; do not copy them forward.
+- **Compile isn't universally safe.** Granite and llama are fine, but some models crash *natively* at warmup under compile (gemma-class here). If warmup dies natively rather than raising a Python error, retry with `--enforce-eager` before calling it a regression, and label the result as eager.
 - **Model not cached**: an uncached HF model downloads on first use (extra minutes); a locally-cached id skips that.
 - **Metrics scope**: this reports *only* whole-generation latency (`avg_latency`, `latencies`, `percentiles`, all in seconds) — each iter is one opaque `llm.generate()` over the batch. There is **no** TTFT / ITL / TPOT / per-token breakdown and no throughput in the JSON (derive it as above). If the user wants TTFT or ITL/TPOT, that's `vllm bench serve` (needs a live `vllm serve` server) — say so rather than faking it from this run.
