@@ -74,6 +74,7 @@ from spyre_inference.custom_ops.head_pad import (
     reject_padded_qk_norm,
     verify_padded_head_dim,
 )
+from spyre_inference.custom_ops.parallel_lm_head import install_tied_lm_head_projection
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
@@ -445,6 +446,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         reject_padded_qk_norm(self.model, self.model_config.hf_config)
         fix_padded_rope(self.model, self.model_config.hf_config)
         fix_padded_attention_scale(self.model, self.model_config.hf_config)
+
+        # Must run before the .to(device) below so the new Parameter is placed too.
+        install_tied_lm_head_projection(self.model)
 
         # Keep Attention module buffers (_k_scale, _v_scale, etc.) on CPU.
         # Note: This _apply cannot reside in SpyreAttentionImpl, as it is not

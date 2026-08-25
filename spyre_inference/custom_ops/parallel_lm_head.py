@@ -21,10 +21,13 @@ Spyre Device Constraints:
       Other quantization methods raise NotImplementedError.
 """
 
+import torch
+
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     UnquantizedEmbeddingMethod,
+    VocabParallelEmbedding,
 )
 
 from .linear import SpyreTransposedWeightMethod
@@ -63,3 +66,33 @@ class SpyreParallelLMHead(ParallelLMHead):
 
         # Set the custom quantization method to route through spyre
         self.quant_method = SpyreUnquantizedLMHeadMethod()
+
+
+def install_tied_lm_head_projection(model: torch.nn.Module) -> None:
+    """Route a tied lm_head through the padded transposed weight.
+
+    `tie_word_embeddings` sets `lm_head = embed_tokens`, leaving the head a
+    VocabParallelEmbedding that never reaches SpyreParallelLMHead: logits go through
+    `F.linear(x, weight)`, which relayouts the `[vocab, hidden]` table with vocab
+    innermost on every call. Work division may only split a stick dim by a divisor of
+    its stick count, so a 151936 vocab (2374 = 2 * 1187 sticks) is stuck at 2 cores
+    and exceeds the 256 MB per-core span once hidden reaches 2048.
+
+    `weight` is left as-is: it is still `embed_tokens.weight`, and still needs the
+    row-gathered layout for the gather.
+    """
+    for module in model.modules():
+        head = getattr(module, "lm_head", None)
+        # An untied head is a ParallelLMHead, which already resolves to the OOT class.
+        if not isinstance(head, VocabParallelEmbedding) or isinstance(head, ParallelLMHead):
+            continue
+        if isinstance(head.quant_method, SpyreUnquantizedLMHeadMethod):
+            continue
+        head.quant_method = SpyreUnquantizedLMHeadMethod()
+        head.quant_method.process_weights_after_loading(head)
+        vocab, hidden = head.weight.shape
+        logger.info(
+            "Tied lm_head (vocab=%d, hidden=%d): projecting through padded_weight_t.",
+            vocab,
+            hidden,
+        )

@@ -303,6 +303,114 @@ def test_spyre_logits_processor_scaling(tp_group, spyre_or_cpu_device, scale):
     torch.testing.assert_close(logits_out.cpu().float(), logits_ref.float(), atol=1e-2, rtol=1e-2)
 
 
+# Tied lm_head tests (issue #631). The per-core span that motivates the fix only
+# shows up on real weights; these cover the behaviour that avoids it.
+
+
+def _tied_model(embed):
+    """A model whose lm_head IS its embedding, as tie_word_embeddings produces."""
+
+    class TiedModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = embed
+            self.lm_head = embed
+
+    return TiedModel()
+
+
+@pytest.mark.parallel_lm_head
+@pytest.mark.parametrize("vocab_size", [128, 49216])
+def test_tied_lm_head_gets_transposed_projection(tp_group, vocab_size):
+    """A tied lm_head is switched to the padded transposed-weight projection.
+
+    `weight` must survive untouched: it is still `embed_tokens.weight` and still needs
+    the row-gathered layout for the gather.
+    """
+    from spyre_inference.custom_ops.parallel_lm_head import (
+        SpyreUnquantizedLMHeadMethod,
+        install_tied_lm_head_projection,
+    )
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    embedding_dim = 64
+    torch.manual_seed(42)
+
+    embed = VocabParallelEmbedding(vocab_size, embedding_dim, params_dtype=torch.float16)
+    loaded = torch.randn(embed.weight.shape, dtype=torch.float16)
+    embed.weight.data.copy_(loaded)
+    weight_before = embed.weight
+
+    install_tied_lm_head_projection(_tied_model(embed))
+
+    assert isinstance(embed.quant_method, SpyreUnquantizedLMHeadMethod)
+    # Same Parameter object, same values: the tie and the gather layout hold.
+    assert embed.weight is weight_before
+    torch.testing.assert_close(embed.weight.data, loaded, atol=0.0, rtol=0.0)
+
+    padded_vocab = vocab_size + embed.spyre_row_padding
+    assert padded_vocab % (64 * 32) == 0
+    assert embed.padded_weight_t.shape == (embedding_dim, padded_vocab)
+    torch.testing.assert_close(
+        embed.padded_weight_t[:, :vocab_size], loaded.t(), atol=0.0, rtol=0.0
+    )
+
+
+@pytest.mark.parallel_lm_head
+def test_tied_lm_head_projection_matches_reference(tp_group):
+    """The tied head's logits match F.linear, and its gather still works."""
+    from spyre_inference.custom_ops.parallel_lm_head import (
+        install_tied_lm_head_projection,
+    )
+    from vllm.model_executor.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+
+    vocab_size, embedding_dim, num_tokens = 49216, 64, 7
+    torch.manual_seed(42)
+
+    embed = VocabParallelEmbedding(vocab_size, embedding_dim, params_dtype=torch.float16)
+    embed.weight.data.normal_(std=0.02)
+    install_tied_lm_head_projection(_tied_model(embed))
+
+    x = torch.randn(num_tokens, embedding_dim, dtype=torch.float16)
+    input_ids = torch.randint(0, vocab_size, (num_tokens,), dtype=torch.int64)
+    logits_ref = reference_lm_head(x, embed.weight.data)
+    gather_ref = F.embedding(input_ids, embed.weight)
+
+    embed = embed.to("spyre")
+    logits = embed.quant_method.apply(embed, x.to("spyre"))
+    gather = embed(input_ids.to("spyre"))
+
+    assert logits.shape == (num_tokens, vocab_size)
+    # Spyre matmul accumulation order diverges from the CPU reference in fp16.
+    torch.testing.assert_close(logits.cpu().float(), logits_ref.float(), atol=1e-1, rtol=5e-2)
+    torch.testing.assert_close(gather.cpu().float(), gather_ref.float(), atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parallel_lm_head
+def test_untied_lm_head_left_alone(tp_group):
+    """An untied head is already a SpyreParallelLMHead; the installer must skip it."""
+    from spyre_inference.custom_ops.parallel_lm_head import (
+        install_tied_lm_head_projection,
+    )
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    head = ParallelLMHead(128, 64, params_dtype=torch.float16)
+    head.weight.data.normal_(std=0.02)
+    head.quant_method.process_weights_after_loading(head)
+
+    method_before = head.quant_method
+    weight_t_before = head.padded_weight_t
+
+    install_tied_lm_head_projection(_tied_model(head))
+
+    assert head.quant_method is method_before
+    assert head.padded_weight_t is weight_t_before
+
+
 @pytest.fixture
 def spyre_or_cpu_device():
     """Use Spyre if available, otherwise CPU."""
