@@ -240,7 +240,7 @@ def test_is_hybrid_attention_missing_layer_types():
 
 
 def test_num_gpu_blocks_override_homogeneous():
-    """Non-hybrid models get the plain seqs × blocks/seq pinned block count."""
+    """Non-hybrid models get seqs × blocks/seq pinned, plus the null block."""
     from spyre_inference.platform import TorchSpyrePlatform
 
     model_config = ModelConfig(
