@@ -12,6 +12,7 @@ Run `vllm bench latency` for a model the user names against **this** `spyre-infe
 ## Hard constraints (do not violate)
 
 - **Single accelerator, sequential only.** Spyre serves one process at a time — never run two Spyre-backed commands concurrently (no backgrounding, no `pytest -n`). In `--compare-main` mode the two runs are strictly sequential.
+- **Profiler-free `torch-spyre` only.** A wheel built with `USE_SPYRE_PROFILER=1` carries the instrumentation into every run and inflates latency by ~20%. Those numbers are not comparable to a normal build and must not be reported as latency — verify in preflight and stop if the profiler is linked.
 - **`uv run --no-sync`** is mandatory — a plain `uv run` / `uv sync` re-resolves the lockfile and clobbers the editable install.
 - **Non-destructive.** The `main` comparison uses a throwaway `git worktree` + a temporary editable-install repoint — never `git checkout` / `git stash` in the working copy, and always restore (step 2).
 - **Always report, never invent.** End every run with numbers from the JSON (step 3); if a run fails, report the failure with the log tail instead of a number.
@@ -31,6 +32,12 @@ Run `vllm bench latency` for a model the user names against **this** `spyre-infe
 test -d .venv || { echo "no .venv — run 'uv sync' first"; exit 1; }
 BRANCH=$(git rev-parse --abbrev-ref HEAD); SHA=$(git rev-parse --short HEAD)
 echo "spyre-inference: $BRANCH ($SHA)"
+
+SO=$(find .venv/lib/python*/site-packages/torch_spyre -maxdepth 1 -name '_C*.so' | head -1)
+test -f "$SO" || { echo "no torch_spyre/_C.so — cannot rule out a profiler build"; exit 1; }
+if ldd "$SO" | grep -q libaiupti; then
+  echo "torch-spyre built with USE_SPYRE_PROFILER=1 — latency inflated ~20%, do not benchmark"; exit 1
+fi
 ```
 
 ### 1. Run the benchmark (current branch)
@@ -96,6 +103,7 @@ p90 (s)                 <a>            <b>                <b−a>
 ## Notes & pitfalls
 
 - **First run is slow.** A cold cache forces a recompile even with a shared cache PVC, so the cold compile can take many minutes — *most of it during the first warmup iteration*. The `Fast Path Debug] SUCCESS` spam is per-decode-shape compilation and keeps going well after `Warming up...` prints, so reaching warmup is **not** "almost done"; don't promise an ETA while those lines still emit. In `--compare-main` mode the `main` leg often compiles cheaper (reuses the shapes the first leg warmed) — so compile cost doesn't explain latency deltas; those live in the timed iters.
+- **Judging a profiler build.** `ldd` on `torch_spyre/_C.so` is the signal: no `libaiupti` means profiler-free (`nm -CD "$SO" | grep -i aiupti` should also be empty). Two things that look like signals but are not — wheel size, since `_C.so` has grown enough that a profiler-free build now matches the size `docs/user_guide/kineto_profiling.md` attributes to a profiler build; and `torch_spyre.profiler.is_available()`, hardcoded to `False` regardless of build flags.
 - **No compile env vars.** `--enforce-eager` is the only compile switch. `SPYRE_FORCE_COMPILE_ATTN`, `-cc.mode` and a bumped `VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS` show up in older logs and notes here — they are stale; do not copy them forward.
 - **Compile isn't universally safe.** Granite and llama are fine, but some models crash *natively* at warmup under compile (gemma-class here). If warmup dies natively rather than raising a Python error, retry with `--enforce-eager` before calling it a regression, and label the result as eager.
 - **Model not cached**: an uncached HF model downloads on first use (extra minutes); a locally-cached id skips that.
