@@ -449,8 +449,8 @@ def _run_spyre_attn_test(
     )
 
     if expect_fused_store is not None:
-        # Kernel cache keys are (num_blocks, padded_query_len, fused_store).
-        fused_used = any(key[2] for key in attn_impl._attn_fns)
+        # Kernel cache keys are (num_blocks, padded_query_len, store_mode, store_len).
+        fused_used = any(key[2] != "none" for key in attn_impl._attn_fns)
         assert fused_used == expect_fused_store, (
             f"fused output store: expected {expect_fused_store}, got {fused_used} "
             f"(kernel cache keys: {sorted(attn_impl._attn_fns)})"
@@ -593,8 +593,8 @@ def test_spyre_attn_compiled_multi_seq(
         pytest.param(
             "STOCK_TORCH_COMPILE",
             [(1, 256), (1, 512)],
-            False,
-            id="STOCK-decode(2seqs)-eager",
+            True,
+            id="STOCK-decode(2seqs)-fused",
         ),
         pytest.param("NONE", [(1, 512)], False, id="NONE-decode(1seq)-eager"),
     ],
