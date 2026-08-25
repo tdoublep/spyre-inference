@@ -186,11 +186,8 @@ def assert_close_outliers(
         outlier_rtol: relative tolerance for outlier elements.
         msg: additional context for the failure message.
     """
-    # Non-finite values must be rejected before the outlier arithmetic: `NaN > tol`
-    # is False, so a NaN would produce *zero* outliers and return as acceptable
-    # below. Attention output is always finite (a fully-masked row writes zeros,
-    # and -inf mask entries reach the caller only through exp()), so any NaN or inf
-    # here is a real failure — including an output buffer a store never landed in.
+    # `NaN > tol` is False, so a non-finite actual scores zero outliers and passes
+    # the check below. Attention output is always finite, so reject it up front.
     n_nonfinite = int((~torch.isfinite(actual)).sum())
     if n_nonfinite:
         raise AssertionError(
@@ -343,12 +340,7 @@ def _run_spyre_attn_test(
     head_size: int = 128,
     expect_fused_store: bool | None = None,
 ) -> None:
-    """Shared test body: validate SpyreAttentionImpl against a reference implementation.
-
-    ``expect_fused_store`` asserts whether the backend took the fused output store
-    (the kernel writing ``output`` itself) or the eager slice-assign. Left None,
-    either is accepted.
-    """
+    """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # The compiled attention kernel targets the Spyre device. On CPU it routes
     # through Inductor's C++ backend, whose codegen for the kernel's indirect
     # index_select + transpose pattern is broken ("use of undeclared identifier
@@ -439,9 +431,8 @@ def _run_spyre_attn_test(
         logits_soft_cap=soft_cap,
     )
 
-    # NaN rather than empty_like: every row is expected to be written, so a store
-    # that silently lands nowhere fails the comparison below instead of passing on
-    # whatever the allocator happened to hand back.
+    # NaN, not empty_like: every row is expected to be written, so a store that
+    # lands nowhere fails below instead of passing on whatever the allocator gave.
     output = torch.full_like(query, float("nan")).to(cache_device)
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
     key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
@@ -458,8 +449,7 @@ def _run_spyre_attn_test(
     )
 
     if expect_fused_store is not None:
-        # Keyed (num_blocks, padded_query_len, fused_store); a True key exists iff
-        # the kernel was built to store its own result and so was handed `output`.
+        # Kernel cache keys are (num_blocks, padded_query_len, fused_store).
         fused_used = any(key[2] for key in attn_impl._attn_fns)
         assert fused_used == expect_fused_store, (
             f"fused output store: expected {expect_fused_store}, got {fused_used} "
@@ -617,17 +607,8 @@ def test_spyre_attn_fused_output_store(
     configure_compilation: str,
     configure_device: str,
 ) -> None:
-    """The compiled kernel storing its own result must land in the output buffer.
-
-    A compiled index_copy_ writes nothing at all when the destination has a single
-    row — every batch-1 decode — so the first version of this store silently never
-    landed (e73c953, reverted in 41dbd14). It went unnoticed because every
-    compiled-on-device combination was skipped at the time, and the fused store
-    only engages when compiled and on device: nothing in this file executed it.
-
-    So this asserts both halves. That the output is correct, and that the path
-    under test is the one that actually ran — otherwise a guard that quietly stops
-    engaging leaves these cases passing while covering only the eager store.
+    """Assert both the output and which store path ran, so a guard that stops
+    engaging cannot leave these cases green on the eager store alone.
     """
     _run_spyre_attn_test(
         seq_lens=seq_lens,

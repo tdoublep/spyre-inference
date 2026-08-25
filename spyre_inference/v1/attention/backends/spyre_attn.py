@@ -150,10 +150,6 @@ def _create_compilable_page_attn(
 
     Dynamo unrolls the loop because num_blocks, padded_query_len, has_alibi,
     logits_soft_cap, and fused_store are closure constants.
-
-    With ``fused_store``, the kernel copies its result into the caller's output
-    buffer instead of returning it, so the store joins the attention jobplan
-    rather than costing a separate eager dispatch and launch per layer.
     """
 
     def specialized_paged_attn_kernel(
@@ -183,11 +179,10 @@ def _create_compilable_page_attn(
                 the derivation at the bias-tile construction site in
                 _online_softmax_attention.
 
-            out: only with fused_store — the caller's output buffer, which this
-                sequence owns in full ([padded_query_len, num_heads, head_size]).
+            out: with fused_store, the caller's buffer to write the result into.
 
-        Returns [padded_query_len, num_heads, head_size], or ``out`` when
-        fused_store copied the result in place.
+        Returns [padded_query_len, num_heads, head_size], or ``out`` under
+        fused_store.
         """
         tile_max = None
         tile_sum = None
@@ -244,13 +239,8 @@ def _create_compilable_page_attn(
         attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
         attn = attn.reshape(padded_query_len, num_heads, head_size)
         if fused_store:
-            # A whole-tensor copy_, not an indirect index_copy_. A compiled
-            # index_copy_ needs a row-outermost destination and writes nothing at
-            # all when the destination has a single row — which is every batch-1
-            # decode, so the store silently never landed. That sank the first
-            # attempt at this (e73c953, reverted in 41dbd14). The caller only
-            # enables fused_store when this sequence owns every row of `out`, so
-            # the shapes match exactly and a plain copy_ is all that is needed.
+            # Not index_copy_: compiled, it silently writes nothing when the
+            # destination has a single row, i.e. every batch-1 decode.
             assert out is not None
             out.copy_(attn)
             return out
@@ -1029,19 +1019,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         active_block_indices_all = attn_metadata.active_block_indices
         aligned_max_query_len = attn_metadata.aligned_max_query_len
         page_index_tables = attn_metadata.page_index_tables
-        # The kernel can store into `output` itself — folding the store into its
-        # jobplan instead of an eager slice-assign per layer — only when this
-        # step's single sequence owns every row of the buffer, so the store is a
-        # plain copy_ of matching shape. A compiled kernel also reads its
-        # arguments from offset 0 (torch-spyre#3770), and vLLM hands out a fresh
-        # buffer per layer, so the buffer is re-checked on every call. Only worth
-        # it when attention is compiled; eager keeps the slice-assign.
+        # Folds the per-layer eager slice-assign into the attention jobplan. Only
+        # safe when this step's single sequence owns the whole buffer, so the store
+        # is a plain copy_ of matching shape. Re-checked per call: vLLM hands out a
+        # fresh buffer per layer.
         fused_store_ok = (
             self._compile_attn
             and num_seqs == 1
             and aligned_max_query_len == attn_metadata.max_query_len
             and output.shape[0] == aligned_max_query_len
             and output.dtype == query_dev.dtype
+            # A compiled kernel reads its arguments from offset 0: torch-spyre#3770.
             and output.storage_offset() == 0
             and output.is_contiguous()
         )
@@ -1134,9 +1122,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     bias = self.alibi_slopes * rel
                     alibi_bias_tiles.append(convert(bias, device=_target_device))
 
-            # Run attention on target device. When the kernel can copy straight
-            # into `output`, the store joins its jobplan instead of costing a
-            # separate eager dispatch and launch per layer.
+            # Run attention on target device
             attn_fn = self._get_attn_fn(
                 len(active_bs), aligned_max_query_len, fused_store=fused_store_ok
             )
