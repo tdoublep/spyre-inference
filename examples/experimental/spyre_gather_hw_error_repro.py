@@ -53,6 +53,16 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _reshape_and_cache_kernel,
 )
 
+import inspect
+
+if "needs_gather" not in inspect.signature(_create_compilable_page_attn).parameters:
+    raise SystemExit(
+        "the installed spyre_inference has no in-graph query gather, so this repro\n"
+        "cannot run against it. Point the editable install at a checkout of\n"
+        "repro/gather-hw-error-3770 (or fix-decode-query-offset-3770):\n"
+        "    uv pip install --no-deps -e <path-to-that-worktree>"
+    )
+
 H, D, NKV = 32, 128, 8
 NQ = H // NKV
 QKV_COLS = H * D + 2 * NKV * D
@@ -111,8 +121,10 @@ def main():
     ap.add_argument("--num-blocks", type=int, default=1, dest="nb")
     ap.add_argument("--block-size", type=int, default=128, dest="bs")
     ap.add_argument("--total-pages", type=int, default=5, dest="pages")
-    ap.add_argument("--scatter", default="yes", choices=["yes", "no"])
-    ap.add_argument("--mutating", default="yes", choices=["yes", "no"])
+    # Defaults ARE the faulting configuration; run with no arguments to repro.
+    # --scatter yes and --mutating yes are the knobs that make it PASS again.
+    ap.add_argument("--scatter", default="no", choices=["yes", "no"])
+    ap.add_argument("--mutating", default="no", choices=["yes", "no"])
     ap.add_argument("--layers", type=int, default=1, help="attention calls per fwd")
     ap.add_argument("--warm-prefill", default="no", choices=["yes", "no"], dest="warm")
     ap.add_argument("--clean-v", action="store_true", dest="clean_v",
@@ -172,7 +184,7 @@ def main():
     if args.warm == "yes":
         run_shape(64, 64, "prefill")
     run_shape(tokens, qlen, "target")
-    print("PASS")
+    print("PASS -- no fault (NOT the repro configuration)")
 
 
 if __name__ == "__main__":
