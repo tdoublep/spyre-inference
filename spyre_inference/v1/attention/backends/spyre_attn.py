@@ -145,6 +145,7 @@ def _create_compilable_page_attn(
     has_alibi: bool = False,
     logits_soft_cap: float = 0.0,
     num_kv_heads: int = 0,
+    needs_gather: bool = True,
 ):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
@@ -190,9 +191,20 @@ def _create_compilable_page_attn(
         # storage_offset, so a later sequence on this compiled variant reads the
         # first one's rows (torch-spyre#3770) — the same reason page indices
         # arrive as a device tensor rather than a slice.
-        q = (
+        #
+        # needs_gather=False when the buffer already *is* this sequence's padded
+        # rows. Skipping the gather there is not just an optimization: a gather
+        # that selects the whole source miscompiles into out-of-bounds addresses
+        # (RAS ComputeHardwareError 0x7b1b) once the query buffer is produced by
+        # the enclosing per-block graph, which no unit test covers because every
+        # multi-sequence batch selects a strict subset.
+        q_rows = (
             query.index_select(0, query_row_index[:padded_query_len])
-            .unsqueeze(0)
+            if needs_gather
+            else query
+        )
+        q = (
+            q_rows.unsqueeze(0)
             .transpose(1, 2)
             .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
         )
@@ -897,10 +909,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
         )
 
-    def _get_attn_fn(self, num_blocks: int, padded_query_len: int):
+    def _get_attn_fn(self, num_blocks: int, padded_query_len: int, needs_gather: bool = True):
         # self.alibi_slopes and self.logits_soft_cap are fixed per instance, so
         # has_alibi and logits_soft_cap don't need to be part of the cache key.
-        key = (num_blocks, padded_query_len)
+        key = (num_blocks, padded_query_len, needs_gather)
         if key not in self._attn_fns:
             self._attn_fns[key] = _maybe_compile(
                 _create_compilable_page_attn(
@@ -911,6 +923,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     has_alibi=self.alibi_slopes is not None,
                     logits_soft_cap=self.logits_soft_cap,
                     num_kv_heads=self.num_kv_heads,
+                    needs_gather=needs_gather,
                 ),
                 self._compile_attn,
             )
@@ -1114,7 +1127,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     alibi_bias_tiles.append(convert(bias, device=_target_device))
 
             # Run attention on target device
-            attn_fn = self._get_attn_fn(len(active_bs), aligned_max_query_len)
+            # A gather selecting the entire query buffer is a no-op that
+            # miscompiles on device — see the kernel's gather comment.
+            needs_gather = not (
+                q_start == 0
+                and query_len == aligned_max_query_len
+                and query_dev.shape[0] == aligned_max_query_len
+            )
+            attn_fn = self._get_attn_fn(len(active_bs), aligned_max_query_len, needs_gather)
             result = attn_fn(
                 query_dev,
                 query_row_indices[seq_idx],
