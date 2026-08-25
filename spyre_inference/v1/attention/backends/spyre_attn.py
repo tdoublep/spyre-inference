@@ -614,7 +614,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         return active_bs, tiles
 
     def _publish_slot_mapping(self, slot_mapping: torch.Tensor, num_actual_tokens: int) -> None:
-        """Mirror this step's slot mapping to device, keeping the transfer out of the graph."""
+        """Copy this step's slot mapping to device for the traced KV write to read.
+
+        vLLM hands it to us on the host, and the patched ``Attention.forward`` reads it
+        off the shared holder, so the transfer happens here rather than in the graph.
+        """
         if not self._kv_layers:
             return
         if self._slots_device is None:
