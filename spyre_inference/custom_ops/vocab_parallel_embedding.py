@@ -36,12 +36,6 @@ logger = init_logger(__name__)
 
 
 def _may_serve_as_lm_head() -> bool:
-    """True when `tie_word_embeddings` can make an embedding double as the LM head.
-
-    Models that instead build a real ParallelLMHead and tie it to this table undo
-    this in `SpyreUnquantizedLMHeadMethod.tie_weights`; those two idioms are
-    indistinguishable until the head itself is constructed.
-    """
     model_config = get_current_vllm_config().model_config
     return (
         model_config is not None
@@ -62,10 +56,8 @@ class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
 
-        # With `lm_head = embed_tokens` this table also serves logits, and the head
-        # method projects through a padded `Wᵀ` rather than letting F.linear relayout
-        # the whole `[vocab, hidden]` table (vocab-innermost, only splittable by a
-        # divisor of its stick count) on every call. `embedding()` is unaffected.
+        # `lm_head = embed_tokens` makes this table serve logits too; project from a padded
+        # `Wᵀ` since work division splits vocab only by a divisor of its stick count.
         if _may_serve_as_lm_head():
             self.quant_method = SpyreUnquantizedLMHeadMethod()
 

@@ -307,10 +307,6 @@ def test_spyre_logits_processor_scaling(tp_group, spyre_or_cpu_device, scale):
     torch.testing.assert_close(logits_out.cpu().float(), logits_ref.float(), atol=1e-2, rtol=1e-2)
 
 
-# Tied lm_head tests (issue #631). The per-core span that motivates the fix only
-# shows up on real weights; these cover the behaviour that avoids it.
-
-
 @pytest.fixture
 def tied_word_embeddings(monkeypatch):
     """Make the ambient VllmConfig look like a `tie_word_embeddings` generative model."""
@@ -332,11 +328,7 @@ def untied_word_embeddings(monkeypatch):
 @pytest.mark.parallel_lm_head
 @pytest.mark.parametrize("vocab_size", [128, 49216])
 def test_tied_embedding_gets_transposed_projection(tp_group, tied_word_embeddings, vocab_size):
-    """A tied embedding projects through a padded `Wᵀ` instead of transposing `weight`.
-
-    `weight` must survive untouched: it is still the gather table, and still needs the
-    row-gathered layout.
-    """
+    """A tied embedding projects through a padded `Wᵀ`, leaving `weight` untouched."""
     from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         VocabParallelEmbedding,
@@ -395,11 +387,7 @@ def test_tied_embedding_projection_matches_reference(tp_group, tied_word_embeddi
 
 @pytest.mark.parallel_lm_head
 def test_separately_tied_head_leaves_embedding_gather_only(tp_group, tied_word_embeddings):
-    """Models that tie a real ParallelLMHead keep the embedding gather-only.
-
-    Both idioms set `tie_word_embeddings`, so the embedding installs the projection
-    optimistically; `tie_weights` is where it learns a real head owns the projection.
-    """
+    """Models that tie a real ParallelLMHead keep the embedding gather-only."""
     from spyre_inference.custom_ops.parallel_lm_head import SpyreUnquantizedLMHeadMethod
     from vllm.model_executor.layers.vocab_parallel_embedding import (
         ParallelLMHead,
@@ -418,7 +406,6 @@ def test_separately_tied_head_leaves_embedding_gather_only(tp_group, tied_word_e
     embed.quant_method.process_weights_after_loading(embed)
     head.quant_method.process_weights_after_loading(head)
 
-    # Only the head materializes a transposed copy; the shared table does not.
     assert not hasattr(embed, "padded_weight_t")
     assert head.padded_weight_t.shape == (64, 51200)
 
