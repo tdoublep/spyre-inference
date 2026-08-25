@@ -227,6 +227,33 @@ class TorchSpyrePlatform(CpuPlatform):
             if all(s not in vllm_config.compilation_config.custom_ops for s in ("all", "none")):
                 vllm_config.compilation_config.custom_ops.append("all")
 
+            # Build bucket sizes for pre-compilation warmup.
+            # Pooling models skip bucketing (their token counts depend on
+            # variable input sequence lengths, not the decode heuristic).
+            if vllm_config.model_config.runner_type != "pooling":
+                # max_capture_size is the largest bucket we compile for.
+                # Bounded by max_num_batched_tokens (scheduler limit) and
+                # 512 (max supported shape for torch-spyre).
+                max_capture_size = min(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    512,
+                )
+
+                compile_sizes = [i for i in [1, 2, 4] if i <= max_capture_size]
+                if max_capture_size >= 8:
+                    compile_sizes += list(range(8, min(max_capture_size + 1, 256), 8))
+                if max_capture_size >= 256:
+                    compile_sizes += list(range(256, max_capture_size + 1, 16))
+                vllm_config.compilation_config.compile_sizes = compile_sizes
+
+                # Ensure the scheduler never sends more tokens than the
+                # largest compiled bucket to avoid runtime recompilation.
+                vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
+                logger.warning(
+                    "Capping max_num_batched_tokens to %d ",
+                    max_capture_size,
+                )
+
         # In check_and_update_config we assert this must be float16 for spyre.
         # This must be set here as the default, otherwise all usage (including test fixtures) would
         # require setting the dtype.
@@ -281,23 +308,21 @@ class TorchSpyrePlatform(CpuPlatform):
         """Override hf_config.head_dim to a 128-multiple when the native head_dim
         is not stick-aligned, stashing the original as ``_spyre_orig_head_dim``.
 
-        No-op on the transformers backend (it pads RoPE itself), for models whose
-        head_dim is already a multiple of 128 (e.g. head_size=128 Granite), and for
-        models without RoPE. The restickify failure this works around is
-        RoPE-induced, so non-RoPE models (OPT, GPT-2, GPT-BigCode) lower fine at
-        head=64; padding them is both unnecessary and unsupported by the port,
-        which assumes a RoPE model that sizes attention from ``config.head_dim`` and
-        names its output projection ``o_proj`` (OPT ignores ``config.head_dim`` and
-        uses ``out_proj``).
+        Applies to the Transformers backend too: padding only the RoPE rotation leaves
+        the KV cache allocated at the native ``get_head_size()``, which the device copy
+        requires to be stick-aligned.
+
+        No-op for models whose head_dim is already a multiple of 128 (e.g.
+        head_size=128 Granite) and for models without RoPE. The restickify failure
+        this works around is RoPE-induced, so non-RoPE models (OPT, GPT-2,
+        GPT-BigCode) lower fine at head=64; padding them is both unnecessary and
+        unsupported by the port, which assumes a RoPE model that sizes attention from
+        ``config.head_dim`` and names its output projection ``o_proj`` (OPT ignores
+        ``config.head_dim`` and uses ``out_proj``).
         """
         from spyre_inference.custom_ops.head_pad import reduced_rotary_dim_reason
 
         model_config = vllm_config.model_config
-        # `model_impl` stays "auto" when vLLM falls back to the Transformers backend
-        # for an unregistered arch, so check the resolved class, not the request.
-        if model_config.using_transformers_backend():
-            return
-
         hf_config = model_config.hf_config
         num_heads = getattr(hf_config, "num_attention_heads", None)
         hidden_size = getattr(hf_config, "hidden_size", None)
