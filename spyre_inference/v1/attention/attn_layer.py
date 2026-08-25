@@ -14,8 +14,9 @@
 
 """Spyre ``Attention.forward``: the KV write is traced, the attention core stays opaque.
 
-The core must stay opaque: its per-sequence Python loop cannot be captured with
-``fullgraph=True``.
+``install()``, called from the attention metadata builder, monkey-patches vLLM's
+``Attention.forward`` with the version below. The core must stay opaque: its
+per-sequence Python loop cannot be captured with ``fullgraph=True``.
 """
 
 from collections.abc import Iterable
