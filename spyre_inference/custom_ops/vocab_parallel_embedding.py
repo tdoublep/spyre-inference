@@ -18,6 +18,7 @@ from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
+from vllm.config import get_current_vllm_config
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -28,9 +29,25 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.utils.torch_utils import direct_register_custom_op
 
 from .lazy_compile import CompileOutermost, compile_when_outermost
+from .parallel_lm_head import SpyreUnquantizedLMHeadMethod
 from .utils import place_row_gathered
 
 logger = init_logger(__name__)
+
+
+def _may_serve_as_lm_head() -> bool:
+    """True when `tie_word_embeddings` can make an embedding double as the LM head.
+
+    Models that instead build a real ParallelLMHead and tie it to this table undo
+    this in `SpyreUnquantizedLMHeadMethod.tie_weights`; those two idioms are
+    indistinguishable until the head itself is constructed.
+    """
+    model_config = get_current_vllm_config().model_config
+    return (
+        model_config is not None
+        and model_config.runner_type == "generate"
+        and bool(getattr(model_config.hf_text_config, "tie_word_embeddings", False))
+    )
 
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
@@ -44,6 +61,13 @@ class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
                 f"SpyreVocabParallelEmbedding does not support quantized "
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
+
+        # With `lm_head = embed_tokens` this table also serves logits, and the head
+        # method projects through a padded `Wᵀ` rather than letting F.linear relayout
+        # the whole `[vocab, hidden]` table (vocab-innermost, only splittable by a
+        # divisor of its stick count) on every call. `embedding()` is unaffected.
+        if _may_serve_as_lm_head():
+            self.quant_method = SpyreUnquantizedLMHeadMethod()
 
         if self.tp_size > 1:
             self.register_buffer(
