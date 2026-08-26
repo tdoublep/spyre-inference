@@ -19,7 +19,6 @@
 per-sequence Python loop cannot be captured with ``fullgraph=True``.
 """
 
-import weakref
 from collections.abc import Callable, Iterable
 from typing import cast
 
@@ -37,17 +36,11 @@ logger = init_logger(__name__)
 # dropped by whichever module imported this one first.
 _original_forward: Callable | None = None
 
-# Every holder install() has handed out, so a run that bypasses the builder can drop
-# the slot mappings it would otherwise leave behind. See clear_published_slots().
-# Weak, so a retired builder's holder stops pinning that step's slot tensor on device.
-_slot_holders: "weakref.WeakSet[SlotMapping]" = weakref.WeakSet()
-
 
 class SlotMapping:
     """This step's slot mapping, shared by every split layer so a step publishes once."""
 
-    # __weakref__ so the module-level registry can hold these weakly.
-    __slots__ = ("slots", "__weakref__")
+    __slots__ = ("slots",)
 
     def __init__(self) -> None:
         self.slots: torch.Tensor | None = None
@@ -85,7 +78,12 @@ def _spyre_attention_forward(
 
     # `dep` makes "scatter before read" a real data dependency, which is otherwise
     # invisible because the op reaches its cache through the forward context.
-    # No slot mapping: warmup and profile runs have no attention metadata.
+    # No slot mapping means no build this step, which only warmup and profiling do.
+    # Those run before serving, so `slots` here is never a previous step's: the one
+    # upstream path that runs a dummy forward mid-serving needs data_parallel_size > 1
+    # (gpu_model_runner's zero-scheduled-tokens branch), which the platform rejects. If
+    # that restriction is ever lifted, this read has to be invalidated per step, since
+    # a stale non-None mapping installs no guard and would scatter at the wrong slots.
     slots = cast(SlotMapping, self.spyre_slots).slots
     dep = None
     if slots is not None and key is not None and value is not None:
@@ -122,20 +120,6 @@ def _can_split(layer: Attention) -> bool:
     )
 
 
-def clear_published_slots() -> None:
-    """Drop every published slot mapping, so a forward without a build cannot reuse one.
-
-    ``slots`` is published by ``SpyreAttentionMetadataBuilder.build`` and read by the
-    patched forward, which cannot clear it itself: under ``torch.compile`` the Python
-    body runs once per trace while the graph re-reads the attribute every step. Runs
-    that execute a forward without building metadata (warmup, profiling) must therefore
-    clear it here, or the graph would scatter this step's K/V at the previous step's
-    slots.
-    """
-    for holder in _slot_holders:
-        holder.slots = None
-
-
 def install(layers: Iterable[Attention]) -> SlotMapping:
     """Opt eligible layers into the traced KV write; returns their shared slot holder."""
     global _original_forward
@@ -144,7 +128,6 @@ def install(layers: Iterable[Attention]) -> SlotMapping:
         Attention.forward = _spyre_attention_forward  # ty: ignore[invalid-assignment]
 
     slot_mapping = SlotMapping()
-    _slot_holders.add(slot_mapping)
     num_split = 0
     for layer in layers:
         split = _can_split(layer)
