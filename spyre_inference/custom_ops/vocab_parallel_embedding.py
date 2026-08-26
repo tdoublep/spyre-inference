@@ -15,10 +15,11 @@
 """Spyre OOT replacement for VocabParallelEmbedding."""
 
 from functools import lru_cache
+from typing import cast
 
 import torch
 import torch.nn.functional as F
-from vllm.config import get_current_vllm_config
+from torch.nn.parameter import Parameter
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -30,18 +31,9 @@ from vllm.utils.torch_utils import direct_register_custom_op
 
 from .lazy_compile import CompileOutermost, compile_when_outermost
 from .parallel_lm_head import SpyreUnquantizedLMHeadMethod
-from .utils import place_row_gathered
+from .utils import convert, place_row_gathered
 
 logger = init_logger(__name__)
-
-
-def _may_serve_as_lm_head() -> bool:
-    model_config = get_current_vllm_config().model_config
-    return (
-        model_config is not None
-        and model_config.runner_type == "generate"
-        and bool(getattr(model_config.hf_text_config, "tie_word_embeddings", False))
-    )
 
 
 @VocabParallelEmbedding.register_oot(name="VocabParallelEmbedding")
@@ -55,11 +47,6 @@ class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
                 f"SpyreVocabParallelEmbedding does not support quantized "
                 f"embeddings (got {type(self.quant_method).__name__})."
             )
-
-        # `lm_head = embed_tokens` makes this table serve logits too; project from a padded
-        # `Wᵀ` since work division splits vocab only by a divisor of its stick count.
-        if _may_serve_as_lm_head():
-            self.quant_method = SpyreUnquantizedLMHeadMethod()
 
         if self.tp_size > 1:
             self.register_buffer(
@@ -158,6 +145,37 @@ class SpyreVocabParallelEmbedding(CompileOutermost, VocabParallelEmbedding):
             output = output * keep.unsqueeze(-1)
             output = tensor_model_parallel_all_reduce(output)
         return output
+
+
+def promote_tied_lm_head(head: torch.nn.Module) -> None:
+    """Give a tied embedding a padded `Wᵀ` the first time it is asked for logits.
+
+    `tie_word_embeddings` does not say which table projects. Models express the tie
+    three ways: alias `lm_head = embed_tokens` (Qwen), tie a real `ParallelLMHead`
+    (Llama), or pass `embed_tokens` to the logits processor with no `lm_head` at all
+    (Gemma) -- and a model may hold gather-only tables under the same config, such as
+    Gemma 3n's per-layer embeddings. The module handed to `_apply_head` is the only
+    signal that identifies the projection in all three, so the decision is made here
+    rather than guessed at construction.
+
+    `weight` is left alone: it keeps the row-gathered layout the gather needs.
+    """
+    # Exact type: SpyreParallelLMHead is a subclass and brings its own method.
+    if type(head) is not SpyreVocabParallelEmbedding:
+        return
+    if isinstance(head.quant_method, SpyreUnquantizedLMHeadMethod):
+        return
+
+    method = SpyreUnquantizedLMHeadMethod()
+    # Pad and transpose on the host: this runs after the device move, and relaying
+    # out a vocab-sized table on device costs far more than the round trip.
+    weight = cast(torch.Tensor, head.weight)
+    method.build_weight_t(head, convert(weight.data, device="cpu"))
+    head.padded_weight_t = Parameter(
+        convert(head.padded_weight_t.data, device=weight.device), requires_grad=False
+    )
+    head.quant_method = method
+    logger.debug("Tied lm_head %s projects from a padded transposed weight", tuple(weight.shape))
 
 
 def _vocab_mask_op_func(

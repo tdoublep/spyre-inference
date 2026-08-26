@@ -38,12 +38,6 @@ class SpyreUnquantizedLMHeadMethod(SpyreTransposedWeightMethod, UnquantizedEmbed
     WEIGHT_T_ATTR = "padded_weight_t"
     ROW_ALIGN = 64 * 32
 
-    def tie_weights(self, layer, embed_tokens):
-        # This head owns the projection, so embed_tokens is gather-only after all: drop
-        # the method it installed for the `lm_head = embed_tokens` idiom.
-        embed_tokens.quant_method = UnquantizedEmbeddingMethod()
-        return super().tie_weights(layer, embed_tokens)
-
 
 @ParallelLMHead.register_oot(name="ParallelLMHead")
 class SpyreParallelLMHead(ParallelLMHead):
