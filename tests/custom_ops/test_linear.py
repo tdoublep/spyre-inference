@@ -150,3 +150,35 @@ def test_unquantized_layers_get_spyre_method(tp_group):
     assert isinstance(mlp.down_proj.quant_method, SpyreUnquantizedLinearMethod)
     # SpyreUnquantizedLinearMethod is itself an UnquantizedLinearMethod subclass.
     assert isinstance(mlp.down_proj.quant_method, UnquantizedLinearMethod)
+
+
+@pytest.mark.mlp
+@pytest.mark.parametrize("num_tokens", [1, 4, 5])
+def test_short_rows_padded_on_gate_up(tp_group, monkeypatch, num_tokens):
+    """Only gate/up pads, only up to `_MAX_PAD_ROWS` rows, and never a large weight."""
+    from spyre_inference.custom_ops import linear as linear_mod
+    from spyre_inference.custom_ops.linear import (
+        SpyrePaddedRowsLinearMethod,
+        SpyreUnquantizedLinearMethod,
+    )
+
+    hidden, inter = 128, 256
+    torch.manual_seed(0)
+    mlp = _make_mlp_module(hidden, inter)
+    assert isinstance(mlp.gate_up_proj.quant_method, SpyrePaddedRowsLinearMethod)
+    assert not isinstance(mlp.down_proj.quant_method, SpyrePaddedRowsLinearMethod)
+
+    gate_up = mlp.gate_up_proj
+    gate_up.weight.data.normal_(std=0.02)
+    gate_up.quant_method.process_weights_after_loading(gate_up)
+
+    torch.manual_seed(1)
+    x = torch.randn(num_tokens, hidden, dtype=torch.float16)
+    unpadded = SpyreUnquantizedLinearMethod().apply(gate_up, x, None)
+    out = _forward(gate_up, x)
+
+    assert out.shape == (num_tokens, 2 * inter)
+    torch.testing.assert_close(out.float(), unpadded.float(), atol=1e-2, rtol=1e-2)
+
+    monkeypatch.setattr(linear_mod, "_MAX_PAD_MACS", 1)
+    torch.testing.assert_close(_forward(gate_up, x), unpadded, atol=0.0, rtol=0.0)
