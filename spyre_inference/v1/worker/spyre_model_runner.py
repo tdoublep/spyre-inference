@@ -682,15 +682,19 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
     @torch.inference_mode()
-    def _dummy_run(self, num_tokens: int, *args, **kwargs):
+    def _dummy_run(self, *args, **kwargs):
         """Force D2H for warmup: upstream ``hidden_states[logit_indices]`` needs CPU."""
-        attn_layer.publish_null_slots(num_tokens)
+        # Read out of the passthrough rather than named in the signature, which would
+        # pin this override to upstream's parameter order across vLLM bumps.
+        num_tokens = kwargs.get("num_tokens", args[0] if args else None)
+        if num_tokens is not None:
+            attn_layer.publish_null_slots(num_tokens)
         wrapper = self.model
         keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device
         if keep:
             object.__setattr__(wrapper, "_keep_outputs_on_device", False)
         try:
-            hidden_states, last_hidden_states = super()._dummy_run(num_tokens, *args, **kwargs)
+            hidden_states, last_hidden_states = super()._dummy_run(*args, **kwargs)
         finally:
             if keep:
                 object.__setattr__(wrapper, "_keep_outputs_on_device", True)
