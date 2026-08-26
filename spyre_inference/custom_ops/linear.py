@@ -38,6 +38,14 @@ from vllm.model_executor.layers.linear import (
 
 logger = init_logger(__name__)
 
+# torch-spyre#4032: the matmul array takes 8 rows per pass, and a matmul with fewer
+# is divided across the cores worse than a full pass. So pad up to 8 rows and slice the
+# output back; the wider matmul shifts the fp16 result slightly.
+_PAD_ROWS = 8
+# Past a few rows, or on a large weight, the padded rows cost more than they save.
+_MAX_PAD_ROWS = 4
+_MAX_PAD_MACS = 1_600_000_000
+
 
 def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor | None):
     """Linear forward with a pre-transposed weight: `x @ Wᵀ (+ bias)`.
@@ -126,8 +134,24 @@ class SpyreUnquantizedLinearMethod(SpyreTransposedWeightMethod, UnquantizedLinea
     """
 
 
+class SpyrePaddedRowsLinearMethod(SpyreUnquantizedLinearMethod):
+    """Pads short activations up to `_PAD_ROWS` rows; used by the fused gate/up layer."""
+
+    def apply(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        weight_t = cast(torch.Tensor, getattr(layer, self.WEIGHT_T_ATTR))
+        m = x.shape[0] if x.dim() == 2 else 0
+        if 0 < m <= _MAX_PAD_ROWS and _PAD_ROWS * weight_t.numel() <= _MAX_PAD_MACS:
+            return super().apply(layer, F.pad(x, (0, 0, 0, _PAD_ROWS - m)), bias)[:m]
+        return super().apply(layer, x, bias)
+
+
 class _SpyreTransposedLinearMixin:
-    """Swaps in `SpyreUnquantizedLinearMethod` for unquantized linear layers.
+    """Swaps in `LINEAR_METHOD` for unquantized linear layers.
 
     Mixed in before a concrete vLLM linear class so `super().__init__` builds the
     layer normally; we then replace the unquantized method with the transposed
@@ -135,10 +159,12 @@ class _SpyreTransposedLinearMixin:
     the transpose fast path only applies to unquantized weights.
     """
 
+    LINEAR_METHOD: type[SpyreUnquantizedLinearMethod] = SpyreUnquantizedLinearMethod
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         if isinstance(self.quant_method, UnquantizedLinearMethod):
-            self.quant_method = SpyreUnquantizedLinearMethod()
+            self.quant_method = self.LINEAR_METHOD()
 
 
 @ColumnParallelLinear.register_oot(name="ColumnParallelLinear")
@@ -149,6 +175,8 @@ class SpyreColumnParallelLinear(_SpyreTransposedLinearMixin, ColumnParallelLinea
 @MergedColumnParallelLinear.register_oot(name="MergedColumnParallelLinear")
 class SpyreMergedColumnParallelLinear(_SpyreTransposedLinearMixin, MergedColumnParallelLinear):
     """OOT MergedColumnParallelLinear (e.g. gate_up_proj) storing `Wᵀ`."""
+
+    LINEAR_METHOD = SpyrePaddedRowsLinearMethod
 
 
 @RowParallelLinear.register_oot(name="RowParallelLinear")
