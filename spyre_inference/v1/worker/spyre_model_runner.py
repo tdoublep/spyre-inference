@@ -55,10 +55,6 @@ from vllm.forward_context import BatchDescriptor
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.layers.attention.attention import Attention
-from vllm.model_executor.layers.vocab_parallel_embedding import (
-    ParallelLMHead,
-    VocabParallelEmbedding,
-)
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.tasks import PoolingTask
@@ -267,45 +263,6 @@ def _repeated_block_lists(model: nn.Module) -> list[nn.ModuleList]:
         if any(isinstance(m, Attention) for b in blocks for m in b.modules()):
             block_lists.append(module)
     return block_lists
-
-
-# Every name vLLM's model zoo gives the norm that runs after the last block.
-_TAIL_NORM_NAMES = frozenset(
-    ("norm", "final_layernorm", "final_layer_norm", "ln_f", "norm_f", "final_norm")
-)
-
-
-def _holds_input_embedding(module: nn.Module) -> bool:
-    # ParallelLMHead subclasses VocabParallelEmbedding but is the logits projection,
-    # applied outside the model forward by LogitsProcessor.
-    return any(
-        isinstance(m, (VocabParallelEmbedding, nn.Embedding)) and not isinstance(m, ParallelLMHead)
-        for m in module.modules()
-    )
-
-
-def _head_and_tail_modules(model: nn.Module, blocks: nn.ModuleList) -> list[nn.Module]:
-    """The embedding and final norm on either side of ``blocks``.
-
-    Decoder stacks hold both as siblings of the block list; encoder stacks (BERT)
-    nest the list one level deeper, so widen the search outwards until each is found.
-    """
-    owner = {id(child): parent for parent in model.modules() for child in parent.children()}
-    head: nn.Module | None = None
-    tail: nn.Module | None = None
-    inner: nn.Module = blocks
-    while (parent := owner.get(id(inner))) is not None:
-        for name, child in parent.named_children():
-            if child is inner:
-                continue
-            if head is None and _holds_input_embedding(child):
-                head = child
-            if tail is None and name in _TAIL_NORM_NAMES:
-                tail = child
-        if head is not None and tail is not None:
-            break
-        inner = parent
-    return [m for m in (head, tail) if m is not None]
 
 
 class _SpyreModelWrapper:
@@ -576,12 +533,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 )
             num_blocks = self._compile_blocks()
             if num_blocks:
-                num_edges = self._compile_head_and_tail()
                 logger.info(
-                    "Wrapped %d transformer blocks and %d head/tail modules of %s for "
-                    "per-block compile on Spyre.",
+                    "Wrapped %d transformer blocks of %s for per-block compile on Spyre.",
                     num_blocks,
-                    num_edges,
                     model_name,
                 )
                 return
@@ -612,19 +566,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 block.compile(backend="inductor", fullgraph=True, dynamic=False)
                 num_blocks += 1
         return num_blocks
-
-    def _compile_head_and_tail(self) -> int:
-        """Compile the embedding and final norm, so no device work outside the blocks
-        stays eager. Wrapped in place for the same reason blocks are."""
-        model = cast(nn.Module, self.model)
-        wrapped: list[int] = []
-        for blocks in _repeated_block_lists(model):
-            for module in _head_and_tail_modules(model, blocks):
-                if id(module) in wrapped:
-                    continue
-                module.compile(backend="inductor", fullgraph=True, dynamic=False)
-                wrapped.append(id(module))
-        return len(wrapped)
 
     def warming_up_model(self) -> None:
         """Run a dummy forward pass to warm up kernels and optional compile.

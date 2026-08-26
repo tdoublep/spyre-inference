@@ -33,7 +33,6 @@ from vllm.model_executor.models.utils import PPMissingLayer
 
 from spyre_inference.v1.worker.spyre_model_runner import (
     TorchSpyreModelRunner,
-    _head_and_tail_modules,
     _repeated_block_lists,
 )
 
@@ -247,8 +246,6 @@ def test_model_granularity_compiles_the_whole_model(monkeypatch) -> None:
 
     assert compiled == [model]
     assert all(block._compiled_call_impl is None for block in model.model.layers)
-    assert model.model.embed_tokens._compiled_call_impl is None
-    assert model.model.norm._compiled_call_impl is None
 
 
 def test_falls_back_to_whole_model_when_no_blocks_are_found(monkeypatch) -> None:
@@ -275,111 +272,6 @@ def test_eager_compiles_nothing(monkeypatch) -> None:
 
     assert compiled == []
     assert all(block._compiled_call_impl is None for block in model.model.layers)
-    assert model.model.embed_tokens._compiled_call_impl is None
-    assert model.model.norm._compiled_call_impl is None
-
-
-def test_finds_the_head_and_tail_beside_the_block_list() -> None:
-    model = _Model(num_layers=4)
-    assert _head_and_tail_modules(model, model.model.layers) == [
-        model.model.embed_tokens,
-        model.model.norm,
-    ]
-
-
-def test_finds_a_head_nested_above_the_block_list() -> None:
-    """BERT keeps the list under ``encoder`` and the embeddings on the grandparent."""
-
-    class Embeddings(nn.Module):
-        def __init__(self, hidden: int):
-            super().__init__()
-            self.word_embeddings = nn.Embedding(16, hidden)
-            self.LayerNorm = nn.LayerNorm(hidden)
-
-    class Encoder(nn.Module):
-        def __init__(self, hidden: int):
-            super().__init__()
-            self.layer = nn.ModuleList([_Block(hidden) for _ in range(2)])
-
-    class Bert(nn.Module):
-        def __init__(self, hidden: int = 32):
-            super().__init__()
-            self.embeddings = Embeddings(hidden)
-            self.encoder = Encoder(hidden)
-
-    model = Bert()
-    assert _repeated_block_lists(model) == [model.encoder.layer]
-    # The whole embeddings module is the head; BERT has no post-block norm.
-    assert _head_and_tail_modules(model, model.encoder.layer) == [model.embeddings]
-
-
-def test_the_lm_head_is_not_mistaken_for_the_input_embedding() -> None:
-    """``ParallelLMHead`` subclasses ``VocabParallelEmbedding``, so a type check alone
-    would wrap the logits projection, which never runs inside the model forward."""
-    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-
-    lm_head = ParallelLMHead.__new__(ParallelLMHead)
-    nn.Module.__init__(lm_head)
-
-    class Tied(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.lm_head = lm_head
-            self.layers = nn.ModuleList([_Block(32) for _ in range(2)])
-
-    model = Tied()
-    assert _head_and_tail_modules(model, model.layers) == []
-
-
-def test_a_tail_norm_is_found_under_any_of_its_zoo_names() -> None:
-    for attr in ("norm", "final_layernorm", "final_layer_norm", "ln_f", "norm_f", "final_norm"):
-        model = nn.Module()
-        model.layers = nn.ModuleList([_Block(32) for _ in range(2)])
-        setattr(model, attr, nn.LayerNorm(32))
-        assert _head_and_tail_modules(model, model.layers) == [getattr(model, attr)], attr
-
-
-def test_compile_head_and_tail_wraps_in_place() -> None:
-    model = _Model(num_layers=2)
-    embed, norm = model.model.embed_tokens, model.model.norm
-
-    assert _runner(model)._compile_head_and_tail() == 2
-
-    assert model.model.embed_tokens is embed
-    assert model.model.norm is norm
-    assert embed._compiled_call_impl is not None
-    assert norm._compiled_call_impl is not None
-
-
-def test_compile_head_and_tail_preserves_parameter_names() -> None:
-    """An ``_orig_mod.`` segment breaks weight save/reload, and the embedding weight is
-    the one a tied lm-head shares."""
-    model = _Model(num_layers=2)
-    before = [name for name, _ in model.named_parameters()]
-
-    _runner(model)._compile_head_and_tail()
-
-    assert [name for name, _ in model.named_parameters()] == before
-
-
-def test_block_granularity_compiles_the_head_and_tail_too() -> None:
-    model = _Model(num_layers=2)
-    _runner(model)._compile_for_spyre()
-
-    assert all(block._compiled_call_impl is not None for block in model.model.layers)
-    assert model.model.embed_tokens._compiled_call_impl is not None
-    assert model.model.norm._compiled_call_impl is not None
-
-
-def test_head_and_tail_are_left_eager_under_model_granularity(monkeypatch) -> None:
-    monkeypatch.setenv("SPYRE_COMPILE_GRANULARITY", "model")
-    monkeypatch.setattr(torch, "compile", lambda m, **kw: m)
-
-    model = _Model(num_layers=2)
-    _runner(model)._compile_for_spyre()
-
-    assert model.model.embed_tokens._compiled_call_impl is None
-    assert model.model.norm._compiled_call_impl is None
 
 
 @pytest.mark.compile
