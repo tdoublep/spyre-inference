@@ -59,7 +59,7 @@ class SlotMapping:
             self._device = self._layers[0].kv_cache[0].device
             # Must exist before tracing; see SpyreAttentionImpl.kv_slot_views.
             for layer in self._layers:
-                layer.impl.kv_slot_views(layer.kv_cache)
+                layer.impl.kv_slot_views(layer.kv_cache)  # ty: ignore[possibly-missing-attribute]
         return self._device
 
     def publish(self, slot_mapping: torch.Tensor) -> None:
@@ -151,7 +151,7 @@ def install(layers: Iterable[Attention]) -> SlotMapping:
     _holders.add(slot_mapping)
 
     for layer in split:
-        layer.spyre_slots = slot_mapping
+        layer.spyre_slots = slot_mapping  # ty: ignore[invalid-assignment]
         layer.forward = types.MethodType(  # ty: ignore[invalid-assignment]
             _spyre_attention_forward, layer
         )
