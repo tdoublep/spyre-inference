@@ -375,12 +375,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self._zero_tile: torch.Tensor | None = None
         self._zero_tile_shape: tuple[int, int] = (0, 0)
 
-        # The builder's own `device` is CPU, so the slot-mapping target device comes
-        # from the bound pages on first use.
         static_ctx = vllm_config.compilation_config.static_forward_context
-        self._kv_layers = [static_ctx[name] for name in layer_names if name in static_ctx]
-        self._slots_device: torch.device | None = None
-        self._slot_mapping = attn_layer.install(self._kv_layers)
+        self._slot_mapping = attn_layer.install(
+            static_ctx[name] for name in layer_names if name in static_ctx
+        )
 
     def _get_zero_tile(self, aligned_max_query_len: int) -> torch.Tensor:
         """Return (or create) the shared all-zero mask tile for interior blocks.
@@ -613,29 +611,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         return active_bs, tiles
 
-    def _publish_slot_mapping(self, slot_mapping: torch.Tensor, num_actual_tokens: int) -> None:
-        """Copy this step's slot mapping to device for the traced KV write to read.
-
-        vLLM hands it to us on the host, and the patched ``Attention.forward`` reads it
-        off the shared holder, so the transfer happens here rather than in the graph.
-        """
-        if not self._kv_layers:
-            return
-        if self._slots_device is None:
-            # Encoder-only groups reach this builder too and never get a cache bound, so
-            # `Attention.kv_cache` keeps its empty default and indexing it would raise.
-            self._kv_layers = [layer for layer in self._kv_layers if len(layer.kv_cache) > 0]
-            if not self._kv_layers:
-                return
-            self._slots_device = self._kv_layers[0].kv_cache[0].device
-            # Must exist before tracing; see SpyreAttentionImpl.kv_slot_views.
-            for layer in self._kv_layers:
-                if hasattr(layer.impl, "kv_slot_views"):
-                    layer.impl.kv_slot_views(layer.kv_cache)
-        self._slot_mapping.slots = convert(
-            slot_mapping[:num_actual_tokens], device=self._slots_device
-        )
-
     def build(
         self,
         common_prefix_len: int,
@@ -736,7 +711,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             blocks_s = slice(n) if active_block_indices is None else active_block_indices[s]
             page_index_table_cpu[s, :n, 0] = block_table[s, blocks_s]
 
-        self._publish_slot_mapping(slot_mapping, common_attn_metadata.num_actual_tokens)
+        # Padded to match key/value by upstream once forward_includes_kv_cache_update is
+        # False, so the traced write keeps one shape per bucket, not one per token count.
+        self._slot_mapping.publish(slot_mapping)
 
         return SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
@@ -1000,6 +977,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Eager index_copy_ rejects an int32 index and silently falls back to CPU with an
         # int64 one, so this always goes through the compiled artifact.
         self._reshape_fn(key, value, k_slots, v_slots, slot_mapping)
+        # Only k_slots is returned, but Inductor fuses both index_copy_ calls into one
+        # kernel, so ordering the read after it covers the V write too.
         return k_slots
 
     @_record_function("spyre_attn::online_softmax")

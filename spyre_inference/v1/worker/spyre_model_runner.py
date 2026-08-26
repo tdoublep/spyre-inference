@@ -77,6 +77,7 @@ from spyre_inference.custom_ops.head_pad import (
     verify_padded_head_dim,
 )
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.pool import (
     TOKEN_POOLING_TASKS,
     configure_pooling_for_spyre,
@@ -681,14 +682,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
     @torch.inference_mode()
-    def _dummy_run(self, *args, **kwargs):
+    def _dummy_run(self, num_tokens: int, *args, **kwargs):
         """Force D2H for warmup: upstream ``hidden_states[logit_indices]`` needs CPU."""
+        attn_layer.publish_null_slots(num_tokens)
         wrapper = self.model
         keep = isinstance(wrapper, _SpyreModelWrapper) and wrapper._keep_outputs_on_device
         if keep:
             object.__setattr__(wrapper, "_keep_outputs_on_device", False)
         try:
-            hidden_states, last_hidden_states = super()._dummy_run(*args, **kwargs)
+            hidden_states, last_hidden_states = super()._dummy_run(num_tokens, *args, **kwargs)
         finally:
             if keep:
                 object.__setattr__(wrapper, "_keep_outputs_on_device", True)

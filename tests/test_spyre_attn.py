@@ -1400,3 +1400,38 @@ def test_kv_cache_update_traced_by_caller(default_vllm_config, configure_device:
         import gc
 
         gc.collect()
+
+
+class _StubAttentionLayer:
+    """Enough of `Attention` for `attn_layer.install` to decide and patch."""
+
+    def __init__(self, attn_type: str):
+        self.attn_type = attn_type
+        self.impl = Mock(spec=["do_kv_cache_update", "kv_slot_views"])
+        self.kv_sharing_target_layer_name = None
+        self.query_quant = None
+        self.calculate_kv_scales = False
+        self.kv_cache: list[torch.Tensor] = []
+
+
+def test_install_patches_layers_not_the_attention_class():
+    from vllm.model_executor.layers.attention.attention import Attention
+    from vllm.v1.attention.backend import AttentionType
+
+    from spyre_inference.v1.attention import attn_layer
+
+    class_forward = Attention.forward
+    decoder = _StubAttentionLayer(AttentionType.DECODER)
+    encoder = _StubAttentionLayer(AttentionType.ENCODER_ONLY)
+
+    holder = attn_layer.install([decoder, encoder])
+
+    assert Attention.forward is class_forward
+    assert decoder.spyre_slots is holder
+    assert decoder.forward.__func__ is attn_layer._spyre_attention_forward
+    assert not hasattr(encoder, "spyre_slots")
+    assert not hasattr(encoder, "forward")
+
+    # No cache bound, so there is no device to mirror onto and nothing to publish.
+    holder.publish_null(8)
+    assert holder.slots is None
