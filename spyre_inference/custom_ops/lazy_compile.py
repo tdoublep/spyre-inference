@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable
-from typing import TypeVar
+from typing import TypeVar, cast
 
 import torch
 
@@ -73,4 +73,4 @@ def compile_when_outermost(method: F) -> F:
             )
         return self.spyre_compiled_kernel(*args, **kwargs)
 
-    return wrapper
+    return cast(F, wrapper)
