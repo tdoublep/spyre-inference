@@ -888,6 +888,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._attn_fns: dict[tuple[int, int], object] = {}
 
         self._kv_slots: SpyrePagedKVCache | None = None
+        # The pages `_kv_slots` was built from, so a re-bind is caught rather than
+        # scattering into views of the previous allocation.
+        self._kv_slots_src: tuple[torch.Tensor, torch.Tensor] | None = None
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
@@ -967,15 +970,21 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         return output
 
     def kv_slot_views(self, kv_cache: SpyrePagedKVCache) -> SpyrePagedKVCache:
-        """Slot-major views of the pages, built once outside any graph.
+        """Slot-major views of the pages, built outside any graph and reused after that.
 
         Inductor cannot lower a store through a view of a Spyre-layout tensor created
-        inside a graph.
+        inside a graph, so the views have to be made here and memoized. Rebinding the
+        cache would leave the memoized views pointing at the previous pages, which the
+        scatter would keep writing while attention read the new ones, so the pages the
+        views came from are checked rather than assumed.
         """
-        if self._kv_slots is None:
-            k_pages, v_pages = kv_cache
+        k_pages, v_pages = kv_cache
+        src = self._kv_slots_src
+        if src is None or k_pages is not src[0] or v_pages is not src[1]:
             shape = (-1, k_pages.shape[2], k_pages.shape[3])
             self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
+            self._kv_slots_src = (k_pages, v_pages)
+        assert self._kv_slots is not None
         return self._kv_slots
 
     def do_kv_cache_update(
@@ -989,7 +998,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Scatter new K/V tokens into their cache slots.
 
         Returns the mutated slot-major K view, which the caller hands to the attention
-        op to order the scatter before the read.
+        op to order the scatter before the read. One view covers both writes: they come
+        from the single ``_reshape_fn`` call below, and a mutation of a graph input is
+        not scheduled after an opaque op that might read it (on cpu the two even lower
+        into one fused kernel). That is a scheduling property rather than something the
+        dep states, so ``test_kv_write_ordered_before_attention_read`` asserts V is
+        visible to the attention read on both cpu and spyre.
         """
         # A source on the wrong device falls back to CPU silently, without raising.
         assert key.device.type == kv_cache[0].device.type, (

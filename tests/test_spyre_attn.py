@@ -21,7 +21,7 @@ import torch
 
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
-from vllm.utils.torch_utils import set_random_seed
+from vllm.utils.torch_utils import direct_register_custom_op, set_random_seed
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
@@ -1400,3 +1400,138 @@ def test_kv_cache_update_traced_by_caller(default_vllm_config, configure_device:
         import gc
 
         gc.collect()
+
+
+# --- ordering of the traced KV write against the attention read ---------------
+#
+# The real attention op reaches its cache through the forward context, so the graph
+# cannot see that it reads the pages. `do_kv_cache_update` therefore returns a value
+# for the caller to thread in as `kv_cache_dummy_dep`. This stand-in op reads the pages
+# the same out-of-band way and records what was already written when it ran.
+
+_PROBE_PAGES: dict[str, torch.Tensor] = {}
+_PROBE_SEEN: dict[str, torch.Tensor] = {}
+
+
+def _probe_attn(out: torch.Tensor, dep: torch.Tensor | None = None) -> None:
+    del dep
+    # Cloned on device; the comparison happens on the host after the graph has run.
+    _PROBE_SEEN["k"] = _PROBE_PAGES["k"].clone()
+    _PROBE_SEEN["v"] = _PROBE_PAGES["v"].clone()
+    out.fill_(1.0)
+
+
+def _probe_attn_fake(out: torch.Tensor, dep: torch.Tensor | None = None) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="spyre_test_probe_attn",
+    op_func=_probe_attn,
+    mutates_args=["out"],
+    fake_impl=_probe_attn_fake,
+)
+# The default registration takes the platform key; the cpu parametrization needs its own.
+torch.library.impl("vllm::spyre_test_probe_attn", "CPU", func=_probe_attn)
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    ["cpu", "spyre"],
+    ids=["device_cpu", "device_spyre"],
+    indirect=True,
+)
+def test_kv_write_ordered_before_attention_read(default_vllm_config, configure_device: str):
+    """Both scatters land before the attention read, not just the one the dep names."""
+    set_random_seed(0)
+    num_tokens, num_kv_heads, head_size, block_size, num_pages = 4, 8, 128, 64, 3
+    cache_device = torch.device(configure_device)
+    slots = [0, block_size + 5, 2 * block_size + 1, 7]
+
+    key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
+    value = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
+
+    def fresh_pages():
+        return torch.full(
+            (num_pages, block_size, num_kv_heads, head_size), -7.0, dtype=torch.float16
+        )
+
+    k_pages = convert(fresh_pages(), device=cache_device)
+    v_pages = convert(fresh_pages(), device=cache_device)
+    _PROBE_PAGES["k"], _PROBE_PAGES["v"] = k_pages, v_pages
+    _PROBE_SEEN.clear()
+
+    attn_impl = SpyreAttentionImpl(
+        num_heads=num_kv_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+    )
+    kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
+    # Production primes the slot-major views at bind time, before any tracing.
+    attn_impl.kv_slot_views(kv_cache)
+
+    def step(key_d, value_d, slot_map):
+        dep = attn_impl.do_kv_cache_update(None, key_d, value_d, kv_cache, slot_map)
+        out = torch.empty(2, 2, dtype=torch.float16, device=key_d.device)
+        torch.ops.vllm.spyre_test_probe_attn(out, dep)
+        return out
+
+    torch.compile(step, dynamic=False)(
+        convert(key, cache_device),
+        convert(value, cache_device),
+        convert(torch.tensor(slots, dtype=torch.int64), cache_device),
+    )
+
+    assert "k" in _PROBE_SEEN, "the stand-in attention op was scheduled out of the graph"
+    idx = torch.tensor(slots)
+    seen_k = _PROBE_SEEN["k"].to("cpu").reshape(-1, num_kv_heads, head_size)
+    seen_v = _PROBE_SEEN["v"].to("cpu").reshape(-1, num_kv_heads, head_size)
+    torch.testing.assert_close(seen_k[idx], key, atol=1e-2, rtol=1e-2)
+    # The dep names the K view; V is written by the same call and must be visible too.
+    torch.testing.assert_close(seen_v[idx], value, atol=1e-2, rtol=1e-2)
+
+    _PROBE_PAGES.clear()
+    _PROBE_SEEN.clear()
+    if configure_device == "spyre":
+        del k_pages, v_pages
+        import gc
+
+        gc.collect()
+
+
+def test_patched_forward_tolerates_missing_key_value(default_vllm_config, monkeypatch):
+    """Layers that pass no key/value reshape nothing and write nothing, as upstream does."""
+    from spyre_inference.v1.attention import attn_layer
+
+    num_heads, head_size = 4, 8
+    calls: list[tuple] = []
+
+    def fake_attention(query, key, value, output, layer_name, **kwargs):
+        calls.append((key, value, kwargs.get("kv_cache_dummy_dep")))
+
+    monkeypatch.setattr(
+        torch.ops.vllm, "unified_attention_with_output", fake_attention, raising=False
+    )
+
+    layer = Mock()
+    layer.spyre_kv_write_in_graph = True
+    layer.spyre_slots = attn_layer.SlotMapping()
+    layer.spyre_slots.slots = torch.tensor([0, 1])
+    layer.num_heads = num_heads
+    layer.num_kv_heads = num_heads
+    layer.head_size = head_size
+    layer.head_size_v = head_size
+    layer.layer_name = "decoder.layers.0.self_attn.attn"
+
+    query = torch.randn(2, num_heads * head_size, dtype=torch.float16)
+    # The KV write must be skipped rather than reshaping None, even though slots are
+    # published: upstream guards both the reshape and the write on key/value.
+    out = attn_layer._spyre_attention_forward(layer, query, None, None)
+
+    assert out.shape == (2, num_heads * head_size)
+    assert len(calls) == 1
+    key_arg, value_arg, dep = calls[0]
+    assert key_arg is None and value_arg is None
+    assert dep is None, "no KV write happened, so there is nothing to order against"
+    layer.impl.do_kv_cache_update.assert_not_called()
