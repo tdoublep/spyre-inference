@@ -124,7 +124,7 @@ class SpyreUnquantizedLinearMethod(SpyreTransposedWeightMethod, UnquantizedLinea
 
 
 class SpyrePaddedRowsLinearMethod(SpyreUnquantizedLinearMethod):
-    """Pads short activations up to `_PAD_ROWS` rows; used by the fused gate/up layer."""
+    """Pads short activations up to `_PAD_ROWS` rows, then slices the output back."""
 
     def apply(
         self,
@@ -148,7 +148,7 @@ class _SpyreTransposedLinearMixin:
     the transpose fast path only applies to unquantized weights.
     """
 
-    LINEAR_METHOD: type[SpyreUnquantizedLinearMethod] = SpyreUnquantizedLinearMethod
+    LINEAR_METHOD: type[SpyreUnquantizedLinearMethod] = SpyrePaddedRowsLinearMethod
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -164,8 +164,6 @@ class SpyreColumnParallelLinear(_SpyreTransposedLinearMixin, ColumnParallelLinea
 @MergedColumnParallelLinear.register_oot(name="MergedColumnParallelLinear")
 class SpyreMergedColumnParallelLinear(_SpyreTransposedLinearMixin, MergedColumnParallelLinear):
     """OOT MergedColumnParallelLinear (e.g. gate_up_proj) storing `Wᵀ`."""
-
-    LINEAR_METHOD = SpyrePaddedRowsLinearMethod
 
 
 @RowParallelLinear.register_oot(name="RowParallelLinear")
