@@ -183,6 +183,29 @@ the full sequence — so it skips the paged-cache machinery entirely and instead
 3. Scatters the unpadded results back to CPU, then writes them per token into the Spyre
    output buffer.
 
+## Encoder / embedding models: target state
+
+Everything above describes what is implemented today. The diagram below is a **target
+state** — where the encoder path is heading once the compile-mode work lands, and not a
+description of current behaviour.
+
+The shape of that target: the model body compiled once per token bucket, attention
+shape-managed separately behind the opaque custom-op boundary, and a warmup that walks
+both shape ladders so nothing compiles on the first request.
+
+<figure markdown="span">
+  ![Encoder target state](encoder-ideal-state.svg){: style="width: 140%; max-width: 1400px; margin-left: -20%" }
+  <figcaption>
+    Target architecture for encoder / embedding models under
+    <code>STOCK_TORCH_COMPILE</code>. Two shape axes are bucketed independently: the
+    token count <code>T</code> for the model body, and <code>(S, L)</code> for
+    attention's dense grid — they are decoupled because attention builds its grid by
+    gathering rows rather than by being handed a reshaped tensor. The foot of the
+    diagram contrasts today's dense-grid strategy with the planned flash-style variant,
+    which would collapse the second axis and converge on the upstream design.
+  </figcaption>
+</figure>
+
 ## Device Placement Strategy
 
 `TorchSpyreModelRunner` inherits from vLLM's `GPUModelRunner` and treats Spyre as the
@@ -266,7 +289,7 @@ backend still stubs `_allgather_base` (so `dist.all_gather_into_tensor` doesn't 
 
 `all_reduce` and `gather` are no longer overridden — they now work natively via
 `libspyre_comms`. Each remaining fallback is
-tagged `REPLACE-WITH-NATIVE`; the `tests/test_spyre_comms_native_probes.py` xfail-strict
+tagged `REPLACE-WITH-NATIVE`; the `tests/probes/test_spyre_comms_native_probes.py` xfail-strict
 suite is the canonical signal: when a probe flips green, delete the corresponding
 override.
 
