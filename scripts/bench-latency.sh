@@ -109,7 +109,7 @@ awk -v a="$AVG" -v p1="$P10" -v p9="$P90" -v sw="$SPREAD_WARN" 'BEGIN {
     else
         printf "  spread is tight (<= %.1f%%): clean measurement window.\n", sw
 }'
-awk -v w="$BUSY_WARN" -v n="$NCPU" -v thr="$THREADS" '
+awk -v w="$BUSY_WARN" -v n="$NCPU" -v threads="$THREADS" '
 { h+=$1; if ($1>hm) hm=$1; p+=$2; c++ }
 END {
     if (!c) { print "host CPU      : (no samples -- run too short)"; exit }
@@ -118,12 +118,12 @@ END {
     ext = h/c - p/c
     if (ext <= w)
         printf "  host was quiet (~%.1f external CPUs): comparable across pods.\n", ext
-    else if (thr > 32) {
-        printf "  WARNING: ~%.1f CPUs of load from OUTSIDE this pod, and OMP_NUM_THREADS=%s is\n", ext, thr
+    else if (threads > 32) {
+        printf "  WARNING: ~%.1f CPUs of load from OUTSIDE this pod, and OMP_NUM_THREADS=%s is\n", ext, threads
         printf "           wide enough that a barrier almost certainly waits on a thread sharing a\n"
         printf "           contended core. Expect an inflated mean; retry at 8-32 threads.\n"
     } else {
-        printf "  NOTE: ~%.1f CPUs of load from OUTSIDE this pod, but OMP_NUM_THREADS=%s is narrow\n", ext, thr
+        printf "  NOTE: ~%.1f CPUs of load from OUTSIDE this pod, but OMP_NUM_THREADS=%s is narrow\n", ext, threads
         printf "        enough to mostly dodge it. Trust the spread above over this number.\n"
     }
 }' "$SAMPLES"
