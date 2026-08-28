@@ -878,7 +878,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
         # Needs the loaded weights, so it cannot happen when the layers are patched.
-        marked = attn_layer.oproj_takes_heads_outer(cast(nn.Module, self.model))
+        # `model` is unset when the cache is sized without one (as the shape tests do);
+        # nothing is marked, and decode falls back to the opaque op.
+        model = getattr(self, "model", None)
+        marked = 0 if model is None else attn_layer.oproj_takes_heads_outer(model)
         if marked:
             logger.info(
                 "o_proj contracts per head for %d attention layers, so decode steps can "
