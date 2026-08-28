@@ -876,6 +876,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
             self.compilation_config.static_forward_context,
             self.kv_caches,
         )
+
+        # Needs the loaded weights, so it cannot happen when the layers are patched.
+        marked = attn_layer.oproj_takes_heads_outer(cast(nn.Module, self.model))
+        if marked:
+            logger.info(
+                "o_proj contracts per head for %d attention layers, so decode steps can "
+                "keep attention in the block's graph.",
+                marked,
+            )
         return kv_caches
 
     # --- Stubs copied from CPUModelRunner ---

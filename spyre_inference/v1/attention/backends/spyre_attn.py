@@ -15,6 +15,7 @@
 """Paged KV-cache attention backend for Spyre using a dense page tensor and online softmax."""
 
 import functools
+import math
 import os
 from dataclasses import dataclass
 from typing import ClassVar, NamedTuple
@@ -78,6 +79,21 @@ QUERY_CHUNK_SIZE = 32
 # padded to this width so each row starts on a stick boundary; see
 # SpyreAttentionMetadata.page_index_tables.
 INT32_ELEMS_PER_STICK = 32
+
+
+def _decode_page_bucket(num_pages: int, max_pages: int) -> int:
+    """Round a decode page count up to a power of two, capped at the model's maximum.
+
+    The traced decode core bakes its trip count into the caller's graph, so an exact
+    count would recompile every decoder block each time a sequence crossed a block
+    boundary. Doubling instead caps the graph count at log2(max_pages) and the wasted
+    work at one extra page-worth of attention per sequence; the surplus pages read the
+    null block under an all-masked tile, contributing nothing.
+    """
+    bucket = 1
+    while bucket < num_pages:
+        bucket *= 2
+    return min(bucket, max_pages)
 
 
 class SpyrePagedKVCache(NamedTuple):
@@ -433,9 +449,82 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self._zero_tile: torch.Tensor | None = None
         self._zero_tile_shape: tuple[int, int] = (0, 0)
 
+        # Ceiling on a sequence's page count, and so on the traced decode trip count.
+        self.max_pages = math.ceil(model_config.max_model_len / self.block_size)
+
+        # Additive decode masks by (kv_len, num_pages); see _get_decode_mask.
+        self._decode_masks: dict[tuple[int, int], torch.Tensor] = {}
+
         static_ctx = vllm_config.compilation_config.static_forward_context
-        self._slot_mapping = attn_layer.install(
+        self._step_state = attn_layer.install(
             static_ctx[name] for name in layer_names if name in static_ctx
+        )
+
+    def _get_decode_mask(self, kv_len: int, num_pages: int, device: torch.device) -> torch.Tensor:
+        """Additive [1, num_pages * block_size] mask for one decoding sequence.
+
+        A decode query sits at the end of its sequence and attends to everything before
+        it, so the mask depends on nothing but `kv_len` and the bucket width — which is
+        why these are cached and reused rather than mirrored to device every step. There
+        are at most `max_model_len` of them, a few hundred bytes each.
+        """
+        key = (kv_len, num_pages)
+        cached = self._decode_masks.get(key)
+        if cached is None:
+            width = num_pages * self.block_size
+            valid = torch.arange(width) < kv_len
+            cached = convert(
+                torch.where(
+                    valid.view(1, width),
+                    torch.tensor(0.0, dtype=self.model_dtype),
+                    torch.tensor(torch.finfo(self.model_dtype).min, dtype=self.model_dtype),
+                ).contiguous(),
+                device=device,
+            )
+            self._decode_masks[key] = cached
+        return cached
+
+    def _publish_decode_plan(
+        self, num_seqs: int, seq_lens: torch.Tensor, block_table: torch.Tensor
+    ) -> None:
+        """Hand the step's decode inputs to the layers, or stand down to the opaque op.
+
+        Called only for decode-only batches. A sliding window is excluded because its
+        mask also carries a per-query window start, which the kv_len-indexed masks above
+        do not express.
+        """
+        state = self._step_state
+        device = state.device
+        if (
+            device is None
+            or self.sliding_window is not None
+            or not state.resolve_decode_traceable()
+        ):
+            state.clear_decode()
+            return
+
+        block_size = self.block_size
+        seq_lens_list = [int(length) for length in seq_lens.tolist()]
+        page_counts = [(length + block_size - 1) // block_size for length in seq_lens_list]
+        max_count = max(page_counts)
+        num_pages = _decode_page_bucket(max_count, max(self.max_pages, max_count))
+
+        # Slot indices, not page indices: the core gathers the sequence's KV run in one
+        # go (see decode_attention). Surplus pages past a sequence's own blocks stay at
+        # the null block, whose zeroed contents the mask discards anyway.
+        offsets = torch.arange(block_size, dtype=torch.int32)
+        pages = torch.zeros(num_seqs, num_pages, dtype=torch.int32)
+        masks: list[torch.Tensor] = []
+        for s, count in enumerate(page_counts):
+            pages[s, :count] = block_table[s, :count]
+            masks.append(self._get_decode_mask(seq_lens_list[s], num_pages, device))
+        ids = (pages.unsqueeze(2) * block_size + offsets).reshape(num_seqs, -1)
+
+        state.publish_decode(
+            num_pages,
+            num_seqs,
+            [convert(ids[s].contiguous(), device=device) for s in range(num_seqs)],
+            masks,
         )
 
     def _get_zero_tile(self, aligned_max_query_len: int) -> torch.Tensor:
@@ -771,7 +860,16 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         # Padded to match key/value by upstream once forward_includes_kv_cache_update is
         # False, so the traced write keeps one shape per bucket, not one per token count.
-        self._slot_mapping.publish(slot_mapping)
+        self._step_state.publish(slot_mapping)
+
+        # max_query_len == 1 means every sequence decodes, so the page loop has a fixed
+        # trip count and the core can trace into each decoder block's graph. Anything
+        # with a prefill in it keeps the opaque op, whose Python loop reads per-sequence
+        # query lengths.
+        if max_query_len == 1 and num_seqs > 0:
+            self._publish_decode_plan(num_seqs, seq_lens, block_table)
+        else:
+            self._step_state.clear_decode()
 
         return SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
@@ -924,6 +1022,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._attn_fns: dict[tuple[int, int, str, int, bool], object] = {}
 
         self._kv_slots: SpyrePagedKVCache | None = None
+        # Page-major shape of the cache, so the traced decode core can read the slot
+        # views back as pages. Set alongside _kv_slots.
+        self._kv_page_shape: tuple[int, ...] = ()
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
@@ -1022,6 +1123,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if self._kv_slots is None:
             k_pages, v_pages = kv_cache
             shape = (-1, k_pages.shape[2], k_pages.shape[3])
+            self._kv_page_shape = tuple(k_pages.shape)
             self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._kv_slots
 
@@ -1032,24 +1134,113 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         value: torch.Tensor,
         kv_cache: SpyrePagedKVCache,
         slot_mapping: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> SpyrePagedKVCache:
         """Scatter new K/V tokens into their cache slots.
 
-        Returns the mutated slot-major K view, which the caller hands to the attention
-        op to order the scatter before the read.
+        Returns the mutated slot-major views, which the caller hands on to order the
+        scatter before the read — the opaque op takes K as a dummy argument, the traced
+        decode core reads both through them.
         """
         # A source on the wrong device falls back to CPU silently, without raising.
         assert key.device.type == kv_cache[0].device.type, (
             f"kv cache update source is on {key.device.type}, pages on {kv_cache[0].device.type}"
         )
 
-        k_slots, v_slots = self.kv_slot_views(kv_cache)
+        slots = self.kv_slot_views(kv_cache)
         # Eager index_copy_ rejects an int32 index and silently falls back to CPU with an
         # int64 one, so this always goes through the compiled artifact.
-        self._reshape_fn(key, value, k_slots, v_slots, slot_mapping)
-        # Only k_slots is returned, but Inductor fuses both index_copy_ calls into one
-        # kernel, so ordering the read after it covers the V write too.
-        return k_slots
+        self._reshape_fn(key, value, slots.k_pages, slots.v_pages, slot_mapping)
+        return slots
+
+    @_record_function("spyre_attn::decode")
+    def decode_attention(
+        self,
+        query: torch.Tensor,
+        kv_slots: SpyrePagedKVCache,
+        num_pages: int,
+        num_seqs: int,
+        slot_ids_per_seq: list[torch.Tensor],
+        masks: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Decode-only attention, traced into the caller's graph.
+
+        `num_pages` and `num_seqs` arrive as Python ints, so the loop unrolls and the
+        whole core becomes ops in the enclosing decoder block's graph rather than a call
+        to a separately compiled artifact.
+
+        One plain softmax over all `num_pages * block_size` cached positions, not the
+        page-at-a-time online softmax the prefill path uses. A decode query is a single
+        row, so its whole score vector is a few thousand elements — there is nothing to
+        stream, and the running max/sum accumulator it would need is both wasted work
+        and (being a loop-carried in-place update) the part a Spyre kernel is least able
+        to schedule once attention is fused with the rest of the block.
+
+        The cache is read through `kv_slots` — the views the scatter just wrote — rather
+        than through the page tensors it aliases, so "scatter before read" stays a data
+        dependency Inductor can see. Reshaping back to page-major here is a read-only
+        view; only stores through a view built inside a graph are unsupported.
+
+        Args:
+            query: [num_tokens, num_heads, head_size]. Rows past `num_seqs` are batch
+                padding for the compiled bucket.
+            slot_ids_per_seq: per sequence, [num_pages * block_size] int32 slot indices.
+            masks: per sequence, [1, num_pages * block_size] additive mask covering KV
+                padding and the surplus pages the bucket added; broadcasts over heads.
+
+        Returns [num_heads, num_tokens, head_size] — the head axis stays outermost so
+        the sibling o_proj can contract each head against its own slice of Wᵀ. Padding
+        columns come back zeroed.
+        """
+        num_heads, nkv, hs = self.num_heads, self.num_kv_heads, self.head_size
+        num_queries_per_kv = self.num_queries_per_kv
+        k_slots, v_slots = kv_slots
+
+        outputs: list[torch.Tensor] = []
+        for s in range(num_seqs):
+            single = num_seqs == 1 and query.shape[0] == 1
+            q_rows = query if single else query[s : s + 1]
+            # The GQA group is the matmul's row axis, not a broadcast batch axis: with
+            # one query row per sequence, the heads sharing a KV head are exactly the
+            # rows of a [group, D] @ [D, kv] product. That leaves a plain 3D batched
+            # matmul over KV heads — no size-1 query axis and no operand broadcast, both
+            # of which a Spyre kernel struggles to schedule once fused into a block.
+            q = q_rows.reshape(nkv, num_queries_per_kv, hs)
+
+            # index_select, not `k_slots[ids]`: subscripting lowers to aten.index, which
+            # upcasts the int32 index to int64 and fails eager. Gathering slots rather
+            # than pages lands the sequence's whole KV run in one [kv, heads, D] tensor,
+            # with no reshape across the page/offset boundary — that reshape is only
+            # valid for a layout the cache does not have, and silently returns scrambled
+            # rows. It also reads the scatter's destination directly, so "scatter before
+            # read" needs no view to carry the dependency.
+            slot_ids = slot_ids_per_seq[s]
+            # `.contiguous()` is load-bearing, not tidiness: a Spyre batchmatmul needs
+            # its second operand's stick to be the axis the output keeps, so K must be
+            # kv-innermost. The cache is head-size-innermost, and a standalone attention
+            # kernel gets the relayout inserted for it; fused into a decoder block there
+            # is none to insert, so the transpose is materialized here. Only the
+            # sequence's gathered KV run is copied, not the cache.
+            k_t = k_slots.index_select(0, slot_ids).permute(1, 2, 0).contiguous()
+            v_kv = v_slots.index_select(0, slot_ids).permute(1, 0, 2)
+
+            scores = torch.matmul(q, k_t) * self.scale
+            if self.logits_soft_cap > 0.0:
+                scores = torch.tanh(scores / self.logits_soft_cap) * self.logits_soft_cap
+            scores = scores + masks[s]
+            attn = torch.matmul(torch.softmax(scores, dim=-1), v_kv)
+            # Heads stay outermost: folding them into hidden here would hand o_proj an
+            # operand whose reduction spans two axes, and a bmm contracts exactly one.
+            outputs.append(attn.reshape(num_heads, 1, hs))
+
+        num_padding = query.shape[0] - num_seqs
+        if num_padding > 0:
+            # Downstream discards these rows; they only have to exist and be finite.
+            outputs.append(
+                torch.zeros(num_heads, num_padding, hs, dtype=query.dtype, device=query.device)
+            )
+        if len(outputs) == 1:
+            return outputs[0]
+        return torch.cat(outputs, dim=1)
 
     @_record_function("spyre_attn::online_softmax")
     def _online_softmax_attention(

@@ -1535,11 +1535,181 @@ def test_install_patches_layers_not_the_attention_class():
     holder = attn_layer.install([decoder, encoder])
 
     assert Attention.forward is class_forward
-    assert decoder.spyre_slots is holder
+    assert decoder.spyre_step is holder
     assert decoder.forward.__func__ is attn_layer._spyre_attention_forward
-    assert not hasattr(encoder, "spyre_slots")
+    assert not hasattr(encoder, "spyre_step")
     assert not hasattr(encoder, "forward")
 
     # No cache bound, so there is no device to mirror onto and nothing to publish.
     holder.publish_null(8)
     assert holder.slots is None
+
+
+class _StubDecodeLayer:
+    """Enough of `Attention` for `StepState` to resolve a device and pre-build views."""
+
+    def __init__(self, impl, kv_cache):
+        self.impl = impl
+        self.kv_cache = kv_cache
+
+
+def _decode_setup(
+    configure_device,
+    kv_lens,
+    block_size=64,
+    num_blocks=64,
+    num_query_heads=8,
+    num_kv_heads=2,
+    head_size=64,
+):
+    """Seed a paged cache for a decode-only batch and publish the traced decode plan.
+
+    Returns what the assertions need: the impl, the builder and its plan holder, the
+    device query, the CPU page tensors that feed `ref_attn`, and the block tables.
+    """
+    from vllm.config import get_current_vllm_config
+
+    from spyre_inference.v1.attention import attn_layer
+
+    dtype = torch.float16
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    num_seqs = len(kv_lens)
+    scale = head_size**-0.5
+    cache_device = torch.device(configure_device)
+
+    query = torch.randn(num_seqs, num_query_heads, head_size, dtype=dtype)
+    k_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
+    v_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=dtype)
+
+    max_blocks = (max(kv_lens) + block_size - 1) // block_size
+    # Distinct, non-identity pages per sequence: a mis-indexed page table cannot pass.
+    block_tables = torch.arange(1, num_seqs * max_blocks + 1, dtype=torch.int32).reshape(
+        num_seqs, max_blocks
+    )
+    for s, kv_len in enumerate(kv_lens):
+        for t in range(kv_len):
+            page = int(block_tables[s, t // block_size])
+            k_pages_cpu[page][t % block_size] = torch.randn(num_kv_heads, head_size, dtype=dtype)
+            v_pages_cpu[page][t % block_size] = torch.randn(num_kv_heads, head_size, dtype=dtype)
+
+    kv_cache = SpyrePagedKVCache(
+        k_pages=k_pages_cpu.to(cache_device), v_pages=v_pages_cpu.to(cache_device)
+    )
+    attn_impl = SpyreAttentionImpl(
+        num_heads=num_query_heads,
+        head_size=head_size,
+        scale=scale,
+        num_kv_heads=num_kv_heads,
+        kv_cache_dtype="auto",
+    )
+    attn_impl.kv_slot_views(kv_cache)
+
+    vllm_config = get_current_vllm_config()
+    vllm_config.model_config.get_num_attention_heads = Mock(return_value=num_query_heads)
+    vllm_config.model_config.get_num_kv_heads = Mock(return_value=num_kv_heads)
+    builder = SpyreAttentionMetadataBuilder(
+        kv_cache_spec=AttentionSpec(
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            dtype=dtype,
+        ),
+        layer_names=["layers.0.self_attn"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+    state = attn_layer.StepState([_StubDecodeLayer(attn_impl, kv_cache)])
+    # Set directly: resolving it needs a real model's o_proj wiring.
+    state.decode_traceable = True
+    builder._step_state = state
+    builder._publish_decode_plan(num_seqs, torch.tensor(kv_lens, dtype=torch.int32), block_tables)
+
+    return {
+        "impl": attn_impl,
+        "builder": builder,
+        "state": state,
+        "kv_cache": kv_cache,
+        "query": query,
+        "query_dev": convert(query, cache_device),
+        "k_pages_cpu": k_pages_cpu,
+        "v_pages_cpu": v_pages_cpu,
+        "block_tables": block_tables,
+        "block_size": block_size,
+        "scale": scale,
+    }
+
+
+@pytest.mark.parametrize("configure_device", ["cpu", "spyre"], indirect=True)
+@pytest.mark.parametrize("kv_lens", [[65], [128], [129], [40, 200, 129]])
+def test_traced_decode_matches_reference(default_vllm_config, configure_device, kv_lens):
+    """The traced decode core reproduces the reference on a decode-only batch.
+
+    Covers the builder's page bucketing and its fill-indexed mask tiles: kv_len 129
+    needs three pages and so runs with a fourth, fully-masked surplus page.
+    """
+    s = _decode_setup(configure_device, kv_lens)
+    state = s["state"]
+
+    result = s["impl"].decode_attention(
+        s["query_dev"],
+        s["impl"].kv_slot_views(s["kv_cache"]),
+        state.decode_pages,
+        state.decode_num_seqs,
+        state.decode_slot_ids,
+        state.decode_masks,
+    )
+
+    ref = ref_attn(
+        query=s["query"],
+        key_cache=s["k_pages_cpu"],
+        value_cache=s["v_pages_cpu"],
+        query_lens=[1] * len(kv_lens),
+        kv_lens=kv_lens,
+        block_tables=s["block_tables"],
+        block_size=s["block_size"],
+        scale=s["scale"],
+    )
+    # decode_attention hands o_proj the head axis outermost; ref_attn is token-major.
+    assert_close_outliers(result.to("cpu").transpose(0, 1), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("configure_device", ["cpu"], indirect=True)
+@pytest.mark.parametrize("kv_lens,expected_pages", [([64], 1), ([65], 2), ([129], 4), ([300], 8)])
+def test_decode_page_count_is_bucketed(
+    default_vllm_config, configure_device, kv_lens, expected_pages
+):
+    """Page counts round up to a power of two, so the traced trip count changes rarely."""
+    state = _decode_setup(configure_device, kv_lens, num_blocks=128)["state"]
+    assert state.decode_pages == expected_pages
+    assert len(state.decode_masks) == len(kv_lens)
+    assert all(m.shape == (1, expected_pages * 64) for m in state.decode_masks)
+    assert len(state.decode_slot_ids) == len(kv_lens)
+    assert all(i.shape == (expected_pages * 64,) for i in state.decode_slot_ids)
+
+
+@pytest.mark.parametrize("configure_device", ["cpu"], indirect=True)
+def test_prefill_batch_clears_the_decode_plan(default_vllm_config, configure_device):
+    """A batch with any prefill in it falls back to the opaque op."""
+    s = _decode_setup(configure_device, [128])
+    assert s["state"].decode_pages != 0
+
+    # Same builder, now handed a two-token query: no longer decode-only.
+    s["builder"].build(
+        common_prefix_len=0,
+        common_attn_metadata=CommonAttentionMetadata(
+            query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 2], dtype=torch.int32),
+            seq_lens=torch.tensor([128], dtype=torch.int32),
+            num_reqs=1,
+            num_actual_tokens=2,
+            max_query_len=2,
+            max_seq_len=128,
+            block_table_tensor=s["block_tables"],
+            slot_mapping=torch.tensor([126, 127], dtype=torch.int64),
+            causal=True,
+        ),
+    )
+    assert s["state"].decode_pages == 0
+    assert s["state"].decode_masks == []
