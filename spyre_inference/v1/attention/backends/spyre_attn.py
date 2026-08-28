@@ -81,6 +81,12 @@ QUERY_CHUNK_SIZE = 32
 INT32_ELEMS_PER_STICK = 32
 
 
+# Decode masks held on device at once. Only sequences sharing a kv_len within a step
+# reuse one, so this bounds a cache that would otherwise grow with every position
+# reached — at long context each mask is hundreds of KB.
+_DECODE_MASK_CACHE = 64
+
+
 def _decode_page_bucket(num_pages: int, max_pages: int) -> int:
     """Round a decode page count up to a power of two, capped at the model's maximum.
 
@@ -464,13 +470,16 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         """Additive [1, num_pages * block_size] mask for one decoding sequence.
 
         A decode query sits at the end of its sequence and attends to everything before
-        it, so the mask depends on nothing but `kv_len` and the bucket width — which is
-        why these are cached and reused rather than mirrored to device every step. There
-        are at most `max_model_len` of them, a few hundred bytes each.
+        it, so the mask depends on nothing but `kv_len` and the bucket width. Cached on
+        that pair, which sequences at the same length share within a step — but `kv_len`
+        grows every step, so the cache is bounded and evicted in insertion order rather
+        than accumulating one mask per position reached.
         """
         key = (kv_len, num_pages)
         cached = self._decode_masks.get(key)
         if cached is None:
+            if len(self._decode_masks) >= _DECODE_MASK_CACHE:
+                del self._decode_masks[next(iter(self._decode_masks))]
             width = num_pages * self.block_size
             valid = torch.arange(width) < kv_len
             cached = convert(

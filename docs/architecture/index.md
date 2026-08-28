@@ -115,10 +115,25 @@ backend compile count is independent of depth, but it is not 1: layer 0 speciali
 separately because `residual is None` there, so a Llama-shaped stack yields two
 artifacts, and stacks that vary per layer yield more — Gemma 3 alternates sliding-window
 and full attention, giving four. A fresh `num_tokens` tier then costs one block recompile
-rather than a whole-model one. Note that `num_tokens` is the block graph's *only* shape
-dependence: kv-cache length and the `KV_LENGTH_ALIGNMENT` tiers live inside
-`unified_attention_with_output`, which is opaque to this graph and compiles its own
-kernels (see [Kineto profiling](../user_guide/kineto_profiling.md)).
+rather than a whole-model one. For a batch containing any prefill, `num_tokens` is the
+block graph's *only* shape dependence: kv-cache length and the `KV_LENGTH_ALIGNMENT` tiers
+live inside `unified_attention_with_output`, which is opaque to this graph and compiles its
+own kernels (see [Kineto profiling](../user_guide/kineto_profiling.md)).
+
+A decode-only step instead traces the attention core into the block graph, so the block is
+one graph rather than prologue / opaque attention / epilogue. Decode is the shape that
+allows it: one query row per sequence, so the KV width is a compile-time constant and the
+body carries no per-sequence query length. That adds a second shape dependence for those
+graphs — the bucketed page count — which `_decode_page_bucket` rounds to a power of two so
+it changes at most `log2(max_model_len / block_size)` times. The traced body is not the
+prefill body: one plain softmax over the whole bucketed KV run, since a decode query's
+score vector is small enough that the online softmax's running max/sum would be pure
+overhead, and its loop-carried update is something the backend cannot schedule once
+attention is fused with the rest of the block. `o_proj` then contracts each head against
+its own slice of `Wᵀ` instead of taking a folded `[tokens, hidden]` operand: folding the
+head axis inside a graph gives that matmul a reduction spanning two axes, and a bmm
+contracts exactly one. Layers whose result does not reach such an `o_proj`, plus ALiBi and
+sliding-window steps, keep the opaque op. `SPYRE_DECODE_TRACED_ATTN=0` disables it.
 
 Depth independence relies on vLLM hoisting the per-layer attention name out of the graph,
 which needs torch >= 2.11 and `VLLM_USE_LAYERNAME=1`. Without it each block bakes in its

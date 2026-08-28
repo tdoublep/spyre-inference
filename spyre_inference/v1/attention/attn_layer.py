@@ -23,8 +23,8 @@ Two shapes of step, two splits:
 * **Decode-only** — every sequence contributes one query row, so the KV width is a
   compile-time constant and the whole core traces, giving one graph per decoder block.
   ``SpyreAttentionMetadataBuilder`` publishes the step's plan on ``StepState``; the
-  page count is bucketed there so that constant changes rarely. Gated off by default:
-  see ``_TRACE_DECODE``.
+  page count is bucketed there so that constant changes rarely.
+  ``SPYRE_DECODE_TRACED_ATTN=0`` falls back to the op below.
 * **Anything with a prefill** — the core stays behind
   ``unified_attention_with_output``. Its per-sequence loop is shaped by per-sequence
   query lengths, which ``fullgraph=True`` cannot hold.
@@ -175,9 +175,7 @@ class StepState:
                 )
             )
             if self.decode_traceable:
-                logger.info(
-                    "Tracing the attention core into each decoder block for decode steps."
-                )
+                logger.info("Tracing the attention core into each decoder block for decode steps.")
         return self.decode_traceable
 
     def publish(self, slot_mapping: torch.Tensor) -> None:
