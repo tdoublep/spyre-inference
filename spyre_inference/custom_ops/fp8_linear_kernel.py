@@ -31,7 +31,6 @@ from typing import cast
 
 import torch
 from torch.nn.parameter import Parameter
-
 from vllm.logger import init_logger
 from vllm.platforms import PlatformEnum
 
