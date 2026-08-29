@@ -1223,13 +1223,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # rows. It also reads the scatter's destination directly, so "scatter before
             # read" needs no view to carry the dependency.
             slot_ids = slot_ids_per_seq[s]
-            # `.contiguous()` is load-bearing, not tidiness: a Spyre batchmatmul needs
-            # its second operand's stick to be the axis the output keeps, so K must be
-            # kv-innermost. The cache is head-size-innermost, and a standalone attention
-            # kernel gets the relayout inserted for it; fused into a decoder block there
-            # is none to insert, so the transpose is materialized here. Only the
-            # sequence's gathered KV run is copied, not the cache.
-            k_t = k_slots.index_select(0, slot_ids).permute(1, 2, 0).contiguous()
+            k_t = k_slots.index_select(0, slot_ids).permute(1, 2, 0)
             v_kv = v_slots.index_select(0, slot_ids).permute(1, 0, 2)
 
             scores = torch.matmul(q, k_t) * self.scale
