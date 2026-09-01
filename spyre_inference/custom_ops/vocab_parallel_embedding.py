@@ -158,7 +158,9 @@ def promote_tied_lm_head(head: torch.nn.Module) -> None:
     signal that identifies the projection in all three, so the decision is made here
     rather than guessed at construction.
 
-    `weight` is left alone: it keeps the row-gathered layout the gather needs.
+    `weight` is left alone: it keeps the row-gathered layout the gather needs. The
+    gather and matmul layouts differ, so both tables stay resident -- the vocab-sized
+    saving upstream tying gets is deliberately given up to keep the transposed matmul.
     """
     # Exact type: SpyreParallelLMHead is a subclass and brings its own method.
     if type(head) is not SpyreVocabParallelEmbedding:
