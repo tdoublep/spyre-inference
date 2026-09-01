@@ -188,7 +188,7 @@ def prepare_token_head_for_spyre(
     for target in targets:
         for module in target.modules():
             if getattr(module, "head_dtype", None) is not None:
-                module.head_dtype = torch.float16
+                module.head_dtype = torch.float16  # ty: ignore[invalid-assignment]
         # A dtype cast on device returns wrong data; convert() detours via host.
         for param in target.parameters(recurse=True):
             if param.dtype == torch.float32:

@@ -51,7 +51,8 @@ RERANKER_MODELS = [
 ]
 
 # Token classification: the model applies its own classifier after casting to
-# a float32 head_dtype, so that tail runs on CPU (SpyreCpuClassifier).
+# head_dtype. prepare_token_head_for_spyre casts the classifier to fp16 so it
+# runs on Spyre instead of detouring through SpyreCpuClassifier.
 TOKEN_CLASSIFY_MODEL = "dslim/bert-base-NER"
 TOKEN_CLASSIFY_PROMPTS = [
     "My name is Wolfgang and I live in Berlin",
