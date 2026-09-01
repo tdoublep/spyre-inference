@@ -28,9 +28,9 @@ from vllm.model_executor.layers.pooler.activations import PoolerNormalize
 from vllm.model_executor.layers.pooler.seqwise.heads import EmbeddingPoolerHead
 from vllm.model_executor.layers.pooler.seqwise.methods import CLSPool, LastPool, MeanPool
 from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
+from vllm.model_executor.layers.pooler.special import DispatchPooler
 from vllm.model_executor.layers.pooler.tokwise.methods import AllPool, StepPool
 from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
-from vllm.model_executor.layers.pooler.special import DispatchPooler
 
 from spyre_inference.v1.pool.spyre_pooler import (
     SpyreAllPool,

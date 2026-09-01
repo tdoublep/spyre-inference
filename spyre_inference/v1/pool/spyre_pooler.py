@@ -27,10 +27,10 @@ from vllm.model_executor.layers.pooler.seqwise.methods import (
     LastPool,
     SequencePoolingMethod,
 )
- from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
-+from vllm.model_executor.layers.pooler.special import DispatchPooler
- from vllm.model_executor.layers.pooler.tokwise.methods import AllPool
- from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
+from vllm.model_executor.layers.pooler.seqwise.poolers import SequencePooler
+from vllm.model_executor.layers.pooler.special import DispatchPooler
+from vllm.model_executor.layers.pooler.tokwise.methods import AllPool
+from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from vllm.v1.outputs import PoolerOutput
 
 from spyre_inference.custom_ops.utils import convert
