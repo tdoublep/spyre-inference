@@ -450,10 +450,8 @@ class TorchSpyrePlatform(CpuPlatform):
         if not cache_config.user_specified_block_size:
             if cache_config.block_size != multiple:
                 logger.info(
-                    "Defaulting block_size to %d for the Spyre paged attention backend "
-                    "(inherited default was %d).",
+                    "Setting kv cache block size to %d for the Spyre paged attention backend.",
                     multiple,
-                    cache_config.block_size,
                 )
                 cache_config.block_size = multiple
             return
