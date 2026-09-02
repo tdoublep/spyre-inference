@@ -46,7 +46,7 @@ BENCH_ARGV = [
     "vllm", "bench", "latency",
     "--model", "ibm-granite/granite-3.3-8b-instruct",
     "--input-len", "64", "--output-len", "512", "--batch-size", "1",
-    "--num-iters-warmup", "2", "--num-iters", "1", "--max-model-len", "128",
+    "--num-iters-warmup", "2", "--num-iters", "1", "--max-model-len", "576",
     "-cc.compile_sizes=[1,64]",
 ]
 
