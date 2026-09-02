@@ -63,7 +63,7 @@ class SpyreParallelLMHead(ParallelLMHead):
 
     def __init__(self, *args, **kwargs):
         # Pad the vocab so every TP shard is a whole number of 64-element sticks, which
-        # lets the logits all_gather run entirely on device (see spyre_communicator).
+        # lets the logits gather stay on device (see SpyreCommunicator.all_gather).
         kwargs["padding_size"] = 64 * get_tensor_model_parallel_world_size()
         super().__init__(*args, **kwargs)
 
