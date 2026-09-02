@@ -39,15 +39,8 @@ from vllm.model_executor.layers.linear import (
 
 logger = init_logger(__name__)
 
-# torch-spyre#4032: a weight tile is held stationary in XRF and broadcast across the 8
-# PT rows, so a GEMM with fewer activation rows leaves rows of the array idle. Decode
-# streams the weight once either way, so normally the row count barely matters -- but on
-# some weight shapes the 1-row schedule lands well below the rate the same weight
-# sustains with a full row block, and padding up to `_PAD_ROWS` escapes it. Which shapes
-# those are does not reduce to a rule: on the narrow-output projections (o_proj, qkv,
-# down_proj) padding measurably *costs* a few percent, and past `_MAX_PAD_WEIGHT` it
-# regresses badly, so re-measure before widening this. The wider matmul also shifts the
-# fp16 result slightly. `test_spyre_fallback_probes.py` fails once #4032 makes this moot.
+# torch-spyre#4032: on some weight shapes a short row block runs well below the rate a
+# full 8 PT rows sustain. It costs a few percent elsewhere, so re-measure before widening.
 _PAD_ROWS = 8
 _MAX_PAD_WEIGHT = 200_000_000
 
@@ -128,12 +121,7 @@ class SpyreUnquantizedLinearMethod(SpyreTransposedWeightMethod, UnquantizedLinea
 
 
 class SpyrePaddedRowsLinearMethod(SpyreUnquantizedLinearMethod):
-    """Pads a partial row block up to `_PAD_ROWS` rows before the GEMM.
-
-    Attached to `SpyreMergedColumnParallelLinear`, so every OOT
-    `MergedColumnParallelLinear` gets the padding and the fp16 shift it brings, not
-    just gate/up. Whether it pays depends on the weight shape; see `_PAD_ROWS`.
-    """
+    """Pads a partial row block to `_PAD_ROWS`; set on every merged-column layer."""
 
     def _pads(self, layer: torch.nn.Module) -> bool:
         return cast(torch.Tensor, getattr(layer, self.WEIGHT_T_ATTR)).numel() <= _MAX_PAD_WEIGHT

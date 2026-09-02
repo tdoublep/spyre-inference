@@ -153,12 +153,7 @@ def test_unquantized_layers_get_spyre_method(tp_group):
 
 
 def _rows_reaching_gemm(gate_up, x, monkeypatch):
-    """The row count the GEMM actually sees, so a test can tell padding from no-padding.
-
-    On CPU `torch.matmul` computes each output row independently, so `out[:m]` is
-    bit-identical whether or not padding fired -- only the shape handed to the parent
-    `apply` distinguishes them.
-    """
+    """Rows reaching the GEMM: on CPU `out[:m]` is identical whether or not padding fired."""
     from spyre_inference.custom_ops.linear import SpyreUnquantizedLinearMethod
 
     seen = []

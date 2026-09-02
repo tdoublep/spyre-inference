@@ -837,8 +837,7 @@ def test_spyre_one_row_matmul_not_slower_than_full_row_block(spyre_device):
         best_of(rows, reps=3)
     one_row, full_block = best_of(1), best_of(8)
 
-    # The gap is ~25% when the limitation bites and the run-to-run spread is a few
-    # percent, so 10% separates a real fix from noise.
+    # Run-to-run spread is a few percent and the gap is far wider, so 10% is not noise.
     assert one_row <= 1.10 * full_block, (
         f"1 row {one_row * 1e3:.2f} ms vs 8 rows {full_block * 1e3:.2f} ms "
         f"({100 * (one_row / full_block - 1):.0f}% slower)"
