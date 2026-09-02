@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     SPYRE_COMPILE_GRANULARITY: str = "block"
     SPYRE_ATTN_PROFILING: bool = False
     SPYRE_BUCKETED_DECODE: bool = False
+    SPYRE_LX_V_CEILING: bool = False
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -54,6 +55,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pending performance characterisation at small batch sizes (num_seqs <= 4).
     # Re-enable to measure the path or to restore it after calibration.
     "SPYRE_BUCKETED_DECODE": lambda: bool(int(os.getenv("SPYRE_BUCKETED_DECODE", "0"))),
+    # MEASUREMENT ONLY -- produces wrong output. Stores V head-major so every page
+    # tile stays LX-resident, and diverts the scatter to a token-major sink of
+    # identical cost, because a per-token store into a head-major page would write
+    # one element per stick and does not lower. Bounds the win available from a
+    # real head-major V (which must transpose whole pages as they fill).
+    "SPYRE_LX_V_CEILING": lambda: bool(int(os.getenv("SPYRE_LX_V_CEILING", "0"))),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

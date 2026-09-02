@@ -207,6 +207,7 @@ def _create_compilable_page_attn(
     logits_soft_cap: float = 0.0,
     store_mode: str = "none",
     needs_gather: bool = True,
+    v_head_major: bool = False,
 ):
     """Create online softmax attention over a fixed number of pages for torch.compile.
 
@@ -274,10 +275,18 @@ def _create_compilable_page_attn(
             # aten.index, which upcasts the int32 index to int64 and fails eager.
             page_idx = page_index_table[i, 0:1]
             k_page = k_pages.index_select(0, page_idx)
-            v_page = v_pages.index_select(0, page_idx)
             # Token-major page to head-major for the matmuls; permutes on device.
             k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
-            v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+            if v_head_major:
+                # v_pages is [kv, head, pages, block]: gathering the page on dim 2
+                # leaves it [kv, head, 1, block], and the QPK axis takes over the
+                # gathered slot, so this is a permute of an already head-major tile.
+                # Consumed below through transpose(-2,-1), which is what earns LX.
+                v_page_4d = v_pages.index_select(2, page_idx).permute(0, 2, 1, 3)
+            else:
+                v_page = v_pages.index_select(0, page_idx)
+                v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+            v_operand = v_page_4d.transpose(-2, -1) if v_head_major else v_page_4d
 
             mask_tile = mask_tiles[i]
 
@@ -299,7 +308,7 @@ def _create_compilable_page_attn(
             if i == 0:
                 tile_max = scores_max
                 tile_probs = torch.exp(scores - tile_max)
-                tile_output = torch.matmul(tile_probs, v_page_4d)
+                tile_output = torch.matmul(tile_probs, v_operand)
                 tile_sum = tile_probs.sum(dim=-1, keepdim=True)
             else:
                 # i > 0 only reachable after the i == 0 branch initialized these.
@@ -311,7 +320,7 @@ def _create_compilable_page_attn(
                 tile_output = tile_output * rescale
                 tile_sum = tile_sum * rescale
                 tile_probs = torch.exp(scores - new_max)
-                tile_output += torch.matmul(tile_probs, v_page_4d)
+                tile_output += torch.matmul(tile_probs, v_operand)
                 tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
                 tile_max = new_max
 
@@ -1149,6 +1158,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     logits_soft_cap=self.logits_soft_cap,
                     store_mode=store_mode,
                     needs_gather=needs_gather,
+                    v_head_major=envs.SPYRE_LX_V_CEILING,
                 ),
                 self._compile_attn,
             )
@@ -1276,7 +1286,27 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         if self._kv_slots is None:
             k_pages, v_pages = kv_cache
             shape = (-1, k_pages.shape[2], k_pages.shape[3])
-            self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
+            if envs.SPYRE_LX_V_CEILING:
+                # MEASUREMENT ONLY: v_pages is head-major and has no slot-major
+                # view, so the V scatter goes to a throwaway sink with the same
+                # shape, layout and cost. V reads then see zeros -- the timing is
+                # meaningful, the output is not.
+                num_slots, num_kv_heads, head_size = (
+                    k_pages.shape[0] * k_pages.shape[1],
+                    k_pages.shape[2],
+                    k_pages.shape[3],
+                )
+                sink = torch.zeros(
+                    num_slots, num_kv_heads, head_size, dtype=k_pages.dtype
+                ).to(  # ty: ignore[no-matching-overload]
+                    k_pages.device,
+                    device_layout=slot_major_kv_layout(
+                        num_slots, num_kv_heads, head_size, k_pages.dtype
+                    ),
+                )
+                self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), sink)
+            else:
+                self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._kv_slots
 
     def do_kv_cache_update(

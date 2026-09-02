@@ -1023,13 +1023,25 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 spec.head_size,
                 dtype=torch.float16,
             ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
-            v_pages = torch.zeros(
-                num_blocks,
-                spec.block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                dtype=torch.float16,
-            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+            if envs.SPYRE_LX_V_CEILING:
+                # MEASUREMENT ONLY: head-major V keeps every page tile LX-resident
+                # but cannot take a per-token store; SpyreAttentionImpl.kv_slot_views
+                # diverts the scatter, so these stay zero. See SPYRE_LX_V_CEILING.
+                v_pages = torch.zeros(
+                    spec.num_kv_heads,
+                    spec.head_size,
+                    num_blocks,
+                    spec.block_size,
+                    dtype=torch.float16,
+                ).to(self._spyre_device)
+            else:
+                v_pages = torch.zeros(
+                    num_blocks,
+                    spec.block_size,
+                    spec.num_kv_heads,
+                    spec.head_size,
+                    dtype=torch.float16,
+                ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
 
             page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
             for layer_name in kv_cache_tensor.shared_by:
