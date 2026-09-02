@@ -39,14 +39,15 @@ from vllm.model_executor.layers.linear import (
 
 logger = init_logger(__name__)
 
-# torch-spyre#4032: a decode GEMM whose row block is not full gets divided across the
-# cores worse than a full one, so padding the activation up to `_PAD_ROWS` and slicing
-# the output back runs faster despite the extra rows. Which shapes this pays on is a
-# property of the weight, not the row count -- it is worth a few percent up to a fifth
-# on the fused gate/up weights we serve, but it *costs* a few percent on the
-# narrow-output projections (o_proj, qkv, down_proj) and regresses badly on weights
-# past `_MAX_PAD_WEIGHT`, so re-measure before widening it to another layer.
-# The wider matmul also shifts the fp16 result slightly.
+# torch-spyre#4032: a weight tile is held stationary in XRF and broadcast across the 8
+# PT rows, so a GEMM with fewer activation rows leaves rows of the array idle. Decode
+# streams the weight once either way, so normally the row count barely matters -- but on
+# some weight shapes the 1-row schedule lands well below the rate the same weight
+# sustains with a full row block, and padding up to `_PAD_ROWS` escapes it. Which shapes
+# those are does not reduce to a rule: on the narrow-output projections (o_proj, qkv,
+# down_proj) padding measurably *costs* a few percent, and past `_MAX_PAD_WEIGHT` it
+# regresses badly, so re-measure before widening this. The wider matmul also shifts the
+# fp16 result slightly. `test_spyre_fallback_probes.py` fails once #4032 makes this moot.
 _PAD_ROWS = 8
 _MAX_PAD_WEIGHT = 200_000_000
 
