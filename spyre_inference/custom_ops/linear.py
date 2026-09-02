@@ -39,13 +39,16 @@ from vllm.model_executor.layers.linear import (
 
 logger = init_logger(__name__)
 
-# torch-spyre#4032: the matmul array takes 8 rows per pass, and a matmul with fewer
-# is divided across the cores worse than a full pass. So pad up to 8 rows and slice the
-# output back; the wider matmul shifts the fp16 result slightly.
+# torch-spyre#4032: a decode GEMM whose row block is not full gets divided across the
+# cores worse than a full one, so padding the activation up to `_PAD_ROWS` and slicing
+# the output back runs faster despite the extra rows. Which shapes this pays on is a
+# property of the weight, not the row count -- it is worth a few percent up to a fifth
+# on the fused gate/up weights we serve, but it *costs* a few percent on the
+# narrow-output projections (o_proj, qkv, down_proj) and regresses badly on weights
+# past `_MAX_PAD_WEIGHT`, so re-measure before widening it to another layer.
+# The wider matmul also shifts the fp16 result slightly.
 _PAD_ROWS = 8
-# Past a few rows, or on a large weight, the padded rows cost more than they save.
-_MAX_PAD_ROWS = 4
-_MAX_PAD_MACS = 1_600_000_000
+_MAX_PAD_WEIGHT = 200_000_000
 
 
 def spyre_linear_t(x: torch.Tensor, weight_t: torch.Tensor, bias: torch.Tensor | None):
@@ -124,7 +127,25 @@ class SpyreUnquantizedLinearMethod(SpyreTransposedWeightMethod, UnquantizedLinea
 
 
 class SpyrePaddedRowsLinearMethod(SpyreUnquantizedLinearMethod):
-    """Pads short activations up to `_PAD_ROWS` rows; used by the fused gate/up layer."""
+    """Pads a partial row block up to `_PAD_ROWS` rows before the GEMM.
+
+    Attached to `SpyreMergedColumnParallelLinear`, so every OOT
+    `MergedColumnParallelLinear` gets the padding and the fp16 shift it brings, not
+    just gate/up. Whether it pays depends on the weight shape; see `_PAD_ROWS`.
+    """
+
+    def _pads(self, layer: torch.nn.Module) -> bool:
+        return cast(torch.Tensor, getattr(layer, self.WEIGHT_T_ATTR)).numel() <= _MAX_PAD_WEIGHT
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        if self._pads(layer):
+            logger.warning_once(
+                "%s: short row blocks padded to %d rows (torch-spyre#4032) "
+                "expect numerical differences to upstream vLLM.",
+                layer.__class__.__name__,
+                _PAD_ROWS,
+            )
 
     def apply(
         self,
@@ -132,9 +153,8 @@ class SpyrePaddedRowsLinearMethod(SpyreUnquantizedLinearMethod):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        weight_t = cast(torch.Tensor, getattr(layer, self.WEIGHT_T_ATTR))
         m = x.shape[0] if x.dim() == 2 else 0
-        if 0 < m <= _MAX_PAD_ROWS and _PAD_ROWS * weight_t.numel() <= _MAX_PAD_MACS:
+        if 0 < m < _PAD_ROWS and self._pads(layer):
             return super().apply(layer, F.pad(x, (0, 0, 0, _PAD_ROWS - m)), bias)[:m]
         return super().apply(layer, x, bias)
 
