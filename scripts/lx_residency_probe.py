@@ -78,6 +78,12 @@ def build_kernel(variant: str, cfg: dict):
         return _sink_v_kernel(cfg)
     if variant == "v-transposed":
         return _v_transposed_kernel(cfg)
+    if variant == "fold-gqa":
+        return _fold_gqa_kernel(cfg)
+    if variant == "kv-head-major":
+        return _kv_head_major_kernel(cfg)
+    if variant == "mixed-layout":
+        return _mixed_layout_kernel(cfg)
     raise SystemExit(f"unknown variant {variant!r}")
 
 
@@ -200,6 +206,195 @@ def _v_transposed_kernel(cfg: dict):
     return kernel
 
 
+def _fold_gqa_kernel(cfg: dict):
+    """Baseline with the GQA broadcast folded into the query axis.
+
+    The baseline reshapes q to [kv, num_queries_per_kv, q, head] and unsqueezes
+    each page to [kv, 1, block, head], so both matmul operands broadcast over
+    num_queries_per_kv -- and the broadcast is *materialized*: a 256 KB gather
+    output becomes a 1 MB clone. Here q is folded to
+    [kv, 1, num_queries_per_kv * q, head] instead, so the page tiles are already
+    the right rank and nothing broadcasts. Same arithmetic, same output memory
+    order (the folded axes are contiguous in the same order), 4x less to pin.
+    """
+    import torch
+
+    num_blocks = cfg["num_blocks"]
+    padded_query_len = cfg["padded_query_len"]
+    num_heads = cfg["num_heads"]
+    num_kv_heads = cfg["num_kv_heads"]
+    head_size = cfg["head_size"]
+    num_queries_per_kv = num_heads // num_kv_heads
+    folded_q = num_queries_per_kv * padded_query_len
+
+    def kernel(query, query_row_index, k_pages, v_pages, page_index_table, mask_tiles, scale):
+        q_rows = query.index_select(0, query_row_index[:padded_query_len])
+        q = (
+            q_rows.unsqueeze(0)
+            .transpose(1, 2)
+            .reshape(num_kv_heads, 1, folded_q, head_size)
+        )
+        tile_max = tile_sum = tile_output = None
+        for i in range(num_blocks):
+            page_idx = page_index_table[i, 0:1]
+            k_page = k_pages.index_select(0, page_idx)
+            v_page = v_pages.index_select(0, page_idx)
+            k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+            v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+
+            # [q, block] masks the folded axis by broadcast when q == 1; otherwise
+            # tile it, outer-major, to match the (per_kv, q) fold order.
+            mask_tile = mask_tiles[i]
+            if padded_query_len != 1:
+                mask_tile = mask_tile.repeat(num_queries_per_kv, 1)
+
+            scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
+            scores = scores + mask_tile
+            scores_max = torch.amax(scores, dim=-1, keepdim=True)
+
+            if i == 0:
+                tile_max = scores_max
+                tile_probs = torch.exp(scores - tile_max)
+                tile_output = torch.matmul(tile_probs, v_page_4d)
+                tile_sum = tile_probs.sum(dim=-1, keepdim=True)
+            else:
+                new_max = torch.maximum(tile_max, scores_max)
+                rescale = torch.exp(tile_max - new_max)
+                tile_output = tile_output * rescale
+                tile_sum = tile_sum * rescale
+                tile_probs = torch.exp(scores - new_max)
+                tile_output += torch.matmul(tile_probs, v_page_4d)
+                tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
+                tile_max = new_max
+        attn = tile_output / tile_sum
+        attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
+        return attn.reshape(padded_query_len, num_heads, head_size)
+
+    return kernel
+
+
+def _kv_head_major_kernel(cfg: dict):
+    """Baseline over a head-major KV cache: [pages, kv, head, block].
+
+    ``v-transposed`` failed because inductor canonicalizes views *between* the
+    gather and the matmul. This changes the gather itself: with the cache stored
+    head-major, each page arrives as [kv, head, block] and needs no permute at
+    all -- K feeds its matmul directly, V feeds its own through one transpose.
+    Requires the caller to pass caches in this layout (the probe does; production
+    would need ``get_kv_cache_shape`` and the store path to match).
+    """
+    import torch
+
+    num_blocks = cfg["num_blocks"]
+    padded_query_len = cfg["padded_query_len"]
+    num_heads = cfg["num_heads"]
+    num_kv_heads = cfg["num_kv_heads"]
+    head_size = cfg["head_size"]
+    num_queries_per_kv = num_heads // num_kv_heads
+
+    def kernel(query, query_row_index, k_pages, v_pages, page_index_table, mask_tiles, scale):
+        q_rows = query.index_select(0, query_row_index[:padded_query_len])
+        q = (
+            q_rows.unsqueeze(0)
+            .transpose(1, 2)
+            .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
+        )
+        tile_max = tile_sum = tile_output = None
+        for i in range(num_blocks):
+            page_idx = page_index_table[i, 0:1]
+            # [1, kv, head, block] -> [kv, 1, head, block]; no permute.
+            k_page_4d = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+            v_page_4d = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+            mask_tile = mask_tiles[i]
+
+            scores = torch.matmul(q, k_page_4d) * scale
+            scores = scores + mask_tile
+            scores_max = torch.amax(scores, dim=-1, keepdim=True)
+
+            if i == 0:
+                tile_max = scores_max
+                tile_probs = torch.exp(scores - tile_max)
+                tile_output = torch.matmul(tile_probs, v_page_4d.transpose(-2, -1))
+                tile_sum = tile_probs.sum(dim=-1, keepdim=True)
+            else:
+                new_max = torch.maximum(tile_max, scores_max)
+                rescale = torch.exp(tile_max - new_max)
+                tile_output = tile_output * rescale
+                tile_sum = tile_sum * rescale
+                tile_probs = torch.exp(scores - new_max)
+                tile_output += torch.matmul(tile_probs, v_page_4d.transpose(-2, -1))
+                tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
+                tile_max = new_max
+        attn = tile_output / tile_sum
+        attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
+        return attn.reshape(padded_query_len, num_heads, head_size)
+
+    return kernel
+
+
+def _mixed_layout_kernel(cfg: dict):
+    """K token-major, V head-major -- so *both* operands are the transposed one.
+
+    ``baseline`` and ``kv-head-major`` are mirror images: whichever operand
+    reaches its matmul through ``.transpose(-2,-1)`` gets the core division its
+    consuming matmul wants and lands in LX, and the operand consumed directly
+    does not. K is transposed under a token-major cache, V under a head-major
+    one -- and K and V are separate tensors in ``SpyrePagedKVCache``, so each can
+    have the layout that makes it the transposed operand.
+
+    k_pages: [pages, block, kv, head]   (unchanged)
+    v_pages: [pages, kv, head, block]   (transposed at store time)
+    """
+    import torch
+
+    num_blocks = cfg["num_blocks"]
+    padded_query_len = cfg["padded_query_len"]
+    num_heads = cfg["num_heads"]
+    num_kv_heads = cfg["num_kv_heads"]
+    head_size = cfg["head_size"]
+    num_queries_per_kv = num_heads // num_kv_heads
+
+    def kernel(query, query_row_index, k_pages, v_pages, page_index_table, mask_tiles, scale):
+        q_rows = query.index_select(0, query_row_index[:padded_query_len])
+        q = (
+            q_rows.unsqueeze(0)
+            .transpose(1, 2)
+            .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
+        )
+        tile_max = tile_sum = tile_output = None
+        for i in range(num_blocks):
+            page_idx = page_index_table[i, 0:1]
+            k_page = k_pages.index_select(0, page_idx)
+            k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+            # Already head-major: [1, kv, head, block] -> [kv, 1, head, block].
+            v_page_4d = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+            mask_tile = mask_tiles[i]
+
+            scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
+            scores = scores + mask_tile
+            scores_max = torch.amax(scores, dim=-1, keepdim=True)
+
+            if i == 0:
+                tile_max = scores_max
+                tile_probs = torch.exp(scores - tile_max)
+                tile_output = torch.matmul(tile_probs, v_page_4d.transpose(-2, -1))
+                tile_sum = tile_probs.sum(dim=-1, keepdim=True)
+            else:
+                new_max = torch.maximum(tile_max, scores_max)
+                rescale = torch.exp(tile_max - new_max)
+                tile_output = tile_output * rescale
+                tile_sum = tile_sum * rescale
+                tile_probs = torch.exp(scores - new_max)
+                tile_output += torch.matmul(tile_probs, v_page_4d.transpose(-2, -1))
+                tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
+                tile_max = new_max
+        attn = tile_output / tile_sum
+        attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
+        return attn.reshape(padded_query_len, num_heads, head_size)
+
+    return kernel
+
+
 # --------------------------------------------------------------------------
 # Modes
 # --------------------------------------------------------------------------
@@ -235,8 +430,32 @@ def run_standalone(args, cfg: dict, out_path: str) -> None:
 
     query = convert(query_cpu, device=device)
     row_index = convert(row_index_cpu, device=device)
-    k_pages = convert(k_cpu, device=device)
-    v_pages = convert(v_cpu, device=device)
+    # [pages, block, kv, head] -> [pages, kv, head, block] for whichever cache the
+    # variant wants head-major; the reference below keeps the token-major copies
+    # so the comparison stays honest.
+    head_major = {
+        "kv-head-major": ("k", "v"),
+        "mixed-layout": ("v",),
+    }.get(args.variant, ())
+    k_dev_cpu = k_cpu.permute(0, 2, 3, 1).contiguous() if "k" in head_major else k_cpu
+    v_dev_cpu = v_cpu.permute(0, 2, 3, 1).contiguous() if "v" in head_major else v_cpu
+    # Algebra check, CPU vs CPU: does this variant compute the same function as
+    # the shipped kernel? Kept separate from the device comparison below, which
+    # is confounded by a harness fidelity bug that mismatches on baseline too.
+    ref_cpu = build_kernel("baseline", cfg)(
+        query_cpu, row_index_cpu, k_cpu, v_cpu, table, mask_cpu, hs**-0.5
+    ).float()
+    var_cpu = build_kernel(args.variant, cfg)(
+        query_cpu, row_index_cpu, k_dev_cpu, v_dev_cpu, table, mask_cpu, hs**-0.5
+    ).float()
+    a_diff = (var_cpu - ref_cpu).abs().max().item()
+    a_scale = ref_cpu.abs().max().item() or 1.0
+    print(f"algebra (CPU vs CPU baseline): max abs diff {a_diff:.4g} "
+          f"(rel {a_diff / a_scale:.2g}) -> "
+          f"{'OK' if a_diff / a_scale < 1e-3 else 'DIFFERENT FUNCTION'}")
+
+    k_pages = convert(k_dev_cpu, device=device)
+    v_pages = convert(v_dev_cpu, device=device)
     page_index_table = convert(table, device=device)
     mask_tiles = [convert(m, device=device) for m in mask_cpu]
 
@@ -421,7 +640,10 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--mode", choices=["standalone", "bench"], default="standalone")
     p.add_argument(
-        "--variant", default="baseline", help="baseline | sink-v | v-transposed"
+        "--variant",
+        default="baseline",
+        help="baseline | sink-v | v-transposed | fold-gqa | kv-head-major "
+        "| mixed-layout (the one that gets both lanes resident)",
     )
     p.add_argument("--num-blocks", type=int, default=DEFAULTS["num_blocks"])
     p.add_argument("--block-size", type=int, default=DEFAULTS["block_size"])
