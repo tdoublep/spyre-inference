@@ -128,6 +128,11 @@ STAGE_NAMES = ("q_g", "k_t", "v_3d", "scores_raw", "scores_masked", "probs", "ti
 # also the bmm's batch extent. Only used by GQA=group.
 K_LAYOUT = os.environ.get("K_LAYOUT", "token")
 assert K_LAYOUT in ("token", "transposed"), K_LAYOUT
+# Cap cores for the attention compile only, by mutating the config the work-division
+# pass reads, rather than the process-wide SENCORES env var. The pass calls
+# _validate_max_cores() per compile, so this should scope the cap to this graph and
+# leave the rest of the model on all 32 cores.
+SENCORES_ATTN = _int("SENCORES_ATTN", 0)
 assert FOLD in ("none", "k", "kv"), FOLD
 assert BLOCK_SIZE % ENTRIES == 0, (BLOCK_SIZE, ENTRIES)
 ROWS_PER_ENTRY = BLOCK_SIZE // ENTRIES
@@ -661,6 +666,7 @@ print(
     f"fold={FOLD} entries={ENTRIES} rows_per_entry={ROWS_PER_ENTRY} index_2d={INDEX_2D} "
     f"fold_src_rank={FOLD_SRC_RANK} gqa={GQA} q_slice={Q_SLICE} "
     f"groups_computed={GROUPS_COMPUTED} k_layout={K_LAYOUT} "
+    f"sencores_attn={SENCORES_ATTN or 'off'} "
     f"fix4258={os.environ.get('SPYRE_FIX_4258', '0')}",
     flush=True,
 )
@@ -676,6 +682,12 @@ dev_args, cpu_args = build_attn_args(k_dev, v_dev)
 if not RETURN_GROUPS and K_LAYOUT == "token":
     xcheck = (paged_attn_kernel(*cpu_args) - paged_attn_kernel_group_loop(*cpu_args)).abs()
     print(f"cpu cross-check broadcast vs group-loop: max abs diff {xcheck.max().item():.3e}")
+
+if SENCORES_ATTN:
+    from torch_spyre._inductor import config as _ts_config
+
+    print(f"sencores {_ts_config.sencores} -> {SENCORES_ATTN} for the attention compile")
+    _ts_config.sencores = SENCORES_ATTN
 
 raw = torch.compile(ATTN_KERNEL, dynamic=False)(*dev_args)
 ref_raw = ATTN_KERNEL(*cpu_args)
