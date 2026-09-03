@@ -183,29 +183,40 @@ def lx_kv_layout_enabled() -> bool:
     return envs.SPYRE_LX_KV_LAYOUT
 
 
-def attn_max_cores() -> int:
-    """Core cap for the attention compile, 0 for uncapped.
+# Cores per Spyre card, i.e. what work_division targets when uncapped.
+_SPYRE_CORES = 32
+# Cap that removes the attention bmm's K-split; see attn_max_cores.
+_LX_ATTN_CORES = 8
 
-    The folded frame needs 8: at head_size 128, block_size 64, q_len 1 the
-    attention bmm's only output axis is kv=8, so reaching 32 cores means
-    K-splitting the 128-element reduction, and a gather can never mirror a split
-    on a value-table data dim.
+
+def attn_max_cores(output_units: int) -> int:
+    """Core cap for one attention compile, 0 for uncapped.
+
+    The folded frame needs a cap only when the attention bmm's output axes are too
+    small to fill the cores on their own: at q_len 1 the only output axis is kv=8, so
+    reaching 32 cores means K-splitting the reduction, and a gather can never mirror a
+    split on a value-table data dim. Prefill has kv * q_len output units to spare and
+    is left on all cores -- capping it would waste 24 of 32 for nothing.
+
+    `output_units` is that product, num_kv_heads * padded_query_len.
     """
     override = envs.SPYRE_ATTN_MAX_CORES
     if override:
         return override
-    return 8 if lx_kv_layout_enabled() else 0
+    if not lx_kv_layout_enabled() or output_units >= _SPYRE_CORES:
+        return 0
+    return _LX_ATTN_CORES
 
 
 @contextlib.contextmanager
-def _capped_attn_cores():
+def _capped_attn_cores(output_units: int = 1):
     """Scope the core cap to one compile.
 
     torch.compile is lazy, so the cap has to wrap the *call* that triggers the
     compile, not the decoration. work_division reads config.sencores per compile,
     which is what keeps the rest of the model on all 32 cores.
     """
-    max_cores = attn_max_cores()
+    max_cores = attn_max_cores(output_units)
     if not max_cores:
         yield
         return
@@ -1915,7 +1926,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 )
                 # The cap has to wrap the call: torch.compile is lazy, so the graph
                 # compiles here, not where it was decorated.
-                with _capped_attn_cores():
+                with _capped_attn_cores(self.num_kv_heads * aligned_max_query_len):
                     result = attn_fn(
                         query_dev,
                         row_table,
