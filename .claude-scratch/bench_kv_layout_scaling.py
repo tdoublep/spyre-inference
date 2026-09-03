@@ -60,20 +60,31 @@ def layout(dims):
     )
 
 
-def timed(fn, args, probe):
+def timed(fn, args, probe, name=None):
     """Median over REPS of the mean per-launch wall time of N queued launches."""
+    if name is not None and name not in VARIANTS:
+        return float("nan")
     # fullgraph=True so a graph break raises instead of silently running eager.
     compiled = torch.compile(fn, dynamic=False, fullgraph=True)
     for _ in range(3):
         compiled(*args)
     probe().cpu()
-    out = []
-    for _ in range(REPS):
+    # Differential timing: (time for 2N launches) - (time for N launches), divided
+    # by N. Any constant per-measurement overhead cancels -- notably the sync probe,
+    # whose .cpu() on a slice of the destination may materialise the whole cache and
+    # would otherwise masquerade as cache-size scaling.
+    def batch(count):
         t0 = time.perf_counter()
-        for _ in range(N):
+        for _ in range(count):
             compiled(*args)
         probe().cpu()
-        out.append((time.perf_counter() - t0) / N)
+        return time.perf_counter() - t0
+
+    out = []
+    for _ in range(REPS):
+        t1 = batch(N)
+        t2 = batch(2 * N)
+        out.append((t2 - t1) / N)
     return statistics.median(out)
 
 
@@ -93,8 +104,11 @@ def s2(cache, idx, src):
     cache.index_copy_(0, idx, src)
 
 
-VARIANTS = ("G0", "G1", "G2", "S1", "S2")
-results: dict[str, dict[int, float]] = {k: {} for k in VARIANTS}
+_ALL = ("G0", "G1", "G2", "S1", "S2")
+VARIANTS = tuple(
+    v for v in _ALL if v in os.environ.get("ONLY", ",".join(_ALL)).split(",")
+)
+results: dict[str, dict[int, float]] = {k: {} for k in _ALL}
 
 for P in PAGES:
     mb = P * B * KV * D * 2 / 2**20
@@ -106,21 +120,21 @@ for P in PAGES:
     # it cannot be trusted to show its absence elsewhere.
     c0 = torch.randn(P * B, KV, D, dtype=torch.float16).to("spyre")
     idx0 = torch.tensor([page * B], dtype=torch.int32).to("spyre")
-    results["G0"][P] = timed(g1, (c0, idx0), lambda: g1(c0, idx0))
+    results["G0"][P] = timed(g1, (c0, idx0), lambda: g1(c0, idx0), name="G0")
 
     # G1: slot-major page gather
     c = torch.randn(P, B, KV, D, dtype=torch.float16).to(
         "spyre", device_layout=layout([P * B, KV, D])
     )
     idx = torch.tensor([page], dtype=torch.int32).to("spyre")
-    results["G1"][P] = timed(g1, (c, idx), lambda: g1(c, idx))
+    results["G1"][P] = timed(g1, (c, idx), lambda: g1(c, idx), name="G1")
 
     # G2: head-major page gather, (page, kv) entries
     ch = torch.randn(P * KV, B, D, dtype=torch.float16).to(
         "spyre", device_layout=layout([P * KV, B, D])
     )
     i2 = (page * KV + torch.arange(KV, dtype=torch.int32)).to("spyre")
-    results["G2"][P] = timed(g2, (ch, i2), lambda: g2(ch, i2))
+    results["G2"][P] = timed(g2, (ch, i2), lambda: g2(ch, i2), name="G2")
 
     # S1: slot-major token scatter
     cs = torch.randn(P * B, KV, D, dtype=torch.float16).to(
@@ -128,7 +142,7 @@ for P in PAGES:
     )
     si = torch.tensor([page * B + 3], dtype=torch.int32).to("spyre")
     src1 = torch.randn(1, KV, D, dtype=torch.float16).to("spyre")
-    results["S1"][P] = timed(s1, (cs, si, src1), lambda: cs[0:1])
+    results["S1"][P] = timed(s1, (cs, si, src1), lambda: cs[0:1], name="S1")
 
     # S2: head-major token scatter
     cs2 = torch.randn(P * KV * B, D, dtype=torch.float16).to(
@@ -138,7 +152,7 @@ for P in PAGES:
         [(page * KV + kv) * B + 3 for kv in range(KV)], dtype=torch.int32
     ).to("spyre")
     src2 = torch.randn(KV, D, dtype=torch.float16).to("spyre")
-    results["S2"][P] = timed(s2, (cs2, rows, src2), lambda: cs2[0:1])
+    results["S2"][P] = timed(s2, (cs2, rows, src2), lambda: cs2[0:1], name="S2")
 
     for k in VARIANTS:
         print(f"  {k}  {results[k][P] * 1e6:9.1f} us", flush=True)
