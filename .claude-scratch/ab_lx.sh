@@ -6,10 +6,11 @@
 #   bash .claude-scratch/ab_lx.sh on    # this branch, folded cache + LX residency
 #
 # Params follow the vllm-bench-latency skill's rules for keeping graph recording out
-# of the timed window: input-len a multiple of the 64-token block size, and
-# input+output inside one further block, so the per-block mask tile count is constant
-# across every decode step. 3200 input tokens is 50 pages -- a genuinely long context,
-# well past the 448 the hand-off asks for, so the gathered pages per step are many.
+# of the timed window: input-len a multiple of the block size, and input+output inside
+# one further block, so the per-block mask tile count is constant across every decode
+# step. The effective block size is 128 (CpuPlatform raises the platform's 64), and
+# 3200 is a multiple of both, so 25 pages are gathered per decode step -- a genuinely
+# long context, well past the 4 pages the hand-off asks for as a minimum.
 set -euo pipefail
 
 LEG="${1:?usage: ab_lx.sh on|off}"
