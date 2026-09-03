@@ -109,12 +109,16 @@ RETURN_GROUPS = os.environ.get("RETURN_GROUPS") == "1"
 # device for every g -- .contiguous() does not help, since the clone reads the
 # same view. "gather" uses index_select, whose output is a real buffer at offset
 # 0, which is the workaround spyre_attn.py already uses for the query rows.
-Q_SLICE = os.environ.get("Q_SLICE", "gather")
-assert Q_SLICE in ("gather", "slice", "slice_contig"), Q_SLICE
+Q_SLICE = os.environ.get("Q_SLICE", "heads")
+assert Q_SLICE in ("heads", "gather", "slice", "slice_contig"), Q_SLICE
 # Compute only the first GROUPS_COMPUTED groups, leaving the query's shape alone.
 # Separates a wrong query slice at this QPK from a wrong interaction between
 # several groups in one graph.
 GROUPS_COMPUTED = _int("GROUPS_COMPUTED", QPK)
+# Return every intermediate of block 0 / group 0 so the first divergence from CPU
+# can be named instead of guessed.
+DEBUG_STAGES = os.environ.get("DEBUG_STAGES") == "1"
+STAGE_NAMES = ("q_g", "k_t", "v_3d", "scores_raw", "scores_masked", "probs", "tile_out")
 # K cache frame. "token": [NUM_PAGES, BLOCK_SIZE, KV_HEADS, HEAD_SIZE], so the
 # gathered page must be permuted to [KV_HEADS, HEAD_SIZE, BLOCK_SIZE] for q @ K^T
 # -- that moves the stick dim, which a restickify does, and a buffer a restickify
@@ -259,8 +263,11 @@ def paged_attn_kernel_group_loop(
     page is never expanded to a group axis and no consumer reads it across one.
     The online-softmax state becomes one entry per group.
     """
-    q_rows = query.index_select(0, query_row_index[:Q_LEN])
-    q = q_rows.unsqueeze(0).transpose(1, 2).reshape(KV_HEADS, QPK, Q_LEN, HEAD_SIZE)
+    if Q_SLICE == "heads":
+        q = None  # taken per group from `query` directly, see below
+    else:
+        q_rows = query.index_select(0, query_row_index[:Q_LEN])
+        q = q_rows.unsqueeze(0).transpose(1, 2).reshape(KV_HEADS, QPK, Q_LEN, HEAD_SIZE)
 
     tile_max: list = [None] * QPK
     tile_sum: list = [None] * QPK
@@ -285,20 +292,32 @@ def paged_attn_kernel_group_loop(
         v_3d = v_page.permute(1, 0, 2)  # [KV_HEADS, BLOCK_SIZE, HEAD_SIZE]
 
         for g in range(GROUPS_COMPUTED):
-            if Q_SLICE == "gather":
+            if Q_SLICE == "heads":
+                # This group's heads straight off the argument, then its rows. Both
+                # gathers read `query` itself; index_select on a reshaped view of a
+                # computed buffer is wrong on device.
+                heads = query.index_select(1, group_indices[g])
+                q_g = (
+                    heads.index_select(0, query_row_index[:Q_LEN])
+                    .transpose(0, 1)
+                    .reshape(KV_HEADS, Q_LEN, HEAD_SIZE)
+                )
+            elif Q_SLICE == "gather":
                 q_g = q.index_select(1, group_indices[g]).reshape(KV_HEADS, Q_LEN, HEAD_SIZE)
             elif Q_SLICE == "slice_contig":
                 q_g = q[:, g].contiguous()
             else:
                 q_g = q[:, g]  # [KV_HEADS, Q_LEN, HEAD_SIZE]
-            scores = torch.matmul(q_g, k_t) * SCALE
-            scores = scores + mask_tiles[i]
+            scores_raw = torch.matmul(q_g, k_t) * SCALE
+            scores = scores_raw + mask_tiles[i]
             scores_max = torch.amax(scores, dim=-1, keepdim=True)
             if i == 0:
                 tile_max[g] = scores_max
                 probs = torch.exp(scores - scores_max)
                 tile_out[g] = torch.matmul(probs, v_3d)
                 tile_sum[g] = probs.sum(dim=-1, keepdim=True)
+                if DEBUG_STAGES and g == 0:
+                    return (q_g, k_t, v_3d, scores_raw, scores, probs, tile_out[0])
             else:
                 new_max = torch.maximum(tile_max[g], scores_max)
                 rescale = torch.exp(tile_max[g] - new_max)
@@ -405,6 +424,15 @@ def build_attn_args(k_dev: torch.Tensor, v_dev: torch.Tensor):
     entry_table = (
         page_table[:, 0:1] * ENTRIES + torch.arange(ENTRIES, dtype=torch.int32)
     ).reshape(NUM_BLOCKS, ENTRIES, 1)
+    # In "heads" mode a group's index lists its NUM_HEADS-space head ids
+    # (head = kv * QPK + g); otherwise it is just the group number.
+    group_index_list = [
+        torch.tensor(
+            [kv * QPK + g for kv in range(KV_HEADS)] if Q_SLICE == "heads" else [g],
+            dtype=torch.int32,
+        )
+        for g in range(QPK)
+    ]
     # (page, kv) entries for the transposed K cache, one per kv head.
     kv_table = (
         page_table[:, 0:1] * KV_HEADS + torch.arange(KV_HEADS, dtype=torch.int32)
@@ -418,7 +446,7 @@ def build_attn_args(k_dev: torch.Tensor, v_dev: torch.Tensor):
         page_table.to("spyre"),
         [m.to("spyre") for m in masks],
         entry_table.to("spyre"),
-        [torch.tensor([g], dtype=torch.int32).to("spyre") for g in range(QPK)],
+        [gi.to("spyre") for gi in group_index_list],
         kv_table.to("spyre"),
     ]
     cpu_args = [
@@ -429,7 +457,7 @@ def build_attn_args(k_dev: torch.Tensor, v_dev: torch.Tensor):
         page_table,
         [m.float() for m in masks],
         entry_table,
-        [torch.tensor([g], dtype=torch.int32) for g in range(QPK)],
+        group_index_list,
         kv_table,
     ]
     return dev_args, cpu_args
@@ -638,6 +666,13 @@ if not RETURN_GROUPS and K_LAYOUT == "token":
 
 raw = torch.compile(ATTN_KERNEL, dynamic=False)(*dev_args)
 ref_raw = ATTN_KERNEL(*cpu_args)
+if DEBUG_STAGES:
+    for name, dev_t, cpu_t in zip(STAGE_NAMES, raw, ref_raw):
+        d = (dev_t.cpu().float() - cpu_t).abs().max().item()
+        scale = cpu_t.abs().max().item() or 1.0
+        flag = "OK  " if d / scale < 2e-2 else "WRONG"
+        print(f"  {flag} {name:<14} {str(tuple(dev_t.shape)):<20} max abs {d:.3e}  rel {d / scale:.3e}")
+    raise SystemExit(0)
 if isinstance(raw, tuple):
     print("per-group max abs diff (RETURN_GROUPS): " + "  ".join(
         f"g{g}={(raw[g].cpu().float() - ref_raw[g]).abs().max().item():.3e}"
