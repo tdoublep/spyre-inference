@@ -133,6 +133,14 @@ assert K_LAYOUT in ("token", "transposed"), K_LAYOUT
 # _validate_max_cores() per compile, so this should scope the cap to this graph and
 # leave the rest of the model on all 32 cores.
 SENCORES_ATTN = _int("SENCORES_ATTN", 0)
+# V cache frame. "token": [NUM_PAGES, BLOCK_SIZE, KV_HEADS, HEAD_SIZE], needing a
+# permute to [KV_HEADS, BLOCK_SIZE, HEAD_SIZE] for probs @ V, and gathered one page
+# per entry so the gather is single-core. "head_major": stored as
+# [NUM_PAGES * KV_HEADS, BLOCK_SIZE, HEAD_SIZE] and gathered on (page, kv), so the
+# gather output already is the matmul operand and its split lands on kv -- which is
+# an output axis of probs @ V, so a consumer can match it. Only used by GQA=group.
+V_LAYOUT = os.environ.get("V_LAYOUT", "token")
+assert V_LAYOUT in ("token", "head_major"), V_LAYOUT
 assert FOLD in ("none", "k", "kv"), FOLD
 assert BLOCK_SIZE % ENTRIES == 0, (BLOCK_SIZE, ENTRIES)
 ROWS_PER_ENTRY = BLOCK_SIZE // ENTRIES
@@ -293,7 +301,9 @@ def paged_attn_kernel_group_loop(
             k_page = fetch_page_folded(k_pages, entry_index_table[i])
         else:
             k_page = k_pages.index_select(0, page_idx).squeeze(0)
-        if FOLD == "kv":
+        if V_LAYOUT == "head_major":
+            v_page = None  # v_3d taken straight from the gather below
+        elif FOLD == "kv":
             v_page = fetch_page_folded(v_pages, entry_index_table[i])
         else:
             v_page = v_pages.index_select(0, page_idx).squeeze(0)
@@ -301,7 +311,10 @@ def paged_attn_kernel_group_loop(
             k_t = k_page  # already [KV_HEADS, HEAD_SIZE, BLOCK_SIZE]
         else:
             k_t = k_page.permute(1, 2, 0)
-        v_3d = v_page.permute(1, 0, 2)  # [KV_HEADS, BLOCK_SIZE, HEAD_SIZE]
+        if V_LAYOUT == "head_major":
+            v_3d = v_pages[kv_index_table[i]].reshape(KV_HEADS, BLOCK_SIZE, HEAD_SIZE)
+        else:
+            v_3d = v_page.permute(1, 0, 2)  # [KV_HEADS, BLOCK_SIZE, HEAD_SIZE]
 
         for g in range(GROUPS_COMPUTED):
             if Q_SLICE == "heads":
@@ -383,7 +396,20 @@ def make_pages() -> tuple[torch.Tensor, torch.Tensor]:
     k = torch.randn(NUM_PAGES, BLOCK_SIZE, KV_HEADS, HEAD_SIZE, dtype=torch.float16)
     v = torch.randn(NUM_PAGES, BLOCK_SIZE, KV_HEADS, HEAD_SIZE, dtype=torch.float16)
     layout = slot_major_layout(NUM_PAGES * BLOCK_SIZE)
-    v_dev = v.to("spyre", device_layout=layout)
+    if V_LAYOUT == "head_major":
+        v_hm = (
+            v.permute(0, 2, 1, 3)
+            .contiguous()
+            .reshape(NUM_PAGES * KV_HEADS, BLOCK_SIZE, HEAD_SIZE)
+        )
+        v_dev = v_hm.to(
+            "spyre",
+            device_layout=rows_outermost_layout(
+                NUM_PAGES * KV_HEADS, BLOCK_SIZE, HEAD_SIZE
+            ),
+        )
+    else:
+        v_dev = v.to("spyre", device_layout=layout)
     if K_LAYOUT == "transposed":
         # Materialised, not viewed: the gather's source must be a real tensor whose
         # indexed axis is at device position 0.
@@ -612,6 +638,8 @@ def classify(shape: list[int]) -> str:
         (kv, QPK, q, 1): "tile_max / tile_sum",
         (kv, d, b): "k_page, head-major transposed for q @ K^T",
         (kv, 1, d, b): "k_page  <- the transposed gather",
+        (kv, 1, b, d): "v_page  <- the head-major gather",
+        (NUM_PAGES * kv, b, d): "V page cache, head-major (arg)",
         (NUM_PAGES * kv, d, b): "K page cache, transposed (arg)",
         (kv, b, d): "v_page, head-major",
         (kv, q, b): "scores / tile_probs  (the P operand)",
@@ -666,7 +694,7 @@ print(
     f"fold={FOLD} entries={ENTRIES} rows_per_entry={ROWS_PER_ENTRY} index_2d={INDEX_2D} "
     f"fold_src_rank={FOLD_SRC_RANK} gqa={GQA} q_slice={Q_SLICE} "
     f"groups_computed={GROUPS_COMPUTED} k_layout={K_LAYOUT} "
-    f"sencores_attn={SENCORES_ATTN or 'off'} "
+    f"sencores_attn={SENCORES_ATTN or 'off'} v_layout={V_LAYOUT} "
     f"fix4258={os.environ.get('SPYRE_FIX_4258', '0')}",
     flush=True,
 )
