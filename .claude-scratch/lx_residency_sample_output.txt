@@ -1,0 +1,187 @@
+blocks=4 q_len=1 kv_heads=8 qpk=4 head_size=128 block_size=64 write_kv=True solver=default
+KV store: k err 1.953e-03  v err 1.953e-03
+attention: max abs diff vs CPU 3.799e-03  (rel 7.829e-03)
+NUMERICS OK
+=== SDSC allocations — 2 kernel(s) ===
+
+fused_add_amax_clone_div_exp_expand_index_select_maximum_mul_permute_s  HBM spill pool 840.0 KB
+  0_identity                   LX=0 HBM=2 HBM: Tensor0_hbm,Tensor1_hbm
+  1_identity                   LX=0 HBM=3 HBM: Tensor0_hbm,Tensor1_hbm,Tensor2_hbm
+  2_identity                   LX=0 HBM=3 HBM: Tensor0_hbm,Tensor1_hbm,Tensor2_hbm
+  3_identity                   LX=0 HBM=3 HBM: Tensor0_hbm,Tensor1_hbm,Tensor2_hbm
+  4_ReStickifyOpHBM            LX=1 HBM=1 HBM: Tensor0_hbm
+  5_batchmatmul                LX=2 HBM=1 HBM: Tensor0_hbm
+  6_mul                        LX=2 HBM=1 HBM: Tensor1_hbm
+  7_add                        LX=2 HBM=1 HBM: Tensor1_hbm
+  8_max                        LX=2 HBM=0
+  9_sub                        LX=3 HBM=0
+  10_exp                       LX=2 HBM=0
+  11_identity                  LX=0 HBM=2 HBM: Tensor0_hbm,Tensor1_hbm
+  12_batchmatmul               LX=2 HBM=1 HBM: Tensor1_hbm
+  13_sum                       LX=2 HBM=0
+  14_identity                  LX=0 HBM=3 HBM: Tensor0_hbm,Tensor1_hbm,Tensor2_hbm
+  15_identity                  LX=0 HBM=3 HBM: Tensor0_hbm,Tensor1_hbm,Tensor2_hbm
+  16_ReStickifyOpHBM           LX=1 HBM=1 HBM: Tensor0_hbm
+  17_batchmatmul               LX=2 HBM=1 HBM: Tensor0_hbm
+  18_mul                       LX=2 HBM=1 HBM: Tensor1_hbm
+  19_add                       LX=2 HBM=1 HBM: Tensor1_hbm
+  20_max                       LX=2 HBM=0
+  21_maximum                   LX=3 HBM=0
+  22_sub                       LX=3 HBM=0
+  23_exp                       LX=2 HBM=0
+  24_mul                       LX=3 HBM=0
+  25_mul                       LX=3 HBM=0
+  26_sub                       LX=3 HBM=0
+  27_exp                       LX=2 HBM=0
+  28_batchmatmul               LX=2 HBM=1 HBM: Tensor1_hbm
+  29_add                       LX=3 HBM=0
+  30_sum                       LX=2 HBM=0
+  31_add                       LX=3 HBM=0
+  32_ReStickifyOpHBM           LX=1 HBM=1 HBM: Tensor0_hbm
+  33_batchmatmul               LX=2 HBM=1 HBM: Tensor0_hbm
+  34_mul                       LX=2 HBM=1 HBM: Tensor1_hbm
+  35_add                       LX=2 HBM=1 HBM: Tensor1_hbm
+  36_max                       LX=2 HBM=0
+  37_maximum                   LX=3 HBM=0
+  38_sub                       LX=3 HBM=0
+  39_exp                       LX=2 HBM=0
+  40_mul                       LX=3 HBM=0
+  41_mul                       LX=3 HBM=0
+  42_sub                       LX=3 HBM=0
+  43_exp                       LX=2 HBM=0
+  44_batchmatmul               LX=2 HBM=1 HBM: Tensor1_hbm
+  45_add                       LX=3 HBM=0
+  46_sum                       LX=2 HBM=0
+  47_add                       LX=3 HBM=0
+  48_batchmatmul               LX=2 HBM=1 HBM: Tensor0_hbm
+  49_mul                       LX=2 HBM=1 HBM: Tensor1_hbm
+  50_add                       LX=2 HBM=1 HBM: Tensor1_hbm
+  51_max                       LX=2 HBM=0
+  52_maximum                   LX=3 HBM=0
+  53_sub                       LX=3 HBM=0
+  54_exp                       LX=2 HBM=0
+  55_mul                       LX=3 HBM=0
+  56_mul                       LX=3 HBM=0
+  57_sub                       LX=3 HBM=0
+  58_add                       LX=3 HBM=0
+  59_realdiv                   LX=2 HBM=1 HBM: Tensor2_hbm
+  TOTAL                        LX=124 HBM=38
+
+fused_index_copy_0_cp0nx47v  HBM spill pool 4096.0 KB
+  0_identity                   LX=0 HBM=2 HBM: Tensor0_hbm,Tensor1_hbm
+  1_identity                   LX=0 HBM=3 HBM: Tensor0_hbm,Tensor1_hbm,Tensor2_hbm
+  2_identity                   LX=0 HBM=2 HBM: Tensor0_hbm,Tensor1_hbm
+  3_identity                   LX=0 HBM=2 HBM: Tensor0_hbm,Tensor1_hbm
+  4_identity                   LX=0 HBM=3 HBM: Tensor0_hbm,Tensor1_hbm,Tensor2_hbm
+  5_identity                   LX=0 HBM=2 HBM: Tensor0_hbm,Tensor1_hbm
+  TOTAL                        LX=0 HBM=14
+
+=== LX verdicts by op kind — KV store graph (6 ops) ===
+  restickify       LX  0   not-LX  4   relayout copy  <- mutation target; op not allowed
+  index_put_       LX  0   not-LX  2   KV cache store  <- op not allowed
+
+=== LX verdicts by op kind — attention graph (73 ops) ===
+  index            LX  0   not-LX  9   page gather (k_page / v_page)  <- core div mismatch: broadcast read on 'buf4': view covers 1 cores but op runs 32; core div mismatch: broadcast read on 'buf3': view covers 8 cores but op runs 32; core div mismatch; core div mismatch: broadcast read on 'buf15': view covers 8 cores but op runs 32; core div mismatch: broadcast read on 'buf34': view covers 8 cores but op runs 32; core div mismatch: broadcast read on 'buf53': view covers 8 cores but op runs 32
+  clone            LX  4   not-LX  4   GQA broadcast of the page  <- core div mismatch
+  constant         LX  0   not-LX  1     <- op not allowed
+  restickify       LX  0   not-LX  1   relayout copy  <- index tensor or indirectly accessed
+  div              LX  0   not-LX  1     <- graph output is a ReinterpretView
+  batched_matmul   LX  8   not-LX  0   q @ k_page^T  and  tile_probs @ v_page
+  mul              LX 10   not-LX  0   
+  add              LX 10   not-LX  0   
+  amax             LX  4   not-LX  0   row max
+  sub              LX  7   not-LX  0   
+  expand           LX  4   not-LX  0   GQA broadcast of the page
+  sum              LX  4   not-LX  0   row sum
+  maximum          LX  3   not-LX  0   
+  exp              LX  3   not-LX  0   tile_probs (the P operand)
+
+=== residency by role (78 produced buffers) ===
+  HBM  op2      [2048, 8, 128]         page cache, slot-major view
+  HBM  op0      [2048, 8, 128]         page cache, slot-major view
+  HBM  op3      [2048, 8, 128]         page cache, slot-major view
+  HBM  op4      [2048, 8, 128]         page cache, slot-major view
+  HBM  op1      [2048, 8, 128]         page cache, slot-major view
+  HBM  op5      [2048, 8, 128]         page cache, slot-major view
+  HBM  op0      [1, 32, 128]           query rows
+  HBM  op1      [1, 64, 8, 128]        k_page / v_page  <- the gather
+  HBM  op2      [1, 64, 8, 128]        k_page / v_page  <- the gather
+  LX   op3      [8, 4, 128, 64]        K clone, GQA-expanded + transposed for q @ K^T
+  LX   op4      [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op5      [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op6      [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op7      [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op8      [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op9      [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  HBM  op10     [8, 4, 64, 128]        V clone, GQA-expanded
+  LX   op11     [8, 4, 1, 128]         tile_output
+  LX   op12     [8, 4, 1, 1]           tile_max / tile_sum
+  HBM  op13     [1, 64, 8, 128]        k_page / v_page  <- the gather
+  HBM  op14     [1, 64, 8, 128]        k_page / v_page  <- the gather
+  LX   op15     [8, 4, 128, 64]        K clone, GQA-expanded + transposed for q @ K^T
+  LX   op16     [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op17     [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op18     [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op19     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op20     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op21     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op22     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op23     [8, 4, 1, 128]         tile_output
+  LX   op24     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op25     [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op26     [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  HBM  op27     [8, 4, 64, 128]        V clone, GQA-expanded
+  LX   op28     [8, 4, 1, 128]         tile_output
+  LX   op29     [8, 4, 1, 128]         tile_output
+  LX   op30     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op31     [8, 4, 1, 1]           tile_max / tile_sum
+  HBM  op32     [1, 64, 8, 128]        k_page / v_page  <- the gather
+  HBM  op33     [1, 64, 8, 128]        k_page / v_page  <- the gather
+  LX   op34     [8, 4, 128, 64]        K clone, GQA-expanded + transposed for q @ K^T
+  LX   op35     [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op36     [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op37     [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op38     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op39     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op40     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op41     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op42     [8, 4, 1, 128]         tile_output
+  LX   op43     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op44     [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op45     [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  HBM  op46     [8, 4, 64, 128]        V clone, GQA-expanded
+  LX   op47     [8, 4, 1, 128]         tile_output
+  LX   op48     [8, 4, 1, 128]         tile_output
+  LX   op49     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op50     [8, 4, 1, 1]           tile_max / tile_sum
+  HBM  op51     [1, 64, 8, 128]        k_page / v_page  <- the gather
+  HBM  op52     [1, 64, 8, 128]        k_page / v_page  <- the gather
+  LX   op53     [8, 4, 128, 64]        K clone, GQA-expanded + transposed for q @ K^T
+  LX   op54     [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op55     [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op56     [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op57     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op58     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op59     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op60     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op61     [8, 4, 1, 128]         tile_output
+  LX   op62     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op63     [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  LX   op64     [8, 4, 1, 64]          scores / tile_probs  (the P operand)
+  HBM  op65     [8, 4, 64, 128]        V clone, GQA-expanded
+  LX   op66     [8, 4, 1, 128]         tile_output
+  LX   op67     [8, 4, 1, 128]         tile_output
+  LX   op68     [8, 4, 1, 1]           tile_max / tile_sum
+  LX   op69     [8, 4, 1, 1]           tile_max / tile_sum
+  HBM  op70     [8, 4, 1, 128]         tile_output
+
+  LX  roles: K clone, GQA-expanded + transposed for q @ K^T, scores / tile_probs  (the P operand), tile_max / tile_sum, tile_output
+  HBM roles: V clone, GQA-expanded, k_page / v_page  <- the gather, page cache, slot-major view, query rows, tile_output
+
+=== KV store relayout copies (4) ===
+  scatter_destination_check: inserting mutation relayout copy for buf0
+  enforce_indirect_layout: inserted mutation relayout copy for buf0 (copy-in arg0_1 -> buf2, copy-back buf2 -> arg0_1)
+  scatter_destination_check: inserting mutation relayout copy for buf1
+  enforce_indirect_layout: inserted mutation relayout copy for buf1 (copy-in arg3_1 -> buf4, copy-back buf4 -> arg3_1)
+
+artifacts: /home/senuser/spyre-inference/.claude/worktrees/lx-residency-repro/.claude-scratch/lx_residency_190018
