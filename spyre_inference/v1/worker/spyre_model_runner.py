@@ -981,13 +981,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
         head_size], matching the shape SpyreAttentionBackend.get_kv_cache_shape
         advertises. The attention kernel selects a page by indexing with a
         one-element device tensor, so the page read is a real indirect access.
+
+        With SPYRE_LX_KV_LAYOUT the same bytes are folded to
+        [num_blocks * num_kv_heads, block_size, head_size] so a page's gather can
+        stay in LX; get_kv_cache_shape keeps advertising the logical frame, whose
+        element count and page size in bytes are unchanged.
         """
         from vllm.v1.worker.utils import bind_kv_cache
 
         from spyre_inference.v1.attention.backends.spyre_attn import (
             SpyrePagedKVCache,
+            head_major_kv_layout,
+            lx_kv_layout_enabled,
             slot_major_kv_layout,
         )
+
+        fold_kv_heads = lx_kv_layout_enabled()
 
         # One spec per layer. disable_hybrid_kv_cache_manager (set in the
         # platform) collapses hybrid models into a single UniformTypeKVCacheSpecs
@@ -1005,6 +1014,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # but the matching `SpyreAttentionImpl.forward` consumes the
         # SpyrePagedKVCache — see the suppression on `bind_kv_cache(...)` below.
         kv_caches: dict[str, SpyrePagedKVCache] = {}
+        dev = self._spyre_device
 
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             # All layers in `shared_by` use the same spec by construction.
@@ -1012,24 +1022,32 @@ class TorchSpyreModelRunner(GPUModelRunner):
             num_blocks = kv_cache_tensor.size // spec.page_size_bytes
 
             # Host-allocated then transferred: only .to() takes a device_layout.
-            layout = slot_major_kv_layout(
-                num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
-            )
+            if fold_kv_heads:
+                # Same bytes as the slot-major frame, folded on (page, kv_head) so
+                # the gather's indexed axis is at device position 0. Materialised,
+                # not viewed: a view would leave the fold off that position.
+                shape: tuple[int, ...] = (
+                    num_blocks * spec.num_kv_heads,
+                    spec.block_size,
+                    spec.head_size,
+                )
+                layout = head_major_kv_layout(
+                    shape[0], spec.block_size, spec.head_size, torch.float16
+                )
+            else:
+                shape = (num_blocks, spec.block_size, spec.num_kv_heads, spec.head_size)
+                layout = slot_major_kv_layout(
+                    num_blocks * spec.block_size, spec.num_kv_heads, spec.head_size, torch.float16
+                )
 
-            k_pages = torch.zeros(
-                num_blocks,
-                spec.block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                dtype=torch.float16,
-            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
-            v_pages = torch.zeros(
-                num_blocks,
-                spec.block_size,
-                spec.num_kv_heads,
-                spec.head_size,
-                dtype=torch.float16,
-            ).to(self._spyre_device, device_layout=layout)  # ty: ignore[no-matching-overload]
+            # One host tensor at a time: both caches alive on host would double the
+            # transient footprint of a multi-GB cache.
+            def alloc(shape=shape, layout=layout) -> torch.Tensor:
+                host = torch.zeros(shape, dtype=torch.float16)
+                return host.to(dev, device_layout=layout)  # ty: ignore[no-matching-overload]
+
+            k_pages = alloc()
+            v_pages = alloc()
 
             page_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
             for layer_name in kv_cache_tensor.shared_by:

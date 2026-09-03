@@ -160,6 +160,65 @@ def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtyp
     )
 
 
+def head_major_kv_layout(num_rows: int, block_size: int, head_size: int, dtype: torch.dtype):
+    """Rows-outermost layout for the (page, kv_head)-folded cache.
+
+    The gather's indexed axis has to sit at device position 0 or index_select costs
+    the whole tensor, so the fold is materialised with this layout rather than
+    viewed out of the slot-major one.
+    """
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+
+    eps = get_elem_in_stick(dtype)
+    sticks = (head_size + eps - 1) // eps
+    return SpyreTensorLayout(
+        device_size=[num_rows, block_size, sticks, eps],
+        stride_map=[block_size * head_size, head_size, eps, 1],
+        device_dtype=get_device_dtype(dtype),
+    )
+
+
+def lx_kv_layout_enabled() -> bool:
+    """Whether the (page, kv_head)-folded cache frame is in use."""
+    return envs.SPYRE_LX_KV_LAYOUT
+
+
+def attn_max_cores() -> int:
+    """Core cap for the attention compile, 0 for uncapped.
+
+    The folded frame needs 8: at head_size 128, block_size 64, q_len 1 the
+    attention bmm's only output axis is kv=8, so reaching 32 cores means
+    K-splitting the 128-element reduction, and a gather can never mirror a split
+    on a value-table data dim.
+    """
+    override = envs.SPYRE_ATTN_MAX_CORES
+    if override:
+        return override
+    return 8 if lx_kv_layout_enabled() else 0
+
+
+@contextlib.contextmanager
+def _capped_attn_cores():
+    """Scope the core cap to one compile.
+
+    torch.compile is lazy, so the cap has to wrap the *call* that triggers the
+    compile, not the decoration. work_division reads config.sencores per compile,
+    which is what keeps the rest of the model on all 32 cores.
+    """
+    max_cores = attn_max_cores()
+    if not max_cores:
+        yield
+        return
+    from torch_spyre._inductor import config as ts_config
+
+    prev = ts_config.sencores
+    ts_config.sencores = max_cores
+    try:
+        yield
+    finally:
+        ts_config.sencores = prev
+
+
 def _maybe_compile(fn, compile_enabled: bool):
     """Compile `fn` when enabled. Attention compiles separately from the model's
     fullgraph capture, which can't hold its per-sequence Python loop.
@@ -172,6 +231,28 @@ def _maybe_compile(fn, compile_enabled: bool):
 def _reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
     k_slots.index_copy_(0, slot_mapping, key)
     v_slots.index_copy_(0, slot_mapping, value)
+
+
+def _create_folded_cache_store(num_kv_heads: int):
+    """Store into the (page, kv_head)-folded cache, one index_copy_ per kv head.
+
+    Unrolled rather than one index_copy_ over a flattened [num_tokens * num_kv_heads,
+    head_size] source, because every way of producing that source fails to lower: a
+    device-side view, an eager reshape, and an in-graph flatten or clone all leave a
+    work-division dim out of the tensor's scales. The unrolled ops fuse into one SDSC
+    kernel, so this costs no extra launches.
+
+    `slot_mapping` is the per-head list `SlotMapping.slots_for` builds, not a tensor.
+    """
+
+    def store(key, value, k_slots, v_slots, slot_mapping):
+        for h in range(num_kv_heads):
+            rows = slot_mapping[h]
+            k_slots.index_copy_(0, rows, key.select(1, h))
+            v_slots.index_copy_(0, rows, value.select(1, h))
+
+    return store
+
 
 
 def _mirror_mask_tiles(
@@ -369,6 +450,144 @@ def _create_compilable_page_attn(
     return specialized_paged_attn_kernel
 
 
+def _create_compilable_lx_page_attn(
+    num_blocks: int,
+    padded_query_len: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size: int,
+    block_size: int,
+    has_alibi: bool = False,
+    logits_soft_cap: float = 0.0,
+    store_mode: str = "none",
+    needs_gather: bool = True,
+    combine: str = "auto",
+):
+    """As `_create_compilable_page_attn`, over the (page, kv_head)-folded cache.
+
+    Two shape choices are what keep the gathered pages in LX rather than HBM:
+
+    * the pages are gathered on (page, kv_head), so V's gather output already *is*
+      the `probs @ V` operand and the gather's split lands on kv, which is an
+      output axis of that matmul and can therefore be mirrored by the consumer;
+    * the query groups are unrolled instead of batched, because the batched form
+      makes inductor clone the page out to a group axis it does not have, and that
+      clone's view of the page contracts.
+    """
+
+    num_queries_per_kv = num_heads // num_kv_heads
+    if combine == "auto":
+        # "scatter" needs a destination with one row per query row, which is what
+        # store_mode "copy" means; every other mode falls back to the stack.
+        combine = "scatter" if store_mode == "copy" else "stack"
+
+    def specialized_lx_paged_attn_kernel(
+        query,
+        query_row_index,
+        k_pages,
+        v_pages,
+        kv_index_tables,
+        head_index_tables,
+        mask_tiles,
+        scale,
+        alibi_bias_tiles=None,
+        out=None,
+    ):
+        """
+        Expected shapes, where the legacy kernel differs:
+            k_pages / v_pages: [num_blocks_total * num_kv_heads, block_size, head_size]
+            kv_index_tables: per active block, a [num_kv_heads, 1] int32 device
+                tensor holding that block's `page * num_kv_heads + kv` rows. One
+                real tensor per block, not a slice of a table: an index tensor
+                reaches the hardware as a tensor argument, so a slice's nonzero
+                storage offset is dropped and every block would gather block 0
+                (torch-spyre#3770).
+            head_index_tables: per query group, a [num_kv_heads] int32 device
+                tensor of that group's head ids (`kv * num_queries_per_kv + g`).
+            alibi_bias_tiles: per block, a list of num_queries_per_kv
+                [num_kv_heads, 1, block_size] tiles (only when has_alibi).
+        """
+        # Each group's heads come off `query` itself, then its rows. A compiled
+        # region reads a view from offset 0 and ignores its strides, so `query[:, g]`
+        # is wrong for every g including 0 and `.contiguous()` does not help — the
+        # clone reads the same view (torch-spyre#3770).
+        q_groups = []
+        for g in range(num_queries_per_kv):
+            heads = query.index_select(1, head_index_tables[g])
+            if needs_gather:
+                heads = heads.index_select(0, query_row_index[:padded_query_len])
+            # [num_kv_heads, padded_query_len, head_size]
+            q_groups.append(heads.transpose(0, 1))
+
+        tile_max: list = [None] * num_queries_per_kv
+        tile_sum: list = [None] * num_queries_per_kv
+        tile_out: list = [None] * num_queries_per_kv
+
+        for i in range(num_blocks):
+            # Subscripting rather than index_select: index_select takes only a 1-D
+            # index, and a 1-D index puts the entry axis on the index's own stick
+            # axis, which can then only split in whole 32-entry sticks. The
+            # [num_kv_heads, 1] shape lets the split land per kv head.
+            kv_rows = kv_index_tables[i]
+            k_page = k_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
+            # V is gathered in exactly the frame `probs @ V` wants: no permute.
+            v_page = v_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
+            # K's permute is a restickify, which is why this path needs
+            # torch-spyre#4153's local-read proof to keep the page in LX.
+            k_t = k_page.permute(0, 2, 1)
+            mask_tile = mask_tiles[i]
+
+            for g in range(num_queries_per_kv):
+                scores = torch.matmul(q_groups[g], k_t) * scale
+                if logits_soft_cap > 0.0:
+                    scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
+                if has_alibi:
+                    assert alibi_bias_tiles is not None
+                    scores = scores + alibi_bias_tiles[i][g]
+                scores = scores + mask_tile
+                scores_max = torch.amax(scores, dim=-1, keepdim=True)
+
+                if i == 0:
+                    tile_max[g] = scores_max
+                    probs = torch.exp(scores - scores_max)
+                    tile_out[g] = torch.matmul(probs, v_page)
+                    tile_sum[g] = probs.sum(dim=-1, keepdim=True)
+                else:
+                    new_max = torch.maximum(tile_max[g], scores_max)
+                    rescale = torch.exp(tile_max[g] - new_max)
+                    tile_out[g] = tile_out[g] * rescale
+                    tile_sum[g] = tile_sum[g] * rescale
+                    probs = torch.exp(scores - new_max)
+                    tile_out[g] = tile_out[g] + torch.matmul(probs, v_page)
+                    tile_sum[g] = tile_sum[g] + probs.sum(dim=-1, keepdim=True)
+                    tile_max[g] = new_max
+
+        groups = [tile_out[g] / tile_sum[g] for g in range(num_queries_per_kv)]
+        if combine == "scatter":
+            # Each group written straight to its own head positions. A torch.stack
+            # does not fuse into the attention kernel and becomes a second launch,
+            # which costs far more than these scatters do (measured: 2 launches vs 1).
+            assert out is not None
+            for g in range(num_queries_per_kv):
+                out.index_copy_(1, head_index_tables[g], groups[g].transpose(0, 1))
+            return out
+
+        attn = torch.stack(groups, dim=1)
+        attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
+        attn = attn.reshape(padded_query_len, num_heads, head_size)
+        if store_mode == "copy":
+            assert out is not None
+            out.copy_(attn)
+            return out
+        if store_mode == "index":
+            assert out is not None and query_row_index is not None
+            out.index_copy_(0, query_row_index[:padded_query_len], attn[:padded_query_len])
+            return out
+        return attn
+
+    return specialized_lx_paged_attn_kernel
+
+
 def _create_compilable_bucketed_decode_attn(
     num_seqs: int,
     num_blocks: int,
@@ -539,6 +758,13 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # its inputs from offset 0, ignoring storage_offset (torch-spyre#3770).
     page_index_table_cpu: torch.Tensor | None = None
     page_index_tables: list[torch.Tensor] | None = None
+
+    # Gather indices for the (page, kv_head)-folded cache, keyed by num_kv_heads
+    # because a hybrid model's layers need not share one: [num_kv_heads][seq][block]
+    # is that block's [num_kv_heads, 1] int32 `page * num_kv_heads + head` rows.
+    # One real tensor per block rather than a slice of a table, for the same
+    # storage-offset reason as page_index_tables.
+    kv_index_tables: dict[int, list[list[torch.Tensor]]] | None = None
 
     # Absolute query rows per sequence: gather sources in `query`, and store
     # destinations in `output`. One offset-0 tensor each, as above. Rows past
@@ -1078,6 +1304,11 @@ class SpyreAttentionBackend(AttentionBackend):
         # K and V are separate tensors in SpyrePagedKVCache, each with the same
         # shape. The base vLLM API expects a single tuple here; callers like
         # get_kv_cache_block_dim and KV-transfer code index into it directly.
+        #
+        # This is the logical frame. Under SPYRE_LX_KV_LAYOUT the runner allocates
+        # the same bytes folded on (page, kv_head); the element count and the page
+        # size are identical, and get_kv_cache_block_dim needs num_blocks to appear
+        # as a dim of its own, so the advertised frame stays put.
         return (num_blocks, block_size, num_kv_heads, head_size)
 
     @classmethod
@@ -1156,13 +1387,31 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         # Always compiled: eager index_copy_ rejects an int32 index and falls
         # back to CPU with an int64 one.
-        self._reshape_fn = torch.compile(_reshape_and_cache_kernel, dynamic=False)
+        self._reshape_fn = torch.compile(
+            _create_folded_cache_store(num_kv_heads)
+            if lx_kv_layout_enabled()
+            else _reshape_and_cache_kernel,
+            dynamic=False,
+        )
 
         # Compiled attention loops, keyed by
         # (num_blocks, padded_query_len, store_mode, needs_gather)
         self._attn_fns: dict[tuple[int, int, str, bool], object] = {}
 
         self._kv_slots: SpyrePagedKVCache | None = None
+
+        self._lx_kv_layout = lx_kv_layout_enabled()
+        if self._lx_kv_layout and not self._compile_attn:
+            raise ValueError(
+                "SPYRE_LX_KV_LAYOUT needs compiled attention: the folded cache is "
+                "gathered with a 2-D index, which eager cannot lower. Unset the flag "
+                "or drop --enforce-eager."
+            )
+        # This group's head ids in num_heads space, one [num_kv_heads] int32 tensor
+        # per group. Constant per layer, so mirrored once on the first forward.
+        self._head_index_tables: list[torch.Tensor] | None = None
+        # Compiled LX attention loops, keyed as self._attn_fns.
+        self._lx_attn_fns: dict[tuple[int, int, str, bool], object] = {}
 
         # Keyed by (bucket_num_seqs, bucket_num_blocks, needs_gather, store_out).
         self._decode_fns: dict[tuple[int, int, bool, bool], object] = {}
@@ -1197,6 +1446,60 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 self._compile_attn,
             )
         return self._attn_fns[key]
+
+    def _get_lx_attn_fn(
+        self,
+        num_blocks: int,
+        padded_query_len: int,
+        block_size: int,
+        store_mode: str = "none",
+        needs_gather: bool = True,
+    ):
+        # block_size is fixed by the KV cache spec, so it is passed but not keyed on.
+        key = (num_blocks, padded_query_len, store_mode, needs_gather)
+        if key not in self._lx_attn_fns:
+            self._lx_attn_fns[key] = _maybe_compile(
+                _create_compilable_lx_page_attn(
+                    num_blocks,
+                    padded_query_len,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_size,
+                    block_size,
+                    has_alibi=self.alibi_slopes is not None,
+                    logits_soft_cap=self.logits_soft_cap,
+                    store_mode=store_mode,
+                    needs_gather=needs_gather,
+                ),
+                self._compile_attn,
+            )
+        return self._lx_attn_fns[key]
+
+    def _mirror_lx_index_tables(
+        self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
+    ) -> list[list[torch.Tensor]]:
+        """Per-block (page, kv_head) gather indices for this layer's head count."""
+        if attn_metadata.kv_index_tables is None:
+            attn_metadata.kv_index_tables = {}
+        cached = attn_metadata.kv_index_tables.get(self.num_kv_heads)
+        if cached is not None:
+            return cached
+
+        table_cpu = attn_metadata.page_index_table_cpu
+        tiles_cpu = attn_metadata.attention_mask_tiles
+        assert table_cpu is not None and tiles_cpu is not None
+        heads = torch.arange(self.num_kv_heads, dtype=torch.int32).reshape(
+            self.num_kv_heads, 1
+        )
+        tables = [
+            [
+                convert(table_cpu[s, b, 0] * self.num_kv_heads + heads, device=device)
+                for b in range(len(tiles_cpu[s]))
+            ]
+            for s in range(table_cpu.shape[0])
+        ]
+        attn_metadata.kv_index_tables[self.num_kv_heads] = tables
+        return tables
 
     def _get_bucketed_decode_kernel(
         self,
@@ -1311,6 +1614,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 attn_metadata.mask_by_block_cpu, device=_target_device
             )
 
+        if self._lx_kv_layout and self._head_index_tables is None:
+            self._head_index_tables = [
+                convert(
+                    torch.tensor(
+                        [kv * self.num_queries_per_kv + g for kv in range(self.num_kv_heads)],
+                        dtype=torch.int32,
+                    ),
+                    device=_target_device,
+                )
+                for g in range(self.num_queries_per_kv)
+            ]
+
         output = self._online_softmax_attention(
             query[:num_actual_tokens],
             k_pages,
@@ -1330,7 +1645,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """
         if self._kv_slots is None:
             k_pages, v_pages = kv_cache
-            shape = (-1, k_pages.shape[2], k_pages.shape[3])
+            if self._lx_kv_layout:
+                # [num_blocks * num_kv_heads * block_size, head_size]. head_size is a
+                # multiple of the stick, so collapsing the leading two dims is a
+                # pure re-view of the same bytes.
+                shape = (-1, k_pages.shape[2])
+            else:
+                shape = (-1, k_pages.shape[2], k_pages.shape[3])
             self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._kv_slots
 
@@ -1483,6 +1804,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             self._run_bucketed_decode_dispatch(query_dev, k_pages, v_pages, attn_metadata, output)
             return output
 
+        kv_index_tables = (
+            self._mirror_lx_index_tables(attn_metadata, _target_device)
+            if self._lx_kv_layout
+            else None
+        )
+
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
             # over sequences or GQA optimization
@@ -1526,7 +1853,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # (alibi_offset = seq_offset - context_len) — the production Triton path.
             #
             # Per-tile shape: [num_kv_heads, num_queries_per_kv, 1, block_size].
-            alibi_bias_tiles: list[torch.Tensor] | None = None
+            alibi_bias_tiles: list | None = None
             if self.alibi_slopes is not None:
                 context_len = kv_len - query_len
                 alibi_bias_tiles = []
@@ -1538,7 +1865,18 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     )
                     rel = (kv_pos - context_len).view(1, 1, 1, block_size)
                     bias = self.alibi_slopes * rel
-                    alibi_bias_tiles.append(convert(bias, device=_target_device))
+                    if self._lx_kv_layout:
+                        # The unrolled kernel wants one [num_kv_heads, 1, block_size]
+                        # tile per group. Split here, on the host: an in-graph
+                        # `tile[:, g]` would be read from offset 0 (torch-spyre#3770).
+                        alibi_bias_tiles.append(
+                            [
+                                convert(bias[:, g].contiguous(), device=_target_device)
+                                for g in range(self.num_queries_per_kv)
+                            ]
+                        )
+                    else:
+                        alibi_bias_tiles.append(convert(bias, device=_target_device))
 
             # Selecting the whole buffer faults the device; see the kernel's gather.
             needs_gather = not (
@@ -1566,23 +1904,48 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 row_table = attn_metadata.query_row_tables[seq_idx]
 
             # Run attention on target device
-            attn_fn = self._get_attn_fn(
-                len(active_bs),
-                aligned_max_query_len,
-                store_mode=store_mode,
-                needs_gather=needs_gather,
-            )
-            result = attn_fn(
-                query_dev,
-                row_table,
-                k_pages,
-                v_pages,
-                page_index_table,
-                mask_tiles,
-                self.scale,
-                alibi_bias_tiles=alibi_bias_tiles,
-                out=output if store_mode != "none" else None,
-            )
+            if self._lx_kv_layout:
+                assert kv_index_tables is not None and self._head_index_tables is not None
+                attn_fn = self._get_lx_attn_fn(
+                    len(active_bs),
+                    aligned_max_query_len,
+                    block_size,
+                    store_mode=store_mode,
+                    needs_gather=needs_gather,
+                )
+                # The cap has to wrap the call: torch.compile is lazy, so the graph
+                # compiles here, not where it was decorated.
+                with _capped_attn_cores():
+                    result = attn_fn(
+                        query_dev,
+                        row_table,
+                        k_pages,
+                        v_pages,
+                        kv_index_tables[seq_idx][: len(active_bs)],
+                        self._head_index_tables,
+                        mask_tiles,
+                        self.scale,
+                        alibi_bias_tiles=alibi_bias_tiles,
+                        out=output if store_mode != "none" else None,
+                    )
+            else:
+                attn_fn = self._get_attn_fn(
+                    len(active_bs),
+                    aligned_max_query_len,
+                    store_mode=store_mode,
+                    needs_gather=needs_gather,
+                )
+                result = attn_fn(
+                    query_dev,
+                    row_table,
+                    k_pages,
+                    v_pages,
+                    page_index_table,
+                    mask_tiles,
+                    self.scale,
+                    alibi_bias_tiles=alibi_bias_tiles,
+                    out=output if store_mode != "none" else None,
+                )
 
             assert result.dtype == output.dtype
             if store_mode != "none":
