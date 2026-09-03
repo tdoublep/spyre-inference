@@ -49,7 +49,7 @@ class SlotMapping:
         self._layers = layers
         self._device: torch.device | None = None
         self.slots: torch.Tensor | None = None
-        self._host: torch.Tensor | None = None
+        self._published = False
         # Per-head (page, kv_head)-folded indices, keyed by (num_kv_heads, block_size)
         # because a hybrid model's layers need not share either.
         self._folded: dict[tuple[int, int], list[torch.Tensor]] = {}
@@ -78,38 +78,48 @@ class SlotMapping:
         device = self._resolve_device()
         if device is None:
             return
-        self._host = host
+        self._published = True
         self._folded.clear()
-        # The folded frame's store never reads this one, so only pay for it when a
-        # layer actually asks.
-        self.slots = None if envs.SPYRE_LX_KV_LAYOUT else convert(host, device=device)
+        if not envs.SPYRE_LX_KV_LAYOUT:
+            self.slots = convert(host, device=device)
+            return
+        # Built here, not on demand in slots_for: that runs inside the model's
+        # compiled graph, so any tensor arithmetic there is traced into it and
+        # inductor then compiles these host ops for the device.
+        #
+        # The folded cache holds a token as num_kv_heads rows of head_size, so a
+        # token's destination rows are
+        # (page * num_kv_heads + head) * block_size + offset_in_block, and the store
+        # writes one head at a time. One entry per distinct layer shape, since a
+        # hybrid model's layers need not share num_kv_heads or block_size.
+        for num_kv_heads, block_size in self._layer_shapes():
+            pages = torch.div(host, block_size, rounding_mode="floor")
+            offsets = host - pages * block_size
+            self._folded[(num_kv_heads, block_size)] = [
+                convert((pages * num_kv_heads + h) * block_size + offsets, device=device)
+                for h in range(num_kv_heads)
+            ]
+
+    def _layer_shapes(self) -> set[tuple[int, int]]:
+        """(num_kv_heads, block_size) of every layer sharing this slot mapping.
+
+        kv_cache[0].shape[1] is block_size in both the slot-major and folded frames.
+        """
+        return {(layer.num_kv_heads, layer.kv_cache[0].shape[1]) for layer in self._layers}
 
     def slots_for(
         self, num_kv_heads: int, block_size: int
     ) -> torch.Tensor | list[torch.Tensor] | None:
         """This step's store index in whichever frame the KV cache is in.
 
-        The folded cache holds a token as `num_kv_heads` rows of `head_size`, so a
-        token's destination rows are `(page * num_kv_heads + head) * block_size +
-        offset_in_block`. The store writes one head at a time, so this returns one
-        index tensor per head, built on host and cached per step.
+        A lookup only. This runs inside the model's compiled graph, so it must not
+        touch a tensor; everything is built in `_publish_host`.
         """
-        if self._host is None:
+        if not self._published:
             return None
         if not envs.SPYRE_LX_KV_LAYOUT:
             return self.slots
-        key = (num_kv_heads, block_size)
-        folded = self._folded.get(key)
-        if folded is None:
-            assert self._device is not None
-            pages = torch.div(self._host, block_size, rounding_mode="floor")
-            offsets = self._host - pages * block_size
-            folded = [
-                convert((pages * num_kv_heads + h) * block_size + offsets, device=self._device)
-                for h in range(num_kv_heads)
-            ]
-            self._folded[key] = folded
-        return folded
+        return self._folded.get((num_kv_heads, block_size))
 
 
 _holders: weakref.WeakSet[SlotMapping] = weakref.WeakSet()
