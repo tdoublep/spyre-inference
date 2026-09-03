@@ -707,7 +707,7 @@ if WRITE_KV:
 dev_args, cpu_args = build_attn_args(k_dev, v_dev)
 # Independent check that the two kernel shapes agree on CPU, so a restructuring
 # bug cannot hide inside the device-vs-CPU comparison of a single closure.
-if not RETURN_GROUPS and K_LAYOUT == "token":
+if not RETURN_GROUPS and K_LAYOUT == "token" and V_LAYOUT == "token":
     xcheck = (paged_attn_kernel(*cpu_args) - paged_attn_kernel_group_loop(*cpu_args)).abs()
     print(f"cpu cross-check broadcast vs group-loop: max abs diff {xcheck.max().item():.3e}")
 
