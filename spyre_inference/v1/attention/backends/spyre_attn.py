@@ -386,7 +386,6 @@ def _create_compilable_bucketed_decode_attn(
     first.
     """
 
-    lead = num_seqs * num_kv_heads
     num_heads = num_kv_heads * num_queries_per_kv
 
     def specialized_bucketed_decode_kernel(
@@ -395,9 +394,9 @@ def _create_compilable_bucketed_decode_attn(
         # Q=1 puts the sequences in rows 0..num_seqs-1; lanes past the batch are
         # -inf-masked and dropped by the caller, so any b_seqs-row prefix serves.
         q_rows = query.index_select(0, query_row_ids) if needs_gather else query[:num_seqs]
-        q = q_rows.reshape(num_seqs, num_kv_heads, num_queries_per_kv, head_size).reshape(
-            lead, num_queries_per_kv, 1, head_size
-        )
+        # [S, KV, QPK, D]: lower_bmm's 4-D form takes two batch axes, so num_seqs
+        # and KV stay separate and nothing here has to be merged or padded.
+        q = q_rows.reshape(num_seqs, num_kv_heads, num_queries_per_kv, head_size)
         # k/v_pages: [num_pages_total, block_size, KV, D] (the raw page cache)
         # block_ids: [num_blocks, stick-padded num_seqs] int32; row i holds the
         #   i-th block's page index for each sequence. Stick-padded so the row
@@ -413,23 +412,13 @@ def _create_compilable_bucketed_decode_attn(
             # index_select, not `k_pages[page_idx]`: subscripting lowers to
             # aten.index, which upcasts the int32 index to int64 and fails eager.
             page_idx = block_ids[i, 0:num_seqs]
-            # Token-major to head-major. (num_seqs, KV) are both batch axes and
-            # must be merged because lower_bmm takes at most a 4-D matmul; after
-            # the permute they are not stride-adjacent, so the merge materializes
-            # a copy of every page. The single-sequence kernel has no num_seqs
-            # axis to merge, which is why its permute stays a free view.
-            k_page = (
-                k_pages.index_select(0, page_idx)
-                .permute(0, 2, 1, 3)
-                .reshape(lead, 1, block_size, head_size)
-            )
-            v_page = (
-                v_pages.index_select(0, page_idx)
-                .permute(0, 2, 1, 3)
-                .reshape(lead, 1, block_size, head_size)
-            )
-            # Builder already broadcast across KV heads; add the QPK axis.
-            mask_tile = mask_by_block[i].unsqueeze(1)
+            # Token-major to head-major, [S, KV, T, D]. A pure view: with (S, KV)
+            # kept as separate batch axes there is no cross-stride merge, so the
+            # page is never materialized.
+            k_page = k_pages.index_select(0, page_idx).permute(0, 2, 1, 3)
+            v_page = v_pages.index_select(0, page_idx).permute(0, 2, 1, 3)
+            # Builder already broadcast across KV heads; split them back out.
+            mask_tile = mask_by_block[i].reshape(num_seqs, num_kv_heads, 1, block_size)
 
             scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
             scores = scores + mask_tile
@@ -454,11 +443,12 @@ def _create_compilable_bucketed_decode_attn(
                 tile_max = new_max
 
         assert tile_output is not None and tile_sum is not None
-        attn = (tile_output / tile_sum).squeeze(2)
+        # [S, KV, QPK, D] -> [S, num_heads, D] is a free view.
+        attn = (tile_output / tile_sum).reshape(num_seqs, num_heads, head_size)
         if store_out:
             # The destination prefix starts at offset 0, so torch-spyre#3770 does not
             # apply; rows past the batch are don't-care and kept finite by the builder.
-            out[:num_seqs].copy_(attn.reshape(num_seqs, num_heads, head_size))
+            out[:num_seqs].copy_(attn)
             return out
         return attn
 
