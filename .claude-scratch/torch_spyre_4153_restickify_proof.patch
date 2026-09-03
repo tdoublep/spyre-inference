@@ -1,0 +1,162 @@
+--- pass_utils.py.pre4153	2026-09-03 20:38:07.820971881 +0000
++++ pass_utils.py	2026-09-03 20:38:17.545706522 +0000
+@@ -2572,6 +2572,42 @@
+     num_cores: int | None = None
+ 
+ 
++def per_core_views_equal(left: PerCoreView, right: PerCoreView) -> bool:
++    """Whether two physical views assign every core the same tensor slice.
++
++    SymPy expressions are implementation spellings, not ownership.  Compare
++    the concrete slot selected for every physical core so semantically equal
++    expressions cannot create a false relayout or a false mismatch.
++    """
++
++    left_splits = dict(left.work_slice_dims)
++    right_splits = dict(right.work_slice_dims)
++    left_slots = dict(left.core_to_slot)
++    right_slots = dict(right.core_to_slot)
++    if (
++        len(left_splits) != len(left.work_slice_dims)
++        or len(right_splits) != len(right.work_slice_dims)
++        or len(left_slots) != len(left.core_to_slot)
++        or len(right_slots) != len(right.core_to_slot)
++        or left_splits != right_splits
++        or left_slots.keys() != right_slots.keys()
++        or left.num_cores is None
++        or left.num_cores != right.num_cores
++    ):
++        return False
++
++    core_id = Symbol("core_id")
++    try:
++        return all(
++            int(left_slots[dim].subs(core_id, core))
++            == int(right_slots[dim].subs(core_id, core))
++            for dim in left_slots
++            for core in range(left.num_cores)
++        )
++    except (TypeError, ValueError):
++        return False
++
++
+ def _is_matmul_op(op: Operation) -> bool:
+     return (
+         isinstance(op, ComputedBuffer)
+--- scratchpad/allocator.py.pre4153	2026-09-03 20:38:07.823971799 +0000
++++ scratchpad/allocator.py	2026-09-03 20:40:13.945530320 +0000
+@@ -38,6 +38,8 @@
+ from torch._inductor.graph import GraphLowering
+ 
+ from torch_spyre._inductor.pass_utils import (
++    per_core_views_equal,
++    _per_core_view_on_buf,
+     commit_iteration_space_ownership,
+     concretize_expr,
+     indirect_info_from_op,
+@@ -189,6 +191,15 @@
+ ]
+ 
+ 
++import os as _os_4153
++
++_LX_RESTICKIFY_RESIDENCY = (
++    _os_4153.environ.get("SPYRE_LX_RESTICKIFY_RESIDENCY", "0") == "1"
++)
++_restickify_logger = logging.getLogger("spyre.inductor.scratchpad.allocator")
++
++
++
+ class ScratchpadOptimizationPass(ABC):
+     """
+     Abstract class for optimization passes which are implemented to improve
+@@ -668,13 +679,84 @@
+         allocators bar the same buffers; only :class:`CpSatLayoutSolver` acts on
+         it, the gap heuristics ignore ``residency_reason``.
+         """
+-        if any(
+-            graph.operations[u].name != name
+-            and self._get_op_name(graph.operations[u]) == "restickify"
++        readers = [
++            graph.operations[u]
+             for u in uses
+-        ):
++            if graph.operations[u].name != name
++            and self._get_op_name(graph.operations[u]) == "restickify"
++        ]
++        if not readers:
++            return None
++        if not _LX_RESTICKIFY_RESIDENCY:
+             return "read by restickify (cross-frame barrier)"
+-        return None
++        if all(
++            self._restickify_read_is_core_local(graph, name, reader)
++            for reader in readers
++        ):
++            _restickify_logger.debug(
++                f"restickify local-read proof PASSED for {name} "
++                f"({len(readers)} reader(s))"
++            )
++            return None
++        return "read by restickify (local-read proof failed)"
++
++    def _restickify_read_is_core_local(
++        self, graph: GraphLowering, name: str, reader: Operation
++    ) -> bool:
++        """Whether ``reader`` consumes exactly ``name``'s same-core slice.
++
++        torch-spyre#4153's proof, minus the relayout-plan branch: with no plans
++        (the cpsat path) it reduces to producer-write-view == restickify-read-view.
++        """
++        reads = [
++            dep
++            for dep in op_read_writes(reader).reads
++            if isinstance(dep, MemoryDep) and dep.name == name
++        ]
++        if len(reads) != 1 or reads[0].is_indirect():
++            _restickify_logger.debug(
++                f"restickify proof {name}: {len(reads)} matching reads -> fail"
++            )
++            return False
++        read_view, partial, representable = _per_core_view_on_buf(
++            reader, reads[0], name
++        )
++        if partial or not representable:
++            _restickify_logger.debug(
++                f"restickify proof {name}: read view partial={partial} "
++                f"representable={representable} -> fail"
++            )
++            return False
++
++        producer = next((op for op in graph.operations if op.get_name() == name), None)
++        if not isinstance(producer, ComputedBuffer):
++            _restickify_logger.debug(
++                f"restickify proof {name}: producer is not a ComputedBuffer -> fail"
++            )
++            return False
++        writes = [
++            dep
++            for dep in op_read_writes(producer).writes
++            if isinstance(dep, MemoryDep) and dep.name == name
++        ]
++        if len(writes) != 1 or writes[0].is_indirect():
++            _restickify_logger.debug(
++                f"restickify proof {name}: write dep unusable -> fail"
++            )
++            return False
++        write_view, write_partial, write_representable = _per_core_view_on_buf(
++            producer, writes[0], name
++        )
++        ok = (
++            not write_partial
++            and write_representable
++            and per_core_views_equal(write_view, read_view)
++        )
++        _restickify_logger.debug(
++            f"restickify proof {name}: write {write_view} vs read {read_view} -> "
++            f"{'PASS' if ok else 'FAIL'}"
++        )
++        return ok
+ 
+     def _build_bound_buffers(
+         self,

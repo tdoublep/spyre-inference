@@ -126,8 +126,13 @@ STAGE_NAMES = ("q_g", "k_t", "v_3d", "scores_raw", "scores_masked", "probs", "ti
 # [NUM_PAGES * KV_HEADS, HEAD_SIZE, BLOCK_SIZE], so the gather output already IS
 # the matmul operand. Folding on (page, kv) gives KV_HEADS index entries, which is
 # also the bmm's batch extent. Only used by GQA=group.
+# "head_major" stores K in the same frame as V, [NUM_PAGES * KV_HEADS, BLOCK_SIZE,
+# HEAD_SIZE], and permutes to [KV_HEADS, HEAD_SIZE, BLOCK_SIZE] in the kernel. The
+# permute is a restickify, so this only reaches LX with torch-spyre#4153's local-read
+# proof -- but the gather then splits kv 8 ways, matching what the restickify reads,
+# and the decode store stays token-contiguous like V's.
 K_LAYOUT = os.environ.get("K_LAYOUT", "token")
-assert K_LAYOUT in ("token", "transposed"), K_LAYOUT
+assert K_LAYOUT in ("token", "transposed", "head_major"), K_LAYOUT
 # Cap cores for the attention compile only, by mutating the config the work-division
 # pass reads, rather than the process-wide SENCORES env var. The pass calls
 # _validate_max_cores() per compile, so this should scope the cap to this graph and
@@ -297,6 +302,8 @@ def paged_attn_kernel_group_loop(
         page_idx = page_index_table[i, 0:1]
         if K_LAYOUT == "transposed":
             k_page = k_pages[kv_index_table[i]].reshape(KV_HEADS, HEAD_SIZE, BLOCK_SIZE)
+        elif K_LAYOUT == "head_major":
+            k_page = k_pages[kv_index_table[i]].reshape(KV_HEADS, BLOCK_SIZE, HEAD_SIZE)
         elif FOLD in ("k", "kv"):
             k_page = fetch_page_folded(k_pages, entry_index_table[i])
         else:
@@ -309,6 +316,8 @@ def paged_attn_kernel_group_loop(
             v_page = v_pages.index_select(0, page_idx).squeeze(0)
         if K_LAYOUT == "transposed":
             k_t = k_page  # already [KV_HEADS, HEAD_SIZE, BLOCK_SIZE]
+        elif K_LAYOUT == "head_major":
+            k_t = k_page.permute(0, 2, 1)  # [KV_HEADS, HEAD_SIZE, BLOCK_SIZE]
         else:
             k_t = k_page.permute(1, 2, 0)
         if V_LAYOUT == "head_major":
@@ -410,6 +419,21 @@ def make_pages() -> tuple[torch.Tensor, torch.Tensor]:
         )
     else:
         v_dev = v.to("spyre", device_layout=layout)
+    if K_LAYOUT == "head_major":
+        k_hm = (
+            k.permute(0, 2, 1, 3)
+            .contiguous()
+            .reshape(NUM_PAGES * KV_HEADS, BLOCK_SIZE, HEAD_SIZE)
+        )
+        return (
+            k_hm.to(
+                "spyre",
+                device_layout=rows_outermost_layout(
+                    NUM_PAGES * KV_HEADS, BLOCK_SIZE, HEAD_SIZE
+                ),
+            ),
+            v_dev,
+        )
     if K_LAYOUT == "transposed":
         # Materialised, not viewed: the gather's source must be a real tensor whose
         # indexed axis is at device position 0.
