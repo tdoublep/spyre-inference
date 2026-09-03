@@ -101,6 +101,29 @@ FOLD_SRC_RANK = _int("FOLD_SRC_RANK", 3)
 # directly and no op reads it across an axis it does not have.
 GQA = os.environ.get("GQA", "broadcast")
 assert GQA in ("broadcast", "group"), GQA
+# Return the per-group outputs instead of stacking them, so a wrong result can be
+# attributed to the group computation or to the cat that assembles it.
+RETURN_GROUPS = os.environ.get("RETURN_GROUPS") == "1"
+# How each group's query slice is taken. A compiled region reads a view from
+# offset 0 and ignores the strides (torch-spyre#3770), so `q[:, g]` is wrong on
+# device for every g -- .contiguous() does not help, since the clone reads the
+# same view. "gather" uses index_select, whose output is a real buffer at offset
+# 0, which is the workaround spyre_attn.py already uses for the query rows.
+Q_SLICE = os.environ.get("Q_SLICE", "gather")
+assert Q_SLICE in ("gather", "slice", "slice_contig"), Q_SLICE
+# Compute only the first GROUPS_COMPUTED groups, leaving the query's shape alone.
+# Separates a wrong query slice at this QPK from a wrong interaction between
+# several groups in one graph.
+GROUPS_COMPUTED = _int("GROUPS_COMPUTED", QPK)
+# K cache frame. "token": [NUM_PAGES, BLOCK_SIZE, KV_HEADS, HEAD_SIZE], so the
+# gathered page must be permuted to [KV_HEADS, HEAD_SIZE, BLOCK_SIZE] for q @ K^T
+# -- that moves the stick dim, which a restickify does, and a buffer a restickify
+# reads can never be LX ("cross-frame barrier"). "transposed": store K as
+# [NUM_PAGES * KV_HEADS, HEAD_SIZE, BLOCK_SIZE], so the gather output already IS
+# the matmul operand. Folding on (page, kv) gives KV_HEADS index entries, which is
+# also the bmm's batch extent. Only used by GQA=group.
+K_LAYOUT = os.environ.get("K_LAYOUT", "token")
+assert K_LAYOUT in ("token", "transposed"), K_LAYOUT
 assert FOLD in ("none", "k", "kv"), FOLD
 assert BLOCK_SIZE % ENTRIES == 0, (BLOCK_SIZE, ENTRIES)
 ROWS_PER_ENTRY = BLOCK_SIZE // ENTRIES
@@ -147,7 +170,15 @@ def fetch_page_folded(pages, entry_index):
 
 
 def paged_attn_kernel(
-    query, query_row_index, k_pages, v_pages, page_index_table, mask_tiles, entry_index_table
+    query,
+    query_row_index,
+    k_pages,
+    v_pages,
+    page_index_table,
+    mask_tiles,
+    entry_index_table,
+    group_indices=None,
+    kv_index_table=None,
 ):
     """Online-softmax attention over NUM_BLOCKS pages for one sequence.
 
@@ -212,7 +243,15 @@ def paged_attn_kernel(
 
 
 def paged_attn_kernel_group_loop(
-    query, query_row_index, k_pages, v_pages, page_index_table, mask_tiles, entry_index_table
+    query,
+    query_row_index,
+    k_pages,
+    v_pages,
+    page_index_table,
+    mask_tiles,
+    entry_index_table,
+    group_indices,
+    kv_index_table,
 ):
     """As :func:`paged_attn_kernel`, with the query groups unrolled.
 
@@ -229,7 +268,9 @@ def paged_attn_kernel_group_loop(
 
     for i in range(NUM_BLOCKS):
         page_idx = page_index_table[i, 0:1]
-        if FOLD in ("k", "kv"):
+        if K_LAYOUT == "transposed":
+            k_page = k_pages[kv_index_table[i]].reshape(KV_HEADS, HEAD_SIZE, BLOCK_SIZE)
+        elif FOLD in ("k", "kv"):
             k_page = fetch_page_folded(k_pages, entry_index_table[i])
         else:
             k_page = k_pages.index_select(0, page_idx).squeeze(0)
@@ -237,11 +278,19 @@ def paged_attn_kernel_group_loop(
             v_page = fetch_page_folded(v_pages, entry_index_table[i])
         else:
             v_page = v_pages.index_select(0, page_idx).squeeze(0)
-        k_t = k_page.permute(1, 2, 0)  # [KV_HEADS, HEAD_SIZE, BLOCK_SIZE]
+        if K_LAYOUT == "transposed":
+            k_t = k_page  # already [KV_HEADS, HEAD_SIZE, BLOCK_SIZE]
+        else:
+            k_t = k_page.permute(1, 2, 0)
         v_3d = v_page.permute(1, 0, 2)  # [KV_HEADS, BLOCK_SIZE, HEAD_SIZE]
 
-        for g in range(QPK):
-            q_g = q[:, g]  # [KV_HEADS, Q_LEN, HEAD_SIZE]
+        for g in range(GROUPS_COMPUTED):
+            if Q_SLICE == "gather":
+                q_g = q.index_select(1, group_indices[g]).reshape(KV_HEADS, Q_LEN, HEAD_SIZE)
+            elif Q_SLICE == "slice_contig":
+                q_g = q[:, g].contiguous()
+            else:
+                q_g = q[:, g]  # [KV_HEADS, Q_LEN, HEAD_SIZE]
             scores = torch.matmul(q_g, k_t) * SCALE
             scores = scores + mask_tiles[i]
             scores_max = torch.amax(scores, dim=-1, keepdim=True)
@@ -260,7 +309,11 @@ def paged_attn_kernel_group_loop(
                 tile_sum[g] = tile_sum[g] + probs.sum(dim=-1, keepdim=True)
                 tile_max[g] = new_max
 
-    attn = torch.stack([tile_out[g] / tile_sum[g] for g in range(QPK)], dim=1)
+    groups = [tile_out[g] / tile_sum[g] for g in range(GROUPS_COMPUTED)]
+    if RETURN_GROUPS:
+        return tuple(groups)
+    assert GROUPS_COMPUTED == QPK, "stacking needs every group; use RETURN_GROUPS=1"
+    attn = torch.stack(groups, dim=1)
     attn = attn.reshape(1, NUM_HEADS, Q_LEN, HEAD_SIZE).transpose(1, 2)
     return attn.reshape(Q_LEN, NUM_HEADS, HEAD_SIZE)
 
@@ -271,6 +324,17 @@ ATTN_KERNEL = paged_attn_kernel_group_loop if GQA == "group" else paged_attn_ker
 def reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
     k_slots.index_copy_(0, slot_mapping, key)
     v_slots.index_copy_(0, slot_mapping, value)
+
+
+def rows_outermost_layout(rows: int, mid: int, inner: int):
+    """Row-axis-outermost layout, so a gather's indexed axis is at device position 0."""
+    eps = get_elem_in_stick(torch.float16)
+    sticks = (inner + eps - 1) // eps
+    return SpyreTensorLayout(
+        device_size=[rows, mid, sticks, eps],
+        stride_map=[mid * inner, inner, eps, 1],
+        device_dtype=get_device_dtype(torch.float16),
+    )
 
 
 def slot_major_layout(num_slots: int):
@@ -288,7 +352,18 @@ def make_pages() -> tuple[torch.Tensor, torch.Tensor]:
     k = torch.randn(NUM_PAGES, BLOCK_SIZE, KV_HEADS, HEAD_SIZE, dtype=torch.float16)
     v = torch.randn(NUM_PAGES, BLOCK_SIZE, KV_HEADS, HEAD_SIZE, dtype=torch.float16)
     layout = slot_major_layout(NUM_PAGES * BLOCK_SIZE)
-    return k.to("spyre", device_layout=layout), v.to("spyre", device_layout=layout)
+    v_dev = v.to("spyre", device_layout=layout)
+    if K_LAYOUT == "transposed":
+        # Materialised, not viewed: the gather's source must be a real tensor whose
+        # indexed axis is at device position 0.
+        k_t = (
+            k.permute(0, 2, 3, 1)
+            .contiguous()
+            .reshape(NUM_PAGES * KV_HEADS, HEAD_SIZE, BLOCK_SIZE)
+        )
+        k_layout = rows_outermost_layout(NUM_PAGES * KV_HEADS, HEAD_SIZE, BLOCK_SIZE)
+        return k_t.to("spyre", device_layout=k_layout), v_dev
+    return k.to("spyre", device_layout=layout), v_dev
 
 
 def write_kv(k_dev: torch.Tensor, v_dev: torch.Tensor) -> None:
@@ -330,6 +405,10 @@ def build_attn_args(k_dev: torch.Tensor, v_dev: torch.Tensor):
     entry_table = (
         page_table[:, 0:1] * ENTRIES + torch.arange(ENTRIES, dtype=torch.int32)
     ).reshape(NUM_BLOCKS, ENTRIES, 1)
+    # (page, kv) entries for the transposed K cache, one per kv head.
+    kv_table = (
+        page_table[:, 0:1] * KV_HEADS + torch.arange(KV_HEADS, dtype=torch.int32)
+    ).reshape(NUM_BLOCKS, KV_HEADS, 1)
 
     dev_args = [
         query.to("spyre"),
@@ -339,6 +418,8 @@ def build_attn_args(k_dev: torch.Tensor, v_dev: torch.Tensor):
         page_table.to("spyre"),
         [m.to("spyre") for m in masks],
         entry_table.to("spyre"),
+        [torch.tensor([g], dtype=torch.int32).to("spyre") for g in range(QPK)],
+        kv_table.to("spyre"),
     ]
     cpu_args = [
         query.float(),
@@ -348,6 +429,8 @@ def build_attn_args(k_dev: torch.Tensor, v_dev: torch.Tensor):
         page_table,
         [m.float() for m in masks],
         entry_table,
+        [torch.tensor([g], dtype=torch.int32) for g in range(QPK)],
+        kv_table,
     ]
     return dev_args, cpu_args
 
@@ -482,6 +565,8 @@ def classify(shape: list[int]) -> str:
         (kv, QPK, q, d): "tile_output",
         (kv, QPK, q, 1): "tile_max / tile_sum",
         (kv, d, b): "k_page, head-major transposed for q @ K^T",
+        (kv, 1, d, b): "k_page  <- the transposed gather",
+        (NUM_PAGES * kv, d, b): "K page cache, transposed (arg)",
         (kv, b, d): "v_page, head-major",
         (kv, q, b): "scores / tile_probs  (the P operand)",
         (kv, q, d): "tile_output",
@@ -533,7 +618,8 @@ print(
     f"head_size={HEAD_SIZE} block_size={BLOCK_SIZE} "
     f"write_kv={WRITE_KV} solver={os.environ.get('LAYOUT_SOLVER', 'default')} "
     f"fold={FOLD} entries={ENTRIES} rows_per_entry={ROWS_PER_ENTRY} index_2d={INDEX_2D} "
-    f"fold_src_rank={FOLD_SRC_RANK} gqa={GQA} "
+    f"fold_src_rank={FOLD_SRC_RANK} gqa={GQA} q_slice={Q_SLICE} "
+    f"groups_computed={GROUPS_COMPUTED} k_layout={K_LAYOUT} "
     f"fix4258={os.environ.get('SPYRE_FIX_4258', '0')}",
     flush=True,
 )
@@ -546,11 +632,49 @@ if WRITE_KV:
 dev_args, cpu_args = build_attn_args(k_dev, v_dev)
 # Independent check that the two kernel shapes agree on CPU, so a restructuring
 # bug cannot hide inside the device-vs-CPU comparison of a single closure.
-xcheck = (paged_attn_kernel(*cpu_args) - paged_attn_kernel_group_loop(*cpu_args)).abs()
-print(f"cpu cross-check broadcast vs group-loop: max abs diff {xcheck.max().item():.3e}")
+if not RETURN_GROUPS and K_LAYOUT == "token":
+    xcheck = (paged_attn_kernel(*cpu_args) - paged_attn_kernel_group_loop(*cpu_args)).abs()
+    print(f"cpu cross-check broadcast vs group-loop: max abs diff {xcheck.max().item():.3e}")
 
-got = torch.compile(ATTN_KERNEL, dynamic=False)(*dev_args).cpu().float()
-ref = ATTN_KERNEL(*cpu_args)
+raw = torch.compile(ATTN_KERNEL, dynamic=False)(*dev_args)
+ref_raw = ATTN_KERNEL(*cpu_args)
+if isinstance(raw, tuple):
+    print("per-group max abs diff (RETURN_GROUPS): " + "  ".join(
+        f"g{g}={(raw[g].cpu().float() - ref_raw[g]).abs().max().item():.3e}"
+        for g in range(len(raw))
+    ))
+    got = torch.cat([t.cpu().float().reshape(-1) for t in raw])
+    ref = torch.cat([t.reshape(-1) for t in ref_raw])
+else:
+    got = raw.cpu().float()
+    ref = ref_raw
+
+# Characterise a mismatch: an all-zero or constant `got` points at a dropped
+# write (a cat destination, say) rather than an arithmetic or layout error.
+print(f"got  absmax {got.abs().max().item():.4e}  mean {got.mean().item():+.4e}  zeros {(got == 0).sum().item()}/{got.numel()}")
+print(f"ref  absmax {ref.abs().max().item():.4e}  mean {ref.mean().item():+.4e}")
+if got.dim() == 3:
+    per_head = (got - ref).abs().amax(dim=(0, 2))
+    print("per-head max abs diff: " + " ".join(f"{v:.2e}" for v in per_head.tolist()))
+    # Is `got` the right values in group-major head order? Output head h is
+    # (kv=h//QPK, g=h%QPK); a group-major assembly puts it at g*KV_HEADS+kv.
+    perm = torch.tensor(
+        [(h % QPK) * KV_HEADS + (h // QPK) for h in range(NUM_HEADS)], dtype=torch.long
+    )
+    d_perm = (got - ref.index_select(1, perm)).abs().max().item()
+    print(f"max abs diff vs group-major-reordered ref: {d_perm:.3e}")
+    # Which reference head does each computed head actually match? A clean
+    # permutation means the arithmetic is right and only the assembly is wrong;
+    # no match anywhere means the values themselves are wrong.
+    g2 = got[0].float()
+    r2 = ref[0].float()
+    dist = (g2.unsqueeze(1) - r2.unsqueeze(0)).abs().amax(dim=-1)
+    best = dist.argmin(dim=1)
+    resid = dist.gather(1, best.unsqueeze(1)).squeeze(1)
+    print("got head -> best ref head: " + " ".join(
+        f"{h}->{best[h].item()}{'' if resid[h] < 1e-2 else '?'}" for h in range(NUM_HEADS)
+    ))
+    print(f"heads with a clean match (<1e-2): {(resid < 1e-2).sum().item()}/{NUM_HEADS}")
 
 diff = (got - ref).abs().max().item()
 denom = ref.abs().max().item() or 1.0
