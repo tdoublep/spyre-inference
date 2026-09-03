@@ -13,6 +13,68 @@ measured. Where I say "unverified", it is genuinely untested — do not promote 
 
 ---
 
+## Environment of record
+
+Every number in this document was produced on exactly this stack. If you are on a
+different pod, reproduce the verified result below first, or your baselines will not
+match mine.
+
+| component | version |
+|---|---|
+| `spyre-inference` base | `0c72c0f` (main at branch point; branch `lx-residency-kpage-gather`) |
+| `torch-spyre` | **`e02b78ba35f9a1a69a458c3149e9c01d9f4fa6a8`** (the `pyproject.toml` / `uv.lock` pin, installed non-editable) |
+| `vllm` | `0.28.0` (git tag pin) |
+| `torch` | `2.13.0+cpu` |
+| python | `3.12.13` |
+| kernel | `5.14.0-570.131.1.el9_6.x86_64` |
+| devices | 4 AIU found, PF access; all work used device 0 |
+
+### Spyre runtime libraries -- read this carefully
+
+The RPMs the runtime actually used are **not** the ones installed system-wide. They are
+the set pinned in this repo's `spyre-rpms.lock`, unpacked into `~/spyre-libs` by
+`scripts/install-pinned-rpms.sh` and selected via `SENTIENT_BASE_INSTALL_DIR`. That is
+why every command here starts with `source ~/spyre-libs/env.sh` -- without it you get
+the image-baked libraries and `torch_spyre._C` fails to load with an undefined
+`spyre_comms` symbol.
+
+Versions used (from `spyre-rpms.lock`, x86_64 prod tree; cross-checked against the
+filenames in `~/.cache/spyre-rpms` and the overlay's install stamp, which was written
+two minutes after those exact RPMs were downloaded):
+
+| package | version |
+|---|---|
+| `ibm-deeptools` / `-devel` | `2.0.0-0.main.1+2414.da394b3_325` |
+| `ibm-flex` / `-devel` | `2.0.0-0.main.1+529.a5453d3_355` |
+| `ibm-senlib-core` / `-dd2` / `-headers` | `2.0.0-0.main.1+261.531e4b5_237` |
+| `ibm-spyre-comms` / `-devel` | `1.0.0-0.main.1+135.cf3c000_167` |
+| `ibm-aiu-toolbox-e2e` | `2.0.0-0.main.1+28.47d9b91_96` |
+| `ibm-libaiupti` | `2.0.0-0.main.1+22.9e597ab_3` |
+
+For contrast, the **system** RPMs on this pod are older and were NOT used:
+`ibm-deeptools 2254.3a98611_287`, `ibm-flex 481.bf81df5_295`,
+`ibm-senlib-core 237.6e30780_202`, `ibm-spyre-comms 121.3865336_140`. If you hit
+different compile errors from mine, check that `env.sh` was sourced before suspecting
+anything else.
+
+To rebuild this environment from scratch:
+
+```bash
+# needs ARTIFACTORY_TOKEN + ARTIFACTORY_BASE_URL + ARTIFACTORY_RPM_PATH
+bash scripts/install-pinned-rpms.sh      # unpacks spyre-rpms.lock into ~/spyre-libs
+source ~/spyre-libs/env.sh
+uv sync --group dev                      # installs the pinned torch-spyre rev
+```
+
+WARNING: both torch-spyre patches below are applied **into `site-packages`**, not to a
+source checkout, because `uv run` re-syncs the pinned git rev on every invocation and
+would silently revert a local build. For the same reason every command here calls the
+venv python directly (`$REPO/.venv/bin/python`) rather than `uv run` -- see
+`run_lx_residency.sh`. If you do iterate on a local torch-spyre build instead, use
+`uv run --no-sync`.
+
+---
+
 ## Verified result (reproduce this first, ~8 min)
 
 ```bash
