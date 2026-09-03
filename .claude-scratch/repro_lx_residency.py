@@ -192,7 +192,14 @@ def paged_attn_kernel(
         k_pages, v_pages  [NUM_PAGES, BLOCK_SIZE, KV_HEADS, HEAD_SIZE]
         page_index_table  [NUM_BLOCKS, INT32_ELEMS_PER_STICK] int32, page index in col 0
         mask_tiles        NUM_BLOCKS additive tiles of [Q_LEN, BLOCK_SIZE]
-        entry_index_table [NUM_BLOCKS, ENTRIES, 1] int32 row-block indices, for FOLD
+        entry_index_table one [ENTRIES, 1] int32 row-block index per block, for FOLD
+        kv_index_table    one [KV_HEADS, 1] int32 (page, kv) index per block
+
+    The index tables are lists, not one tensor sliced per block: an index tensor
+    reaches the hardware as a real tensor argument, so a per-block slice's nonzero
+    storage offset is dropped and every block gathers block 0's rows
+    (torch-spyre#3770). page_index_table survives being sliced only because it is
+    padded to INT32_ELEMS_PER_STICK, which makes each row stick-aligned.
 
     NUM_BLOCKS and Q_LEN are module-level constants, so Dynamo unrolls the loop.
     """
@@ -421,9 +428,12 @@ def build_attn_args(k_dev: torch.Tensor, v_dev: torch.Tensor):
     # Row-block indices for the folded gather, built on the host: entry e of
     # block i is row-block page_table[i] * ENTRIES + e. Trailing size-1 axis so
     # the entry variable is not the index's stick axis.
-    entry_table = (
-        page_table[:, 0:1] * ENTRIES + torch.arange(ENTRIES, dtype=torch.int32)
-    ).reshape(NUM_BLOCKS, ENTRIES, 1)
+    entry_table = [
+        (page_table[i, 0] * ENTRIES + torch.arange(ENTRIES, dtype=torch.int32))
+        .reshape(ENTRIES, 1)
+        .contiguous()
+        for i in range(NUM_BLOCKS)
+    ]
     # In "heads" mode a group's index lists its NUM_HEADS-space head ids
     # (head = kv * QPK + g); otherwise it is just the group number.
     group_index_list = [
@@ -434,9 +444,12 @@ def build_attn_args(k_dev: torch.Tensor, v_dev: torch.Tensor):
         for g in range(QPK)
     ]
     # (page, kv) entries for the transposed K cache, one per kv head.
-    kv_table = (
-        page_table[:, 0:1] * KV_HEADS + torch.arange(KV_HEADS, dtype=torch.int32)
-    ).reshape(NUM_BLOCKS, KV_HEADS, 1)
+    kv_table = [
+        (page_table[i, 0] * KV_HEADS + torch.arange(KV_HEADS, dtype=torch.int32))
+        .reshape(KV_HEADS, 1)
+        .contiguous()
+        for i in range(NUM_BLOCKS)
+    ]
 
     dev_args = [
         query.to("spyre"),
@@ -445,9 +458,9 @@ def build_attn_args(k_dev: torch.Tensor, v_dev: torch.Tensor):
         v_dev,
         page_table.to("spyre"),
         [m.to("spyre") for m in masks],
-        entry_table.to("spyre"),
+        [t.to("spyre") for t in entry_table],
         [gi.to("spyre") for gi in group_index_list],
-        kv_table.to("spyre"),
+        [t.to("spyre") for t in kv_table],
     ]
     cpu_args = [
         query.float(),
