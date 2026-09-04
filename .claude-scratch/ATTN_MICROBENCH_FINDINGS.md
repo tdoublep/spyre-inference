@@ -143,7 +143,38 @@ On the read path it makes no measurable difference — `on-nogate` (flag on, gat
 
 All within the baseline error bar. The folded frame alone delivers the entire kernel-level
 win. This is consistent with the earlier finding that LX relayout saw zero acceptances in
-decode. #4153 may still matter for the *store* path, which this benchmark does not touch.
+decode.
+
+**Confirmed end to end** (`ab_gate.sh`, `ab_gate_rev.sh`), which closes the store-path and
+prefill gap the read-path benchmark left open, since these legs compile the whole model:
+
+| ordering | gate on | gate off |
+|---|---|---|
+| pair 1, gate on first | 16.635 s | 16.473 s |
+| pair 2, gate off first | 16.464 s | 16.518 s |
+| **pooled mean** | **16.550 s** | **16.496 s** |
+
+The pooled gap is 0.33%, inside the 0.43% baseline spread. The reversed pair is what makes
+this readable: pair 1 alone looked like a 0.98% *win for disabling* the gate, but in both
+pairs the faster leg is whichever ran second, so that gap tracked position, not the gate.
+`gate_on` also reproduces the recorded on leg (16.635 vs 16.597 s), so nothing drifted
+between sessions.
+
+**Verdict: the LX KV layout does not need #4153.** The hand-off's "the LX win rides on
+this" does not hold. The PR may still matter elsewhere, but not for this feature.
+
+Not established: the *mechanism*. `gate_count.sh` was meant to count how many buffers the
+local-read proof un-bars, but it emitted no `spyre.inductor.scratchpad.allocator` records
+at all under `VLLM_LOGGING_LEVEL=DEBUG` -- not even the WARNING that appears in ordinary
+runs -- so its zeros are an instrumentation failure, not evidence. Counting them needs a
+mechanism that does not route through vLLM's logging config. Ruled out along the way: a
+warm compile cache making all four legs load one binary, which would have made the table
+above vacuous. 17k+ files were written under `torchinductor_*/inductor-spyre` during the
+legs, so each leg really did compile and the gate really did have the chance to act.
+
+Its second leg also hit a hardware fault -- RAS `0xa35e` "PCIe bus master fence" -- and
+died with `EngineDeadError`. All four timing legs are RAS-clean, the fault came after them,
+and `aiu-query-devices` shows all 4 AIUs back with full memory, so the results above stand.
 
 ### The 8-core cap is an optimisation, not a ceiling
 
