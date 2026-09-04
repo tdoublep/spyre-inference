@@ -4,3 +4,6 @@ probe_*/
 lx_residency_*/
 ab/
 ab-main/
+# The gate A/B's raw vllm logs are tens of KB each; the result JSONs next to them are
+# small and worth keeping, so only the logs are excluded.
+ab_gate/*.log
