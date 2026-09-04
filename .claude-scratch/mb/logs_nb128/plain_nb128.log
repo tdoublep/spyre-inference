@@ -1,0 +1,142 @@
+INFO 09-04 10:34:49 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 09-04 10:34:49 [__init__.py:54] - spyre_inference -> spyre_inference:register
+INFO 09-04 10:34:49 [__init__.py:66] Loading plugin spyre_inference
+INFO 09-04 10:34:49 [__init__.py:254] Platform plugin spyre_inference is activated
+
+Spyre attention micro-benchmark  [2026-09-04_10-34-49]
+  model      : granite-3.3-8b-instruct
+  shape      : q_heads=32 kv_heads=8 head_size=128 block_size=[128] dtype=torch.float16
+  span       : spyre_attn::online_softmax
+  variants   : ['online_softmax_compiled']
+  shapes     : 4
+  iterations : 10 (warmup 2)
+  output     : /home/senuser/spyre-inference/.claude/worktrees/lx-kpage-land/.claude-scratch/mb/results_nb128/plain_nb128/granite33_8b_decode_ctx512plus_nb128/2026-09-04_10-34-49
+
+INFO 09-04 10:34:52 [importing.py:88] Triton not installed or not compatible; certain GPU-related functions will not be available.
+INFO 09-04 10:34:53 [__init__.py:39] Registering custom ops for spyre_inference
+INFO 09-04 10:34:53 [fp8_linear_kernel.py:300] Registered SpyreFp8LinearKernel for PlatformEnum.OOT (aten._scaled_mm)
+INFO 09-04 10:34:54 [model.py:672] Resolved architecture: Qwen3ForCausalLM
+WARNING 09-04 10:34:54 [model.py:2299] Casting torch.bfloat16 to torch.float16.
+INFO 09-04 10:34:54 [model.py:1965] Using max model len 2048
+INFO 09-04 10:34:54 [scheduler.py:242] Chunked prefill is enabled with max_num_batched_tokens=2048.
+WARNING 09-04 10:34:54 [vllm.py:1354] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+WARNING 09-04 10:34:54 [platform.py:286] Capping max_num_batched_tokens to 512 
+INFO 09-04 10:34:54 [kernel.py:308] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+INFO 09-04 10:34:54 [vllm.py:1422] Cudagraph mode FULL_AND_PIECEWISE is not compatible with compilation mode 1.Overriding to NONE.
+
+    [91m▄█▀▀█▄[0m  [38;5;208m█▀▀▀█▄[0m  [93m█   █[0m  [92m█▀▀▀█▄[0m  [94m█▀▀▀▀[0m    [97;1m█  █▄   █  █▀▀▀▀ █▀▀▀▀  █▀▀▀█▄ █▀▀▀▀  █▄   █  ▄█▀▀█▄ █▀▀▀▀[0m
+    [91m▀▀▄▄▄[0m   [38;5;208m█▄▄▄█▀[0m  [93m▀▄ ▄▀[0m  [92m█▄▄▄█▀[0m  [94m█▄▄▄[0m     [97;1m█  █ █  █  █▄▄▄  █▄▄▄   █▄▄▄█▀ █▄▄▄   █ █  █  █      █▄▄▄[0m
+         [91m█[0m  [38;5;208m█[0m        [93m▀█▀[0m   [92m█ ▀█▄[0m   [94m█[0m        [97;1m█  █  █ █  █     █      █ ▀█▄  █      █  █ █  █      █[0m
+    [91m▀▄▄▄█▀[0m  [38;5;208m█[0m         [93m█[0m    [92m█   ▀█[0m  [94m█▄▄▄▄[0m    [97;1m█  █   ▀█  █     █▄▄▄▄  █   ▀█ █▄▄▄▄  █   ▀█  ▀█▄▄█▀ █▄▄▄▄[0m
+
+    version [97;1m0.1.dev387[0m    model [97;1mQwen/Qwen3-0.6B[0m
+
+WARNING 09-04 10:34:54 [platform.py:469] Block size must be a multiple of 64 for the Spyre paged attention backend. Overriding block_size from 16 to 64.
+INFO 09-04 10:34:54 [threading_config.py:92] Initial threading configuration: OMP_NUM_THREADS=192 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=None VECLIB_MAXIMUM_THREADS=None
+INFO 09-04 10:34:54 [threading_config.py:119] SPYRE_NUM_CPUS is set to 8. Setting each threading configuration to 8 for 1 worker(s) (SPYRE_UPDATE_THREAD_CONFIG enabled).
+INFO 09-04 10:34:54 [platform.py:507] Loading worker from: spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker
+INFO 09-04 10:34:54 [platform.py:516] Loading scheduler from: vllm.v1.core.sched.scheduler.Scheduler
+WARNING 09-04 10:34:54 [cpu.py:163] Reset SSM cache type to float32 for AMX mamba attention.
+INFO 09-04 10:34:54 [platform.py:554] Setting num_gpu_blocks_override=2049 (128 seqs × 16 blocks/seq + 1 null block)
+WARNING 09-04 10:34:54 [vllm.py:652] Model Runner V2 requires Triton; using the V1 model runner instead.
+INFO 09-04 10:34:54 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+[WARNING] [spyre.inductor.scratchpad.allocator] LX relayout is not supported by _make_cpsat_solver; continuing without relayout
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+[W904 10:35:14.351198160 collection.cpp:1074] Warning: Detected an event which was likely passed to kineto by the PyTorch profiler, but is not present in the set of known events: [memory] This most likely means that Kineto has not maintained address stability for this event. Please report this to the PyTorch team. (function operator())
+  [guard] profiler active; 'spyre_attn::online_softmax' device time = 7255.7us
+
+  online_softmax_compiled    bs=128  decode_ctx512            nreqs=1 q=1 kv=512
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:14 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:15 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:15 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:15 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:15 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:15 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+    -> 7225.5us device (min=7211.2, max=7247.9) mem=0.3%  cpu=0.46ms  max_diff=0.00122
+  online_softmax_compiled    bs=128  decode_ctx2048           nreqs=1 q=1 kv=2048
+[WARNING] [spyre.inductor.scratchpad.allocator] LX relayout is not supported by _make_cpsat_solver; continuing without relayout
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:35:40 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+    -> 28934.7us device (min=28844.8, max=28963.8) mem=0.2%  cpu=0.55ms  max_diff=0.000595
+  online_softmax_compiled    bs=128  decode_ctx3200           nreqs=1 q=1 kv=3200
+[WARNING] [spyre.inductor.scratchpad.allocator] LX relayout is not supported by _make_cpsat_solver; continuing without relayout
+USDT:2026-09-04 10:36:19 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:36:19 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:36:19 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:36:19 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:36:19 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:36:19 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:36:19 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:36:19 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:36:19 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:36:19 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:36:19 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:36:19 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:36:19 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:36:20 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:36:20 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:36:20 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:36:20 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:36:20 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:36:20 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:36:20 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+    -> 46889.2us device (min=46816.5, max=47000.0) mem=0.2%  cpu=0.65ms  max_diff=0.000549
+  online_softmax_compiled    bs=128  decode_ctx8192           nreqs=1 q=1 kv=8192
+[WARNING] [spyre.inductor.scratchpad.allocator] LX relayout is not supported by _make_cpsat_solver; continuing without relayout
+USDT:2026-09-04 10:39:13 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:39:13 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:39:13 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:39:13 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:39:13 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:39:13 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:39:13 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:39:13 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:39:13 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:39:13 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:39:13 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:39:14 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:39:14 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:39:14 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:39:14 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:39:14 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:39:14 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:39:14 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:39:14 515867:515867 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:39:14 515867:515867 SyncActivityProfilerHandler.cpp:59] profiler_stop
+    -> 115836.7us device (min=115620.0, max=115927.0) mem=0.2%  cpu=0.89ms  max_diff=0.000549
+
+Done. 4 measurements -> /home/senuser/spyre-inference/.claude/worktrees/lx-kpage-land/.claude-scratch/mb/results_nb128/plain_nb128/granite33_8b_decode_ctx512plus_nb128/2026-09-04_10-34-49
+  measured 4/4; correctness pass 4/4

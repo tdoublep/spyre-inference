@@ -1,0 +1,99 @@
+---- IBM AIU Device Discovery... (Using provided cache)
+---- IBM AIU Environment Setup... (Generate environment from existing config)
+---- IBM AIU Device Access: PF (config)
+---- IBM AIU Devices Found: 4
+------------------------
+=== leg=on-32core checkout=/home/senuser/spyre-inference/.claude/worktrees/lx-kpage-land span=online_softmax kv_layout=folded ===
+SPYRE_ATTN_MAX_CORES=32
+SPYRE_ATTN_PROFILING=1
+SPYRE_COMMS_INSTALL_DIR=/home/senuser/spyre-libs/opt/ibm/spyre/spyre-comms
+SPYRE_LX_KV_LAYOUT=1
+SPYRE_LX_RESTICKIFY_RESIDENCY=1
+SPYRE_NUM_CPUS=8
+
+INFO 09-04 10:05:10 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 09-04 10:05:10 [__init__.py:54] - spyre_inference -> spyre_inference:register
+INFO 09-04 10:05:10 [__init__.py:66] Loading plugin spyre_inference
+INFO 09-04 10:05:10 [__init__.py:254] Platform plugin spyre_inference is activated
+
+Spyre attention micro-benchmark  [2026-09-04_10-05-10]
+  model      : granite-3.3-8b-instruct
+  shape      : q_heads=32 kv_heads=8 head_size=128 block_size=[128] dtype=torch.float16
+  span       : spyre_attn::online_softmax
+  variants   : ['online_softmax_compiled']
+  shapes     : 6
+  iterations : 10 (warmup 2)
+  output     : /home/senuser/spyre-inference/.claude/worktrees/lx-kpage-land/.claude-scratch/mb/results2/on-32core_online_softmax/granite33_8b_decode_ctx512plus/2026-09-04_10-05-10
+
+INFO 09-04 10:05:13 [importing.py:88] Triton not installed or not compatible; certain GPU-related functions will not be available.
+INFO 09-04 10:05:13 [__init__.py:39] Registering custom ops for spyre_inference
+INFO 09-04 10:05:13 [fp8_linear_kernel.py:300] Registered SpyreFp8LinearKernel for PlatformEnum.OOT (aten._scaled_mm)
+INFO 09-04 10:05:15 [model.py:672] Resolved architecture: Qwen3ForCausalLM
+WARNING 09-04 10:05:15 [model.py:2299] Casting torch.bfloat16 to torch.float16.
+INFO 09-04 10:05:15 [model.py:1965] Using max model len 2048
+INFO 09-04 10:05:15 [scheduler.py:242] Chunked prefill is enabled with max_num_batched_tokens=2048.
+WARNING 09-04 10:05:15 [vllm.py:1354] Inductor compilation was disabled by user settings, optimizations settings that are only active during inductor compilation will be ignored.
+WARNING 09-04 10:05:15 [platform.py:286] Capping max_num_batched_tokens to 512 
+INFO 09-04 10:05:15 [kernel.py:308] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+INFO 09-04 10:05:15 [vllm.py:1422] Cudagraph mode FULL_AND_PIECEWISE is not compatible with compilation mode 1.Overriding to NONE.
+
+    [91m▄█▀▀█▄[0m  [38;5;208m█▀▀▀█▄[0m  [93m█   █[0m  [92m█▀▀▀█▄[0m  [94m█▀▀▀▀[0m    [97;1m█  █▄   █  █▀▀▀▀ █▀▀▀▀  █▀▀▀█▄ █▀▀▀▀  █▄   █  ▄█▀▀█▄ █▀▀▀▀[0m
+    [91m▀▀▄▄▄[0m   [38;5;208m█▄▄▄█▀[0m  [93m▀▄ ▄▀[0m  [92m█▄▄▄█▀[0m  [94m█▄▄▄[0m     [97;1m█  █ █  █  █▄▄▄  █▄▄▄   █▄▄▄█▀ █▄▄▄   █ █  █  █      █▄▄▄[0m
+         [91m█[0m  [38;5;208m█[0m        [93m▀█▀[0m   [92m█ ▀█▄[0m   [94m█[0m        [97;1m█  █  █ █  █     █      █ ▀█▄  █      █  █ █  █      █[0m
+    [91m▀▄▄▄█▀[0m  [38;5;208m█[0m         [93m█[0m    [92m█   ▀█[0m  [94m█▄▄▄▄[0m    [97;1m█  █   ▀█  █     █▄▄▄▄  █   ▀█ █▄▄▄▄  █   ▀█  ▀█▄▄█▀ █▄▄▄▄[0m
+
+    version [97;1m0.1.dev387[0m    model [97;1mQwen/Qwen3-0.6B[0m
+
+WARNING 09-04 10:05:15 [platform.py:469] Block size must be a multiple of 64 for the Spyre paged attention backend. Overriding block_size from 16 to 64.
+INFO 09-04 10:05:15 [threading_config.py:92] Initial threading configuration: OMP_NUM_THREADS=192 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 NUMEXPR_NUM_THREADS=None VECLIB_MAXIMUM_THREADS=None
+INFO 09-04 10:05:15 [threading_config.py:119] SPYRE_NUM_CPUS is set to 8. Setting each threading configuration to 8 for 1 worker(s) (SPYRE_UPDATE_THREAD_CONFIG enabled).
+INFO 09-04 10:05:15 [platform.py:507] Loading worker from: spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker
+INFO 09-04 10:05:15 [platform.py:516] Loading scheduler from: vllm.v1.core.sched.scheduler.Scheduler
+WARNING 09-04 10:05:15 [cpu.py:163] Reset SSM cache type to float32 for AMX mamba attention.
+INFO 09-04 10:05:15 [platform.py:561] Setting num_gpu_blocks_override=2049 (128 seqs × 16 blocks/seq + 1 null block)
+WARNING 09-04 10:05:15 [vllm.py:652] Model Runner V2 requires Triton; using the V1 model runner instead.
+INFO 09-04 10:05:15 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:59] profiler_stop
+[W904 10:05:31.157404589 collection.cpp:1074] Warning: Detected an event which was likely passed to kineto by the PyTorch profiler, but is not present in the set of known events: [memory] This most likely means that Kineto has not maintained address stability for this event. Please report this to the PyTorch team. (function operator())
+  [guard] profiler active; 'spyre_attn::online_softmax' device time = 771.1us
+
+  online_softmax_compiled    bs=128  decode_ctx512            nreqs=1 q=1 kv=512
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:59] profiler_stop
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:52] profiler_start
+USDT:2026-09-04 10:05:31 507244:507244 SyncActivityProfilerHandler.cpp:59] profiler_stop
+    -> 770.0us device (min=767.8, max=771.5) mem=3.0%  cpu=0.42ms  max_diff=0.00177
+  online_softmax_compiled    bs=128  decode_ctx1024           nreqs=1 q=1 kv=1024
+Signal Received: 15 (Terminated)
+Signal Received from pid=482091 
+*** BACKTRACE ***
+Signal Received: 15 (Terminated)
+Signal Received from pid=482091 
+*** BACKTRACE ***
+/home/senuser/spyre-libs/opt/ibm/spyre/senlib/lib/libsenlib-dd2.so(+0x47681f)[0x7fed4edad81f]
+/lib64/libc.so.6(+0x411c0)[0x7fed7ce481c0]
+/lib64/libc.so.6(epoll_wait+0x56)[0x7fed7cf0d876]
+/home/senuser/spyre-libs/opt/ibm/spyre/senlib/lib/libsenlib-dd2.so(_ZN6senlib2v216InterruptMonitor4WaitEi+0x50)[0x7fed4fda5210]
+/home/senuser/spyre-libs/opt/ibm/spyre/senlib/lib/libsenlib-dd2.so(_ZN6senlib2v212vfio_backend10IrqMonitorEv+0x20e)[0x7fed4fdb2a1e]
+/home/senuser/spyre-libs/opt/ibm/spyre/senlib/lib/libsenlib-dd2.so(+0x47681f)[0x7fed4edad81f]
+/lib64/libstdc++.so.6(+0xee0e4)[0x7fed7a6830e4]
+/lib64/libc.so.6(+0x958bf)[0x7fed7ce9c8bf]
+/lib64/libc.so.6(__clone+0x44)[0x7fed7cf0d264]
+*****************

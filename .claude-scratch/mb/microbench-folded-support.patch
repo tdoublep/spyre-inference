@@ -1,0 +1,293 @@
+diff --git a/scripts/microbench/configs/granite33_8b_decode_ctx512plus.json b/scripts/microbench/configs/granite33_8b_decode_ctx512plus.json
+new file mode 100644
+index 0000000..b0372a1
+--- /dev/null
++++ b/scripts/microbench/configs/granite33_8b_decode_ctx512plus.json
+@@ -0,0 +1,64 @@
++{
++  "run_label": "granite33_8b_decode_ctx512plus",
++  "model": "granite-3.3-8b-instruct",
++  "num_query_heads": 32,
++  "num_kv_heads": 8,
++  "head_size": 128,
++  "block_size": 128,
++  "num_blocks": 64,
++  "seed": 0,
++  "warmup": 2,
++  "iterations": 10,
++  "atol": 0.3,
++  "rtol": 0.2,
++  "variants": [
++    "online_softmax_compiled"
++  ],
++  "capture_batches": [
++    {
++      "name": "decode_ctx512",
++      "capture_type": "decode",
++      "query_lens": [1],
++      "seq_lens": [512],
++      "extra_cols": {"seqlen": 512, "decode_share": 1.0}
++    },
++    {
++      "name": "decode_ctx1024",
++      "capture_type": "decode",
++      "query_lens": [1],
++      "seq_lens": [1024],
++      "extra_cols": {"seqlen": 1024, "decode_share": 1.0}
++    },
++    {
++      "name": "decode_ctx2048",
++      "capture_type": "decode",
++      "query_lens": [1],
++      "seq_lens": [2048],
++      "extra_cols": {"seqlen": 2048, "decode_share": 1.0}
++    },
++    {
++      "name": "decode_ctx3200",
++      "capture_type": "decode",
++      "query_lens": [1],
++      "seq_lens": [3200],
++      "extra_cols": {"seqlen": 3200, "decode_share": 1.0}
++    },
++    {
++      "name": "decode_ctx4096",
++      "capture_type": "decode",
++      "query_lens": [1],
++      "seq_lens": [4096],
++      "extra_cols": {"seqlen": 4096, "decode_share": 1.0}
++    },
++    {
++      "name": "decode_ctx8192",
++      "capture_type": "decode",
++      "query_lens": [1],
++      "seq_lens": [8192],
++      "extra_cols": {"seqlen": 8192, "decode_share": 1.0}
++    }
++  ],
++  "block_sizes": [
++    128
++  ]
++}
+diff --git a/scripts/microbench/configs/granite33_8b_decode_ctx512plus_nb128.json b/scripts/microbench/configs/granite33_8b_decode_ctx512plus_nb128.json
+new file mode 100644
+index 0000000..455867b
+--- /dev/null
++++ b/scripts/microbench/configs/granite33_8b_decode_ctx512plus_nb128.json
+@@ -0,0 +1,50 @@
++{
++  "run_label": "granite33_8b_decode_ctx512plus_nb128",
++  "model": "granite-3.3-8b-instruct",
++  "num_query_heads": 32,
++  "num_kv_heads": 8,
++  "head_size": 128,
++  "block_size": 128,
++  "num_blocks": 128,
++  "seed": 0,
++  "warmup": 2,
++  "iterations": 10,
++  "atol": 0.3,
++  "rtol": 0.2,
++  "variants": [
++    "online_softmax_compiled"
++  ],
++  "capture_batches": [
++    {
++      "name": "decode_ctx512",
++      "capture_type": "decode",
++      "query_lens": [1],
++      "seq_lens": [512],
++      "extra_cols": {"seqlen": 512, "decode_share": 1.0}
++    },
++    {
++      "name": "decode_ctx2048",
++      "capture_type": "decode",
++      "query_lens": [1],
++      "seq_lens": [2048],
++      "extra_cols": {"seqlen": 2048, "decode_share": 1.0}
++    },
++    {
++      "name": "decode_ctx3200",
++      "capture_type": "decode",
++      "query_lens": [1],
++      "seq_lens": [3200],
++      "extra_cols": {"seqlen": 3200, "decode_share": 1.0}
++    },
++    {
++      "name": "decode_ctx8192",
++      "capture_type": "decode",
++      "query_lens": [1],
++      "seq_lens": [8192],
++      "extra_cols": {"seqlen": 8192, "decode_share": 1.0}
++    }
++  ],
++  "block_sizes": [
++    128
++  ]
++}
+diff --git a/scripts/microbench/configs/granite33_8b_decode_smoke.json b/scripts/microbench/configs/granite33_8b_decode_smoke.json
+new file mode 100644
+index 0000000..622b1f4
+--- /dev/null
++++ b/scripts/microbench/configs/granite33_8b_decode_smoke.json
+@@ -0,0 +1,29 @@
++{
++  "run_label": "granite33_8b_decode_smoke",
++  "model": "granite-3.3-8b-instruct",
++  "num_query_heads": 32,
++  "num_kv_heads": 8,
++  "head_size": 128,
++  "block_size": 128,
++  "num_blocks": 64,
++  "seed": 0,
++  "warmup": 2,
++  "iterations": 5,
++  "atol": 0.3,
++  "rtol": 0.2,
++  "variants": [
++    "online_softmax_compiled"
++  ],
++  "capture_batches": [
++    {
++      "name": "decode_ctx512",
++      "capture_type": "decode",
++      "query_lens": [1],
++      "seq_lens": [512],
++      "extra_cols": {"seqlen": 512, "decode_share": 1.0}
++    }
++  ],
++  "block_sizes": [
++    128
++  ]
++}
+diff --git a/scripts/microbench/spyre_attn_microbench.py b/scripts/microbench/spyre_attn_microbench.py
+index b7a43c2..17e0d06 100644
+--- a/scripts/microbench/spyre_attn_microbench.py
++++ b/scripts/microbench/spyre_attn_microbench.py
+@@ -225,7 +225,20 @@ def build_inputs_from_requests(
+     k_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=DTYPE)
+     v_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=DTYPE)
+ 
+-    block_tables = torch.randint(0, num_blocks, (num_seqs, blocks_per_seq), dtype=torch.int32)
++    # Distinct physical pages wherever the cache is big enough to supply them. Sampling
++    # with replacement aliases logical blocks onto one page -- harmless for correctness,
++    # since the reference reads the same table, but the page reuse it creates grows with
++    # context (at 64 draws from 64 blocks only ~41 pages are distinct) and flatters a
++    # residency-sensitive layout exactly where the win is being claimed.
++    total_pages = num_seqs * blocks_per_seq
++    if total_pages <= num_blocks:
++        block_tables = (
++            torch.randperm(num_blocks)[:total_pages].to(torch.int32).reshape(num_seqs, -1)
++        )
++    else:
++        block_tables = torch.randint(
++            0, num_blocks, (num_seqs, blocks_per_seq), dtype=torch.int32
++        )
+ 
+     slot_mapping = []
+     hist_k, hist_v, hist_slots = [], [], []
+@@ -275,6 +288,22 @@ def build_inputs_from_requests(
+         if cache_device.type != "spyre" or kv_layout == "plain":
+             return cache.to(cache_device)
+         nb, bsz, h, d = cache.shape
++        if kv_layout == "folded":
++            # Imported here, not at the top: baseline checkouts predating the folded
++            # frame have no head_major_kv_layout, and they only ever ask for 'plain'.
++            from spyre_inference.v1.attention.backends.spyre_attn import (
++                head_major_kv_layout,
++            )
++
++            # SPYRE_LX_KV_LAYOUT's frame: [num_blocks * num_kv_heads, block_size,
++            # head_size], row = page * num_kv_heads + kv_head, which is the index
++            # _mirror_lx_index_tables gathers with. Folding on the host is why this is
++            # trivial here; no device-side reshape to this frame lowers.
++            folded = cache.permute(0, 2, 1, 3).contiguous().reshape(nb * h, bsz, d)
++            return folded.to(
++                cache_device,
++                device_layout=head_major_kv_layout(nb * h, bsz, d, cache.dtype),
++            )
+         layout = slot_major_kv_layout(nb * bsz, h, d, cache.dtype)
+         if kv_layout == "slot_major":
+             return cache.to(cache_device, device_layout=layout)
+@@ -308,9 +337,25 @@ def build_inputs_from_requests(
+         "query_lens": list(query_lens),
+         "seq_lens": list(seq_lens),
+         "total_query_tokens": total_q,
++        "kv_fold": (num_blocks, num_kv_heads) if kv_layout == "folded" else None,
+     }
+ 
+ 
++def ref_pages(inputs, key):
++    """Device pages in the reference's [num_blocks, block_size, num_kv_heads, head_size]
++    frame. Reading back from the device rather than using the host copy is deliberate:
++    under a non-plain layout the on-device contents are what the kernel actually read.
++    """
++    pages = inputs[key].to("cpu")
++    fold = inputs.get("kv_fold")
++    if fold is None:
++        return pages
++    num_blocks, num_kv_heads = fold
++    return pages.reshape(num_blocks, num_kv_heads, pages.shape[1], pages.shape[2]).permute(
++        0, 2, 1, 3
++    )
++
++
+ def grid_to_requests(
+     batch_size, seqlen, decode_share, partial_prefill_share, prompt_pattern, block_size
+ ):
+@@ -555,8 +600,8 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
+         got = output.to("cpu").float()
+         ref = ref_attn(
+             inputs["query_cpu"],
+-            inputs["k_pages"].to("cpu"),
+-            inputs["v_pages"].to("cpu"),
++            ref_pages(inputs, "k_pages"),
++            ref_pages(inputs, "v_pages"),
+             inputs["query_lens"],
+             inputs["seq_lens"],
+             inputs["block_tables"],
+@@ -689,13 +734,15 @@ def main():
+     ap.add_argument("--device", default=None)
+     ap.add_argument(
+         "--kv-layout",
+-        choices=["plain", "slot_major", "slot_major_devfill"],
++        choices=["plain", "slot_major", "slot_major_devfill", "folded"],
+         default=None,
+         help="KV page device layout. 'plain' (default) is correct for a "
+         "host-populated cache. 'slot_major_devfill' matches the "
+         "worker: zeroed slot-major alloc, history written on device. "
+         "'slot_major' pins the worker layout on a host-populated "
+-        "cache and is numerically wrong; kept to reproduce that.",
++        "cache and is numerically wrong; kept to reproduce that. "
++        "'folded' is the SPYRE_LX_KV_LAYOUT (page, kv_head) frame and has to be "
++        "paired with SPYRE_LX_KV_LAYOUT=1.",
+     )
+     ap.add_argument(
+         "--span",
+@@ -724,6 +771,18 @@ def main():
+     cfg["stop_on_failure"] = args.stop_on_failure
+     cfg.setdefault("device", "spyre")
+ 
++    from spyre_inference import envs
++
++    # The impl reads the flag at construction and the cache frame has to match it, so a
++    # half-set pair produces a plausible-looking number for the wrong configuration.
++    # A checkout predating the folded frame has no such knob, hence the default.
++    lx_flag = getattr(envs, "SPYRE_LX_KV_LAYOUT", False)
++    if lx_flag != (cfg.get("kv_layout") == "folded"):
++        raise SystemExit(
++            "SPYRE_LX_KV_LAYOUT=1 and --kv-layout folded must be set together; got "
++            f"SPYRE_LX_KV_LAYOUT={lx_flag}, kv_layout={cfg.get('kv_layout')!r}"
++        )
++
+     variants = [v for v in cfg["variants"] if VARIANT_REGISTRY[v]["available"]()]
+     if not variants:
+         raise SystemExit("no available variants")
+@@ -781,6 +840,8 @@ def main():
+             cfg["block_size"],
+             cfg["num_blocks"],
+             cfg["device"],
++            seed=cfg.get("seed", 0),
++            kv_layout=cfg.get("kv_layout", "plain"),
+         )
+         probe_run, _ = make_forward(
+             probe_inputs, cfg["num_query_heads"], cfg["num_kv_heads"], cfg["head_size"]
