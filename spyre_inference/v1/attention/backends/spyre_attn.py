@@ -256,6 +256,33 @@ def _mirror_mask_tiles(
 # ---------------------------------------------------------------------------
 
 
+_TILE_SIGS: set[tuple] = set()
+
+
+def _log_tile_sig(where: str, tile: torch.Tensor, extra: str = "") -> None:
+    """One line per distinct mask-tile shape/stride/offset, under SPYRE_COMPILE_PROBE.
+
+    A recorded variant is only reachable if dispatch presents the same tile
+    stride and offset, and a mismatch is otherwise invisible -- it shows up as an
+    unexplained recompile. Compare RECORD against DISPATCH.
+    """
+    if not envs.SPYRE_COMPILE_PROBE:
+        return
+    sig = (where, tuple(tile.shape), tuple(tile.stride()), tile.storage_offset(), extra)
+    if sig in _TILE_SIGS:
+        return
+    _TILE_SIGS.add(sig)
+    logger.warning(
+        "TILE SIG %s: shape=%s stride=%s offset=%d contig=%s %s",
+        where,
+        tuple(tile.shape),
+        tuple(tile.stride()),
+        tile.storage_offset(),
+        tile.is_contiguous(),
+        extra,
+    )
+
+
 def _stick_aligned_len(n: int) -> int:
     """Round n up to a whole number of int32 sticks (see INT32_ELEMS_PER_STICK)."""
     return (n + INT32_ELEMS_PER_STICK - 1) // INT32_ELEMS_PER_STICK * INT32_ELEMS_PER_STICK
@@ -1027,7 +1054,17 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     col_start = b * block_size
                     col_end = col_start + block_size
                     tile = mask_cpu[s, :aligned_max_query_len, col_start:col_end]
-                    seq_tiles.append(tile.contiguous())
+                    # NOT .contiguous(): at aligned_max_query_len == 1 the slice
+                    # already reports contiguous (the stride of a size-1 dim does
+                    # not affect contiguity), so .contiguous() is a no-op and the
+                    # tile keeps stride(0) == mask_kv_width plus a per-block
+                    # storage offset. That stride varies with the batch's block
+                    # count, so it never matches the recorded variant's
+                    # stride(0) == block_size, and a nonzero offset reaching a
+                    # compiled kernel is torch-spyre#3770. Force a dense copy.
+                    tile = tile.clone(memory_format=torch.contiguous_format)
+                    _log_tile_sig("BUILD_CPU", tile, f"kv_width={mask_kv_width}")
+                    seq_tiles.append(tile)
                 attention_mask_tiles.append(seq_tiles)
             # active_block_indices stays None, so forward iterates all blocks.
         else:
@@ -1615,6 +1652,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             convert(torch.zeros(q_len, block_size, dtype=self.model_dtype), device=device)
             for _ in range(bucket.num_blocks)
         ]
+        _log_tile_sig("RECORD", mask_tiles[0], f"q_len={q_len} nblocks={bucket.num_blocks}")
 
         alibi_bias_tiles = None
         if self.alibi_slopes is not None:
@@ -1861,6 +1899,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             mask_tiles = mask_tiles_all[seq_idx][: len(active_bs)]
             # A short slice here would silently hand the kernel a wrong shape.
             assert len(mask_tiles) == len(active_bs)
+            _log_tile_sig(
+                "DISPATCH",
+                mask_tiles[0],
+                f"aligned={aligned_max_query_len} nblocks={len(active_bs)}",
+            )
 
             # ALiBi bias tiles: slope[h] * (kv_pos - context_len), one per block.
             #
