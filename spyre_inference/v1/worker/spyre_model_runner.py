@@ -84,6 +84,7 @@ from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
     SpyrePagedKVCache,
+    allocate_staging_buffers,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 from spyre_inference.v1.pool import (
@@ -627,7 +628,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
         is_pooling = self.model_config.runner_type == "pooling"
-        self._allocate_attention_staging()
+        # Before the first trace: see allocate_staging_buffers.
+        allocate_staging_buffers(self.compilation_config.static_forward_context, self._spyre_device)
 
         if is_pooling and not self.vllm_config.model_config.enforce_eager:
             logger.info("Warming up model...")
@@ -678,19 +680,6 @@ class TorchSpyreModelRunner(GPUModelRunner):
             len(bucket_sizes),
         )
         self._record_attention_graphs(bucket_sizes)
-
-    def _allocate_attention_staging(self) -> None:
-        """Allocate the attention staging buffers before anything is traced.
-
-        ``attn_layer`` reaches them from inside the block graph, so a lazy
-        ``self._staging is None`` check becomes one of that graph's guards: it is
-        True while warmup compiles and False once serving starts, which
-        recompiles every block. Allocating up front keeps it constant.
-        """
-        for layer in self.compilation_config.static_forward_context.values():
-            impl = getattr(layer, "impl", None)
-            if isinstance(impl, SpyreAttentionImpl):
-                impl.staging_buffers(self._spyre_device)
 
     @torch.inference_mode()
     def _record_attention_graphs(self, token_counts: list[int]) -> None:

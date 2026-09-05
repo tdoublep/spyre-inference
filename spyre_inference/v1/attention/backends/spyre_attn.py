@@ -1526,10 +1526,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         q_len = bucket.padded_query_len
         attn_fn = self._get_attn_fn(bucket.num_blocks, q_len)
 
-        # The real staging buffers, not fabricated ones: dispatch passes these, and
-        # Dynamo guards their dtype, shape, stride, storage offset, device layout
-        # and dispatch key set. A same-shaped fresh allocation matches the first
-        # four and differs on the last two, which is enough to miss every variant.
+        # Trace on the buffers dispatch passes: Dynamo also guards device layout and
+        # dispatch key set, which a same-shaped fresh allocation would not match.
         q_staging, out_staging = self._staging_buffers(device)
         query = q_staging
 
@@ -1543,6 +1541,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             torch.zeros(bucket.num_blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32),
             device=device,
         )
+
         # All-zero additive tiles: values are irrelevant to tracing, and zero is
         # the one choice that cannot leave a row fully masked (which would make
         # tile_sum 0 and attn NaN).
@@ -1718,9 +1717,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         padded_num_blocks = attn_metadata.padded_num_blocks
         aligned_max_query_len = attn_metadata.aligned_max_query_len
         page_index_tables = attn_metadata.page_index_tables
-        # Folds the per-layer eager slice-assign into the attention jobplan. Only the
-        # compile switch gates it: the store writes out_staging, so torch-spyre#3770's
-        # offset-0 and contiguity conditions hold by construction.
+        # Let the kernel write its output buffer directly, saving a copy per layer.
         store_out = self._compile_attn
         assert mask_tiles_all is not None, (
             "attention_mask_tiles_device must be mirrored by forward()"
@@ -1747,7 +1744,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             q_staging[:batch_rows] = query_dev
         # Where this loop writes. With a fused store the kernel writes the staging
         # buffer and it is copied back once, after the loop.
-        sink = out_staging if store_out else output
+        dest = out_staging if store_out else output
 
         for seq_idx in range(num_seqs):
             # Most-naive implementation: no parallelization
@@ -1772,17 +1769,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             if len(active_bs) == 0:
                 # Every KV position is outside every query's window. Attention
                 # over the empty set is undefined; write zeros.
-                sink[q_start:q_end] = 0.0
+                dest[q_start:q_end] = 0.0
                 continue
 
-            # NOTE: this table is as wide as the *batch's* largest padded block
-            # count, while the kernel declares `[num_blocks, ...]`, is specialized
-            # on num_blocks, and reads only rows 0..num_blocks-1. So its shape is
-            # an implicit, batch-dependent Dynamo guard that the cache key does
-            # not cover. Trimming it here fixes the shape but slices an
-            # already-converted device tensor, which diverges on SpyreTensorLayout
-            # instead; the fix belongs before the convert above, with the
-            # per-sequence width taken from padded_num_blocks.
+            # Wider than the kernel's num_blocks, so its shape is a Dynamo guard the
+            # cache key misses. Narrowing belongs before the convert, not here.
             page_index_table = page_index_tables[seq_idx]
             # mask_tiles_all[seq_idx] is indexed by position within active_bs.
             mask_tiles = mask_tiles_all[seq_idx][: len(active_bs)]
@@ -1847,9 +1838,24 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             if store_out:
                 # The kernel wrote `out_staging` itself; copied back below.
                 continue
-            sink[q_start:q_end] = result[:query_len]
+            dest[q_start:q_end] = result[:query_len]
 
         if store_out and not pre_staged:
             output.copy_(out_staging[:batch_rows])
 
         return output
+
+
+def allocate_staging_buffers(
+    static_forward_context: dict[str, object], device: torch.device
+) -> None:
+    """Allocate every attention layer's staging buffers before anything is traced.
+
+    ``attn_layer`` reaches them from inside the block graph, so a lazy allocation
+    check would become one of that graph's guards: True while warmup compiles and
+    False once serving starts, which recompiles every block.
+    """
+    for layer in static_forward_context.values():
+        impl = getattr(layer, "impl", None)
+        if isinstance(impl, SpyreAttentionImpl):
+            impl.staging_buffers(device)
