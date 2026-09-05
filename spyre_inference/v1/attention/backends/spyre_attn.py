@@ -292,9 +292,6 @@ def _create_compilable_page_attn(
         """
         # A compiled region reads a view from offset 0, ignoring storage_offset
         # (torch-spyre#3770), so the rows are gathered here rather than sliced outside.
-        # A gather selecting its whole source faults the device
-        # (RAS ComputeHardwareError 0x7b1b, torch-spyre#4033); staging_rows keeps it
-        # one row short of that.
         q_rows = query.index_select(0, query_row_index[:padded_query_len])
         q = (
             q_rows.unsqueeze(0)
@@ -544,10 +541,8 @@ class SpyreAttentionMetadata(AttentionMetadata):
     # index at [s, b, 0]. Each index needs its own stick-wide row to compile,
     # which is why block_table cannot serve as the index. The device mirror is
     # filled by the first forward(), since the builder's device is CPU.
-    # One tensor per sequence, materialized once per step: a compiled kernel reads
-    # its inputs from offset 0, ignoring storage_offset (torch-spyre#3770).
-    # One table per sequence at its own active-block count. A batch-max width
-    # would put max(num_active) into the kernel's guards, which the key cannot carry.
+    # One table per sequence at its own active-block count, materialized once per
+    # step: a batch-max width would put max(num_active) into the kernel's guards.
     page_index_tables_cpu: list[torch.Tensor] | None = None
     page_index_tables: list[torch.Tensor] | None = None
 
@@ -1246,9 +1241,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._decode_fns: dict[tuple[int, int, bool, bool], object] = {}
 
         # Constant for the run, so the kernel's arguments never carry the model
-        # graph's token count. One row wider than the widest batch so the kernel's
-        # gather is always a strict subset: it faults when a sequence *is* the
-        # whole buffer.
+        # graph's token count. The +1 keeps every gather a strict subset: selecting
+        # a whole source faults the device (torch-spyre#4033).
         self.staging_rows: int = (
             get_current_vllm_config().scheduler_config.max_num_batched_tokens + 1
         )
@@ -1417,8 +1411,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 attn_metadata.mask_by_block_cpu, device=_target_device
             )
 
-        # Unsliced: slicing to num_actual_tokens undid the bucket padding, so Dynamo
-        # re-specialized on every token count. The kernel gathers its own rows.
         output = self._online_softmax_attention(
             query,
             k_pages,
