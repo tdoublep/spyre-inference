@@ -1654,6 +1654,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             torch.zeros(bucket.num_blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32),
             device=device,
         )
+        _log_tile_sig("RECORD_pageidx", page_index_table, f"nblocks={bucket.num_blocks}")
+        if row_table is not None:
+            _log_tile_sig("RECORD_rowtab", row_table, f"q_len={q_len}")
 
         # All-zero additive tiles: values are irrelevant to tracing, and zero is
         # the one choice that cannot leave a row fully masked (which would make
@@ -1904,6 +1907,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 sink[q_start:q_end] = 0.0
                 continue
 
+            # NOTE: this table is as wide as the *batch's* largest padded block
+            # count, while the kernel declares `[num_blocks, ...]`, is specialized
+            # on num_blocks, and reads only rows 0..num_blocks-1. So its shape is
+            # an implicit, batch-dependent Dynamo guard that the cache key does
+            # not cover. Trimming it here fixes the shape but slices an
+            # already-converted device tensor, which diverges on SpyreTensorLayout
+            # instead; the fix belongs before the convert above, with the
+            # per-sequence width taken from padded_num_blocks.
             page_index_table = page_index_tables[seq_idx]
             # mask_tiles_all[seq_idx] is indexed by position within active_bs.
             mask_tiles = mask_tiles_all[seq_idx][: len(active_bs)]
@@ -1961,6 +1972,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                         attn_metadata, _target_device
                     )
                 row_table = attn_metadata.query_row_tables[seq_idx]
+                _log_tile_sig(
+                    "DISPATCH_rowtab", row_table, f"aligned={aligned_max_query_len}"
+                )
+            _log_tile_sig("DISPATCH_pageidx", page_index_table, f"nblocks={len(active_bs)}")
 
             # Run attention on target device
             attn_fn = self._get_attn_fn(
