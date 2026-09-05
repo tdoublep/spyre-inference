@@ -678,6 +678,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self._record_attention_graphs(bucket_sizes)
 
+    @torch.inference_mode()
     def _record_attention_graphs(self, token_counts: list[int]) -> None:
         """Pre-compile the attention.
 

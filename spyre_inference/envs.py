@@ -34,6 +34,8 @@ if TYPE_CHECKING:
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_BUCKETED_DECODE: bool = False
+    SPYRE_COMPILE_PROBE: bool = False
+    SPYRE_COMPILE_PROBE_OUT: str | None = None
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
@@ -67,6 +69,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pending performance characterisation at small batch sizes (num_seqs <= 4).
     # Re-enable to measure the path or to restore it after calibration.
     "SPYRE_BUCKETED_DECODE": lambda: bool(int(os.getenv("SPYRE_BUCKETED_DECODE", "0"))),
+    # When "1", count every torch.compile episode and tag it with the lifecycle
+    # phase it landed in, warning on any that lands after warmup. Off by default:
+    # the dynamo callbacks it installs are cheap but not free.
+    "SPYRE_COMPILE_PROBE": lambda: bool(int(os.getenv("SPYRE_COMPILE_PROBE", "0"))),
+    # Path prefix for the compile probe's JSON report; ".<pid>.json" is appended
+    # so each engine process writes its own. Unset logs the findings only.
+    "SPYRE_COMPILE_PROBE_OUT": lambda: os.getenv("SPYRE_COMPILE_PROBE_OUT"),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),

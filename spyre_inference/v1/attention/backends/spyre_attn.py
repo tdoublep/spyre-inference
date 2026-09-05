@@ -38,7 +38,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-from spyre_inference import envs
+from spyre_inference import compile_probe, envs
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
@@ -1309,6 +1309,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # has_alibi and logits_soft_cap don't need to be part of the cache key.
         key = (num_blocks, padded_query_len, store_mode, needs_gather)
         if key not in self._attn_fns:
+            compile_probe.record_miss("varlen_attn", key)
             logger.info(
                 "Compiling attention for shape (num_blocks=%d, padded_query_len=%d, "
                 "store_mode=%s, needs_gather=%s)",
@@ -1347,6 +1348,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # constants, so they are.
         key = (bucket_num_seqs, bucket_num_blocks, needs_gather, store_out)
         if key not in self._decode_fns:
+            compile_probe.record_miss("bucketed_decode", key)
             self._decode_fns[key] = _maybe_compile(
                 _create_compilable_bucketed_decode_attn(
                     bucket_num_seqs,
@@ -1400,7 +1402,6 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
         k_pages, v_pages = kv_cache
         _target_device = k_pages.device
-        num_actual_tokens = attn_metadata.num_actual_tokens
 
         # Only the first layer of a step pays for the device mirror.
         if attn_metadata.page_index_tables is None:
@@ -1447,8 +1448,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 attn_metadata.mask_by_block_cpu, device=_target_device
             )
 
+        # Unsliced: `query` arrives padded to a SpyreShapeBucketer bucket, and
+        # slicing to num_actual_tokens undid that, so Dynamo re-specialized the
+        # kernel on every distinct token count. Each kernel gathers its own rows
+        # from the buffer, so trailing padded rows are never read.
         output = self._online_softmax_attention(
-            query[:num_actual_tokens],
+            query,
             k_pages,
             v_pages,
             attn_metadata,
