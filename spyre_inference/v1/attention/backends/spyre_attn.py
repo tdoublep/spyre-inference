@@ -1334,7 +1334,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Row count of the query/output staging buffers: one constant for the
         # run, so the kernel's tensor arguments never carry the model graph's
         # token count. See _staging_buffers.
-        self.staging_rows: int = get_current_vllm_config().scheduler_config.max_num_batched_tokens
+        #
+        # One row wider than the widest batch, which makes `needs_gather` a
+        # constant rather than a cache key. `False` is not merely an
+        # optimisation -- the kernel's gather faults when the sequence *is* the
+        # whole buffer -- so it is only reachable while a sequence can fill the
+        # buffer exactly. A spare row makes every gather a proper subset, so
+        # `True` is always both correct and safe. Keep in lockstep with
+        # SpyreAttnBucketer._staging_rows, which resolves the recorded flags.
+        self.staging_rows: int = (
+            get_current_vllm_config().scheduler_config.max_num_batched_tokens + 1
+        )
         self._staging: tuple[torch.Tensor, torch.Tensor] | None = None
 
         logger.debug_once(
@@ -1835,13 +1845,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         page_index_tables = attn_metadata.page_index_tables
         # Folds the per-layer eager slice-assign into the attention jobplan.
         # Re-checked per call: vLLM hands out a fresh buffer per layer.
-        fused_store_ok = (
-            self._compile_attn
-            and output.dtype == query_dev.dtype
-            # A compiled kernel reads its arguments from offset 0: torch-spyre#3770.
-            and output.storage_offset() == 0
-            and output.is_contiguous()
-        )
+        # The fused store writes `out_staging`, not the caller's buffer, so the
+        # offset-0 and contiguity conditions this used to check (torch-spyre#3770)
+        # are satisfied by construction -- the staging buffers are allocated
+        # whole. Only the dtype still matters, for the copy back. Both remaining
+        # terms are per-call constants, which is what keeps store_mode out of the
+        # cache key.
+        fused_store_ok = self._compile_attn and output.dtype == query_dev.dtype
         assert mask_tiles_all is not None, (
             "attention_mask_tiles_device must be mirrored by forward()"
         )

@@ -122,8 +122,9 @@ class SpyreAttnBucketer:
         max_model_len = vllm_config.model_config.max_model_len
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens
         # Must equal SpyreAttentionImpl.staging_rows: the recorded flags are
-        # resolved from it, so a divergence records the wrong variants.
-        self._staging_rows = max_batched
+        # resolved from it, so a divergence records the wrong variants. The spare
+        # row is what keeps needs_gather constant; see that attribute.
+        self._staging_rows = max_batched + 1
 
         # Imported at call time, not module scope: spyre_attn imports this
         # module, so a top-level import back into it would be circular.
@@ -248,18 +249,20 @@ class SpyreAttnBucketer:
                 if min_real_query[padded_query_len] > max_query_here:
                     continue
                 # `output` and `query` are the staging buffers, so the row count
-                # both resolvers read is one constant for the run rather than
-                # something that varies with the batch.
+                # both resolvers read is one constant for the run. With a spare
+                # row it also exceeds every padded_query_len, which pins
+                # needs_gather to True. store_mode is resolved with
+                # fused_store_ok=True because record_graphs returns early when
+                # the impl is not compiling, and 'none' is otherwise only a
+                # dtype-mismatch fallback that compiles on demand if ever hit.
+                # So both flags are constants and each cell has exactly one pair.
                 rows = self._staging_rows
                 flag_pairs = {
                     (
-                        resolve_store_mode(fused_store_ok, rows),
+                        resolve_store_mode(True, rows),
                         resolve_needs_gather(q_start, padded_query_len, padded_query_len, rows),
                     )
-                    for fused_store_ok in (True, False)
                     for q_start in (0, 1)
-                    # A sequence cannot start past the buffer it lives in.
-                    if q_start < rows
                 }
                 for store_mode, needs_gather in sorted(flag_pairs):
                     out.append(
