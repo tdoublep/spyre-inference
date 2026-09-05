@@ -627,6 +627,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Upstream dummy skips encoder attention unless ``force_attention=True``.
         """
         is_pooling = self.model_config.runner_type == "pooling"
+        self._allocate_attention_staging()
 
         if is_pooling and not self.vllm_config.model_config.enforce_eager:
             logger.info("Warming up model...")
@@ -678,6 +679,20 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self._record_attention_graphs(bucket_sizes)
 
+    def _allocate_attention_staging(self) -> None:
+        """Allocate the attention staging buffers before anything is traced.
+
+        ``attn_layer`` reaches them from inside the block graph, so a lazy
+        ``self._staging is None`` check becomes one of that graph's guards: it is
+        True while warmup compiles and False once serving starts, which
+        recompiles every block. Allocating up front keeps it constant.
+        """
+        for layer in self.compilation_config.static_forward_context.values():
+            impl = getattr(layer, "impl", None)
+            if isinstance(impl, SpyreAttentionImpl):
+                impl.staging_buffers(self._spyre_device)
+
+    @torch.inference_mode()
     def _record_attention_graphs(self, token_counts: list[int]) -> None:
         """Pre-compile the attention.
 

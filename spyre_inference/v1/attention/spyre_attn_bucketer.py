@@ -121,6 +121,9 @@ class SpyreAttnBucketer:
         self.block_size = block_size
         max_model_len = vllm_config.model_config.max_model_len
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens
+        # Must equal SpyreAttentionImpl.staging_rows: the recorded flags resolve
+        # from it, so a divergence records the wrong variants.
+        self._staging_rows = max_batched + 1
 
         # Imported at call time, not module scope: spyre_attn imports this
         # module, so a top-level import back into it would be circular.
@@ -244,21 +247,17 @@ class SpyreAttnBucketer:
             for padded_query_len in sorted(self._query_buckets, reverse=True):
                 if min_real_query[padded_query_len] > max_query_here:
                     continue
-                # `output` and `query` share one row count (query.shape[0]), the
-                # only input both resolvers read. At the decode bucket that count
-                # can be 1 (lone sequence owning row 0) or more (several one-token
-                # sequences also padding to aligned_max_query_len == 1).
-                row_counts = (1, 2) if padded_query_len == 1 else (padded_query_len,)
+                # Both resolvers read the staging row count. It exceeds every
+                # padded_query_len, so needs_gather is pinned True; fused_store_ok
+                # still varies for layers attn_layer does not stage.
+                rows = self._staging_rows
                 flag_pairs = {
                     (
                         resolve_store_mode(fused_store_ok, rows),
                         resolve_needs_gather(q_start, padded_query_len, padded_query_len, rows),
                     )
                     for fused_store_ok in (True, False)
-                    for rows in row_counts
                     for q_start in (0, 1)
-                    # A sequence cannot start past the buffer it lives in.
-                    if q_start < rows
                 }
                 for store_mode, needs_gather in sorted(flag_pairs):
                     out.append(

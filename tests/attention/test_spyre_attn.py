@@ -2069,7 +2069,8 @@ def test_padded_num_blocks_lands_on_a_bucket(default_vllm_config, kv_len, expect
 
     assert metadata.padded_num_blocks == [expected]
     assert len(metadata.attention_mask_tiles[0]) == expected
-    assert metadata.page_index_table_cpu.shape[1] == expected
+    # One table per sequence, sized to that sequence's own active-block count.
+    assert [t.shape[0] for t in metadata.page_index_tables_cpu] == [expected]
 
 
 def test_padded_tiles_are_finfo_min_and_prefix_is_unchanged(default_vllm_config):

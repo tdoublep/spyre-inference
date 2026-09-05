@@ -167,36 +167,30 @@ class TestVariants:
             if v.store_mode == "copy":
                 assert v.padded_query_len == 1
 
-    def test_index_without_gather_is_recorded_above_the_decode_bucket(self, bucketer):
-        """A single-sequence prefill filling the query buffer exactly needs no
-        gather, yet stores by index since the batch is wider than one row."""
+    def test_gather_is_always_needed(self, bucketer):
+        """The staging buffers are one row wider than any query bucket, so a
+        sequence can never be the whole buffer and the gather is unconditional."""
         for bucket in bucketer.query_buckets:
-            if bucket == 1:
-                continue
-            keys = {
-                (v.store_mode, v.needs_gather)
-                for v in bucketer.variants()
-                if v.padded_query_len == bucket
-            }
-            assert ("index", False) in keys
+            assert bucket < bucketer._staging_rows
+        assert {v.needs_gather for v in bucketer.variants()} == {True}
 
-    @pytest.mark.parametrize("output_rows", [1, 2, 8, 512])
     @pytest.mark.parametrize("fused_store_ok", [True, False])
-    def test_every_resolved_runtime_pair_was_recorded(self, bucketer, output_rows, fused_store_ok):
+    def test_every_resolved_runtime_pair_was_recorded(self, bucketer, fused_store_ok):
         """The anti-drift guard: the flags come from the backend's own resolvers,
-        so this fails if either the resolvers or the enumeration changes alone."""
+        so this fails if either the resolvers or the enumeration changes alone.
+
+        The row count is ``staging_rows``, not the batch's: the kernel is always
+        called on the staging buffers (SpyreAttentionImpl._staging_buffers).
+        """
+        rows = bucketer._staging_rows
         recorded = {(v.store_mode, v.needs_gather) for v in bucketer.variants()}
         for query_len in (1, 2, 5, 200, 512):
             padded = bucketer.find_query_bucket(query_len)
             assert padded is not None
-            if output_rows == 1 and padded != 1:
-                continue  # a one-row batch cannot hold a longer query
             for q_start in (0, 1):
-                if q_start >= output_rows:
-                    continue
                 pair = (
-                    resolve_store_mode(fused_store_ok, output_rows),
-                    resolve_needs_gather(q_start, padded, padded, output_rows),
+                    resolve_store_mode(fused_store_ok, rows),
+                    resolve_needs_gather(q_start, padded, padded, rows),
                 )
                 assert pair in recorded, f"unrecorded runtime pair {pair}"
 
