@@ -15,13 +15,13 @@
 """Bucketer for the attention kernel's compile cache.
 
 ``SpyreAttentionImpl`` compiles one kernel per
-``(num_blocks, padded_query_len, store_mode, needs_gather)`` key, lazily on
-first use, which puts a full Inductor compile in the serving path. This module
-enumerates the keys a run can reach so warmup can record them all up front.
+``(num_blocks, padded_query_len)`` key, lazily on first use, which puts a full
+Inductor compile in the serving path. This module enumerates the keys a run can
+reach so warmup can record them all up front.
 
 Separate from ``SpyreShapeBucketer``, which dispatches a single ``num_tokens``
 int for the model graph; an attention variant is 2-D (kv_len and query_len
-buckets) plus two discrete flags.
+buckets).
 
 Vocabulary: a *bucket* is one padded size a runtime length rounds up onto; the
 sorted list of them for one axis is that axis's *buckets*; the spacing between
@@ -41,9 +41,6 @@ from spyre_inference import envs
 
 logger = init_logger(__name__)
 
-# Store modes the kernel factory accepts, in the order forward() prefers them.
-STORE_MODES = ("none", "copy", "index")
-
 # Spacing of the default query buckets above the decode bucket, capped against
 # max_num_batched_tokens. Every non-decode batch pads its query length up to a
 # multiple of this.
@@ -60,12 +57,10 @@ class SpyreAttnBucket:
 
     num_blocks: int
     padded_query_len: int
-    store_mode: str
-    needs_gather: bool
 
     @property
-    def key(self) -> tuple[int, int, str, bool]:
-        return (self.num_blocks, self.padded_query_len, self.store_mode, self.needs_gather)
+    def key(self) -> tuple[int, int]:
+        return (self.num_blocks, self.padded_query_len)
 
 
 def _parse_buckets(raw: str | None) -> list[int] | None:
@@ -121,9 +116,6 @@ class SpyreAttnBucketer:
         self.block_size = block_size
         max_model_len = vllm_config.model_config.max_model_len
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens
-        # Must equal SpyreAttentionImpl.staging_rows: the recorded flags resolve
-        # from it, so a divergence records the wrong variants.
-        self._staging_rows = max_batched + 1
 
         # Imported at call time, not module scope: spyre_attn imports this
         # module, so a top-level import back into it would be circular.
@@ -218,23 +210,7 @@ class SpyreAttnBucketer:
         the bucket itself, since a 2-token query on a 1-block sequence still
         dispatches to a large padded bucket; bounding by the bucket would prune
         that variant and put a compile back in the serving path.
-
-        The flags aren't enumerated directly -- each bucket's inputs are fed
-        through ``forward``'s own resolvers, so the recorded set follows the
-        backend by construction. Above the decode bucket the two flags vary
-        independently: ``store_mode`` follows batch width (one-token -> "copy",
-        wider -> "index"); ``needs_gather`` follows whether one sequence owns the
-        query buffer whole from row 0. ``"copy"`` is thus only reachable at
-        ``padded_query_len == 1``, where ``build()`` exempts the batch from query
-        padding. ``store_mode="none"`` (the un-fused fallback) pairs with either
-        gather setting.
         """
-        # Imported at call time; see __init__ for why module scope would be circular.
-        from spyre_inference.v1.attention.backends.spyre_attn import (
-            resolve_needs_gather,
-            resolve_store_mode,
-        )
-
         # Smallest real query_len that rounds up to each bucket: one past the
         # bucket below (1 for the smallest).
         ascending = sorted(self._query_buckets)
@@ -247,25 +223,7 @@ class SpyreAttnBucketer:
             for padded_query_len in sorted(self._query_buckets, reverse=True):
                 if min_real_query[padded_query_len] > max_query_here:
                     continue
-                # Both resolvers read the staging row count, which exceeds every
-                # padded_query_len, so needs_gather is pinned True. fused_store_ok
-                # is True whenever recording runs at all (record_graphs returns
-                # early otherwise), so "none" is the eager path and not recorded.
-                rows = self._staging_rows
-                flag_pairs = {
-                    (
-                        resolve_store_mode(True, rows),
-                        resolve_needs_gather(q_start, padded_query_len, padded_query_len, rows),
-                    )
-                    for q_start in (0, 1)
-                }
-                for store_mode, needs_gather in sorted(flag_pairs):
-                    out.append(
-                        SpyreAttnBucket(
-                            num_blocks=num_blocks,
-                            padded_query_len=padded_query_len,
-                            store_mode=store_mode,
-                            needs_gather=needs_gather,
-                        )
-                    )
+                out.append(
+                    SpyreAttnBucket(num_blocks=num_blocks, padded_query_len=padded_query_len)
+                )
         return out
