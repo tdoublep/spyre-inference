@@ -41,7 +41,7 @@ class SpyreUnquantizedLMHeadMethod(
 
     No graph encloses it: per-block wraps only the block ModuleList, and a whole-model
     compile intercepts ``__call__``, not ``compute_logits``. Compiled ``dynamic=False``,
-    so rows must arrive padded onto the ``logits_row_buckets`` ladder.
+    so rows must arrive padded onto one of the ``logits_row_buckets``.
     """
 
     WEIGHT_T_ATTR = "padded_weight_t"

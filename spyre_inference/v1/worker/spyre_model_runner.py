@@ -344,15 +344,16 @@ class _SpyreModelWrapper:
         """Move hidden_states onto Spyre for the lm_head custom op.
 
         gpu_model_runner.execute_model slices `hidden_states[logits_indices]`
-        on CPU (Spyre cannot slice), so the tensor handed to compute_logits
-        is on CPU; move it onto Spyre for the lm_head matmul. The logits are
+        on CPU (no Spyre `aten::index.Tensor`; a device gather needs
+        `select_rows`), so the tensor handed to compute_logits is on CPU;
+        move it onto Spyre for the lm_head matmul. The logits are
         returned on CPU: SpyreParallelLMHead.forward_oot keeps them on Spyre
         for the TP all_gather, and SpyreLogitsProcessor._gather_logits
         converts back to CPU right after the gather (before the vocab slice
         and scale), so downstream sampling gets CPU logits.
 
         The sampled-row count is not body-bucket padded, so padding it onto the warmed
-        ladder keeps the projection on shapes warmup compiled.
+        row buckets keeps the projection on shapes warmup compiled.
         """
         num_rows = hidden_states.shape[0]
         buckets = self._logits_row_buckets
@@ -659,8 +660,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         Decoder: dummy each 1D ``compile_sizes`` bucket (largest first), then a dummy
         logits/sampler run at each *sampled-row* width so the lm_head compiles here
-        rather than mid-request. The two ladders differ: body buckets are packed token
-        counts, rows are at most ``max_num_reqs``.
+        rather than mid-request. The two bucket sets differ: body buckets are packed
+        token counts, rows are at most ``max_num_reqs``.
         Compiled pooling: dummy 1D body sizes, ``mark_warmed_up()``, then each
         attention ``(B, L)`` at its full size.
         Eager pooling: one short dummy, then ``mark_warmed_up()``.
@@ -714,7 +715,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 _, last_hidden_states = self._dummy_run(size)
                 if widest_hidden_states is None:
                     widest_hidden_states = last_hidden_states
-            # Row ladder, not one run per body bucket: the prefill bucket's token count
+            # Row buckets, not one run per body bucket: the prefill bucket's token count
             # exceeds any reachable row count, so it would compile an unreachable width.
             if widest_hidden_states is not None:
                 for rows in sorted(row_widths, reverse=True):

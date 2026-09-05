@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``compute_logits`` pads its sampled rows onto the warmed ladder."""
+"""``compute_logits`` pads its sampled rows onto the warmed row buckets."""
 
 import torch
 import torch.nn as nn
@@ -69,7 +69,7 @@ def test_an_exact_width_is_not_padded():
     assert model.seen_rows == [4]
 
 
-def test_a_width_above_the_ladder_is_left_alone():
+def test_a_width_above_the_buckets_is_left_alone():
     """Nothing warmed covers it, so padding would only add a second unwarmed shape."""
     model, wrapper = _wrapper([1, 2, 4])
     wrapper.compute_logits(torch.randn(7, HIDDEN, dtype=torch.float16))
@@ -88,7 +88,7 @@ def test_every_reachable_width_lands_on_a_warmed_shape():
     assert set(model.seen_rows) <= set(buckets)
 
 
-def test_no_ladder_keeps_the_old_behaviour():
+def test_no_buckets_keeps_the_old_behaviour():
     model, wrapper = _wrapper([])
     wrapper.compute_logits(torch.randn(5, HIDDEN, dtype=torch.float16))
 
