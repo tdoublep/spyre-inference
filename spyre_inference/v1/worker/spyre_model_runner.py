@@ -658,7 +658,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         """Warm kernels / compile.
 
         Decoder: dummy each 1D ``compile_sizes`` bucket (largest first), then a dummy
-        logits/sampler run so the lm_head is warmed at each sampled-row width.
+        logits/sampler run at each *sampled-row* width so the lm_head compiles here
+        rather than mid-request. The two ladders differ: body buckets are packed token
+        counts, rows are at most ``max_num_reqs``.
         Compiled pooling: dummy 1D body sizes, ``mark_warmed_up()``, then each
         attention ``(B, L)`` at its full size.
         Eager pooling: one short dummy, then ``mark_warmed_up()``.
@@ -701,16 +703,22 @@ class TorchSpyreModelRunner(GPUModelRunner):
             bucket_sizes[0] if bucket_sizes else 0,
             bucket_sizes[-1] if bucket_sizes else 0,
         )
+        row_widths = logits_row_buckets(bucket_sizes, self.max_num_reqs)
         t0 = time.time()
         with _set_spyre_compilation_settings(self.vllm_config):
             # Compile largest bucket first: Inductor's internal caches benefit
             # from seeing the most complex shape first, so subsequent smaller
             # shapes compile faster via partial cache hits.
+            widest_hidden_states = None
             for size in sorted(bucket_sizes, reverse=True):
                 _, last_hidden_states = self._dummy_run(size)
-                # The lm_head projection is in no graph and in no body dummy run: without
-                # this it compiles on the first real step at each sampled-row width.
-                self._dummy_sampler_run(last_hidden_states)
+                if widest_hidden_states is None:
+                    widest_hidden_states = last_hidden_states
+            # Row ladder, not one run per body bucket: the prefill bucket's token count
+            # exceeds any reachable row count, so it would compile an unreachable width.
+            if widest_hidden_states is not None:
+                for rows in sorted(row_widths, reverse=True):
+                    self._dummy_sampler_run(widest_hidden_states[:rows])
         self.spyre_shape_bucketer.mark_warmed_up()
         logger.info(
             "Warmup complete in %.3fs for %d buckets.",
