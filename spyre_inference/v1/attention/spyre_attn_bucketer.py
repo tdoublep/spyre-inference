@@ -247,16 +247,16 @@ class SpyreAttnBucketer:
             for padded_query_len in sorted(self._query_buckets, reverse=True):
                 if min_real_query[padded_query_len] > max_query_here:
                     continue
-                # Both resolvers read the staging row count. It exceeds every
-                # padded_query_len, so needs_gather is pinned True; fused_store_ok
-                # still varies for layers attn_layer does not stage.
+                # Both resolvers read the staging row count, which exceeds every
+                # padded_query_len, so needs_gather is pinned True. fused_store_ok
+                # is True whenever recording runs at all (record_graphs returns
+                # early otherwise), so "none" is the eager path and not recorded.
                 rows = self._staging_rows
                 flag_pairs = {
                     (
-                        resolve_store_mode(fused_store_ok, rows),
+                        resolve_store_mode(True, rows),
                         resolve_needs_gather(q_start, padded_query_len, padded_query_len, rows),
                     )
-                    for fused_store_ok in (True, False)
                     for q_start in (0, 1)
                 }
                 for store_mode, needs_gather in sorted(flag_pairs):

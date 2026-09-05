@@ -174,14 +174,16 @@ class TestVariants:
             assert bucket < bucketer._staging_rows
         assert {v.needs_gather for v in bucketer.variants()} == {True}
 
-    @pytest.mark.parametrize("fused_store_ok", [True, False])
-    def test_every_resolved_runtime_pair_was_recorded(self, bucketer, fused_store_ok):
+    def test_every_resolved_runtime_pair_was_recorded(self, bucketer):
         """The anti-drift guard: the flags come from the backend's own resolvers,
         so this fails if either the resolvers or the enumeration changes alone.
 
-        The row count is ``staging_rows``, not the batch's: the kernel is always
-        called on the staging buffers (SpyreAttentionImpl._staging_buffers).
+        ``fused_store_ok`` is True because recording only runs when the impl
+        compiles (``record_graphs`` returns early otherwise), so ``"none"`` is the
+        eager path and never a recorded variant. The row count is ``staging_rows``,
+        not the batch's: the kernel is always called on the staging buffers.
         """
+        fused_store_ok = True
         rows = bucketer._staging_rows
         recorded = {(v.store_mode, v.needs_gather) for v in bucketer.variants()}
         for query_len in (1, 2, 5, 200, 512):

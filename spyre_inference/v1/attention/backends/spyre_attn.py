@@ -1795,11 +1795,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         aligned_max_query_len = attn_metadata.aligned_max_query_len
         page_index_tables = attn_metadata.page_index_tables
         # Folds the per-layer eager slice-assign into the attention jobplan.
-        # Re-checked per call: vLLM hands out a fresh buffer per layer.
         # The fused store writes out_staging, so the offset-0 and contiguity
-        # conditions (torch-spyre#3770) hold by construction. Both remaining terms
-        # are per-call constants, which keeps store_mode out of the cache key.
-        fused_store_ok = self._compile_attn and output.dtype == query_dev.dtype
+        # conditions (torch-spyre#3770) hold by construction, and the platform
+        # enforces one dtype throughout. So "none" is the eager path only, which
+        # keeps store_mode out of the cache key.
+        fused_store_ok = self._compile_attn
         assert mask_tiles_all is not None, (
             "attention_mask_tiles_device must be mirrored by forward()"
         )
