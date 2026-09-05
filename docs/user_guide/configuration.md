@@ -33,7 +33,7 @@ The body pads the packed token count to the next `compile_sizes` bucket, and war
 dummies every bucket. The lm_head sits outside every body graph and compiles its own, so
 it needs the same treatment: it projects one row per *sampled* request, a width that
 would otherwise take every value in `1..--max-num-seqs` as requests finish. Those rows
-pad onto the same ladder clipped to `--max-num-seqs`, and warmup projects each width, so
+pad onto the same buckets clipped to `--max-num-seqs`, and warmup projects each width, so
 no shape reaches the lm_head uncompiled. Pad rows are dropped before sampling.
 
 ## Encoder / pooling compile buckets

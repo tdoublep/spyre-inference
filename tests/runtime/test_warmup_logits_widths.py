@@ -72,7 +72,7 @@ def test_every_body_bucket_is_still_warmed():
     assert sorted(body_rows) == BODY_BUCKETS
 
 
-def test_projection_widths_are_the_row_ladder_not_the_body_ladder():
+def test_projection_widths_are_the_row_buckets_not_the_body_buckets():
     runner, _, projected_rows = _runner()
     runner.warming_up_model()
 
