@@ -121,6 +121,9 @@ class SpyreAttnBucketer:
         self.block_size = block_size
         max_model_len = vllm_config.model_config.max_model_len
         max_batched = vllm_config.scheduler_config.max_num_batched_tokens
+        # Must equal SpyreAttentionImpl.staging_rows: the recorded flags are
+        # resolved from it, so a divergence records the wrong variants.
+        self._staging_rows = max_batched
 
         # Imported at call time, not module scope: spyre_attn imports this
         # module, so a top-level import back into it would be circular.
@@ -244,18 +247,16 @@ class SpyreAttnBucketer:
             for padded_query_len in sorted(self._query_buckets, reverse=True):
                 if min_real_query[padded_query_len] > max_query_here:
                     continue
-                # `output` and `query` share one row count (query.shape[0]), the
-                # only input both resolvers read. At the decode bucket that count
-                # can be 1 (lone sequence owning row 0) or more (several one-token
-                # sequences also padding to aligned_max_query_len == 1).
-                row_counts = (1, 2) if padded_query_len == 1 else (padded_query_len,)
+                # `output` and `query` are the staging buffers, so the row count
+                # both resolvers read is one constant for the run rather than
+                # something that varies with the batch.
+                rows = self._staging_rows
                 flag_pairs = {
                     (
                         resolve_store_mode(fused_store_ok, rows),
                         resolve_needs_gather(q_start, padded_query_len, padded_query_len, rows),
                     )
                     for fused_store_ok in (True, False)
-                    for rows in row_counts
                     for q_start in (0, 1)
                     # A sequence cannot start past the buffer it lives in.
                     if q_start < rows
