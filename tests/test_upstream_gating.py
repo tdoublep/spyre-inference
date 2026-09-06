@@ -19,7 +19,6 @@ import re
 from pathlib import Path
 
 import pytest
-
 from spyre_testing_plugin.pytest_plugin import _markexpr_selects_upstream
 
 REQUESTS_UPSTREAM = [
@@ -35,7 +34,9 @@ DOES_NOT_REQUEST_UPSTREAM = [
     "not upstream",
     "attention and not upstream",
     "distributed and not upstream",
+    "distributed and not (upstream or probe)",
     "not (distributed or upstream or attention)",
+    "not (distributed or upstream or attention or probe)",
     # Could match upstream tests, but keeping the clone off the default path is the point.
     "attention",
     "not distributed",

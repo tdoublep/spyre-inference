@@ -30,7 +30,6 @@ def test_merged_column_matches_reference(
 ):
     """A fused gate_up_proj on Spyre matches the upstream CPU F.linear."""
     import torch.nn as nn
-
     from vllm.model_executor.layers.activation import SiluAndMul
     from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 
@@ -96,6 +95,7 @@ def test_qkv_matches_reference(tp_group, num_tokens, num_heads, num_kv_heads, he
     CPU-side unfusing.
     """
     from vllm.model_executor.layers.linear import QKVParallelLinear
+
     from spyre_inference.custom_ops.linear import SpyreQKVParallelLinear
 
     dtype = torch.float16
@@ -155,6 +155,7 @@ def test_row_parallel_matches_reference(tp_group, num_tokens, input_size, output
     transposed (Wᵀ) so the forward GEMM is the Spyre-fast `x @ A`.
     """
     from vllm.model_executor.layers.linear import RowParallelLinear
+
     from spyre_inference.custom_ops.linear import SpyreRowParallelLinear
 
     dtype = torch.float16
@@ -195,17 +196,7 @@ def test_row_parallel_matches_reference(tp_group, num_tokens, input_size, output
 @pytest.mark.parametrize(
     "input_size,output_size",
     [
-        pytest.param(
-            128,
-            1,
-            marks=pytest.mark.xfail(
-                reason="torch-spyre batchmatmul cannot restickify an out=1 output dim "
-                "('cannot restickify any input layout of x to carry x_var=d1'); fails "
-                "in both eager and compile. Padding out=1->2 works, but the fix belongs "
-                "in torch-spyre. Tracked upstream.",
-                strict=True,
-            ),
-        ),
+        (128, 1),
         (256, 8),
         (1024, 512),
     ],
@@ -217,10 +208,11 @@ def test_replicated_matches_reference(tp_group, num_tokens, input_size, output_s
     Reaches Spyre as the `score` head of a sequence-classification model
     (`as_seq_cls_model` in vLLM's model adapters), which is why the tiny
     `output_size=1` case is covered: a single-column weight still has to survive
-    the `[out, in]` → `[in, out]` transpose. That out=1 case is currently xfail —
-    torch-spyre's batchmatmul cannot stickify a size-1 output dimension.
+    the `[out, in]` → `[in, out]` transpose. The out=1 case was strict-xfail until
+    torch-spyre#4206 taught batchmatmul to stickify a size-1 output dimension.
     """
     from vllm.model_executor.layers.linear import ReplicatedLinear
+
     from spyre_inference.custom_ops.linear import SpyreReplicatedLinear
 
     dtype = torch.float16
@@ -268,6 +260,7 @@ def test_linear_oot_registration(tp_group):
         ReplicatedLinear,
         RowParallelLinear,
     )
+
     from spyre_inference.custom_ops.linear import (
         SpyreColumnParallelLinear,
         SpyreMergedColumnParallelLinear,
