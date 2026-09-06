@@ -131,7 +131,44 @@ Reproducibility: 375.26 ms here vs 374 ms in section 3's A/B, despite different
 2049 blocks now gives 375 ms, so that penalty was part of the same layout bug. A
 new-build run at 513 blocks would confirm no residual sensitivity; not measured.
 
-## 5. Profiler traces
+## 5. The original benchmark, re-run on the fix
+
+Same command as `benchmark-pr789-pr784.md` (100 prompts, real aiops dataset,
+`--output-len -1`, concurrency 4), on `da15ede` with the profiler compiled back out
+so the numbers are production-representative. Two deliberate deltas:
+`--max-num-seqs 4` (enough for concurrency 4; trims compile_sizes 7 -> 4 body
+buckets, saving ~85 s of warmup) and `--num-gpu-blocks-override 2049` to pin cache
+size to what `max-num-seqs 32` gave -- without it, 4 seqs would allocate 257 blocks
+and collapse the prefix cache. The control worked: hit rate came out at 52.7%,
+identical to the original.
+
+| metric | `e02b78b` | `da15ede` | change |
+|---|---|---|---|
+| **median ITL** | 2100.88 ms | **420.46 ms** | **5.0x** |
+| mean ITL | 2251.59 ms | 566.54 ms | 4.0x |
+| P99 ITL | 4096.15 ms | 2356.17 ms | 1.7x |
+| median TPOT | 2211.59 ms | 530.50 ms | 4.2x |
+| median TTFT | 8606.83 ms | 3587.85 ms | 2.4x |
+| P99 TTFT | 51299.87 ms | 25471.14 ms | 2.0x |
+| output throughput | 1.61 tok/s | 5.96 tok/s | 3.7x |
+| total throughput | 51.45 tok/s | 207.20 tok/s | 4.0x |
+| duration | 3359 s | 832 s | 4.0x |
+| successful / failed | 100 / 0 | 100 / 0 | — |
+| prefix cache hit | 52.7% | 52.7% | identical |
+
+Server side: 0 serving-path attention compiles, 0 fallbacks, 0 5xx, `Running: 4` in
+54 of 82 engine samples.
+
+Caveat on duration: input tokens are identical (167,398) but generated tokens differ
+(5414 -> 4958, -8.4%), because fp16 numerics changed (#4234 touches fp16 mask
+extremes) so sampled tokens diverge and EOS lands differently. Per-token metrics are
+unaffected; normalising duration for token count gives ~3.7x rather than 4.0x.
+
+Consistency with section 4's model: `190 + 11.5 * 16 = 374 ms` predicted for the
+1674-token average prompt, against a 420 ms measured median. P99 ITL of 2356 ms
+reflects the dataset's tail up to 8192 tokens (64 blocks -> ~926 ms predicted).
+
+## 6. Profiler traces
 
 Traces taken either side of the cliff, same workload shape (4 prompts,
 concurrency 4, 8 decode steps), only `input_len` differing.
