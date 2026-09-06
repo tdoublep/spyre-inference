@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="400" viewBox="0 0 760 400" font-family="IBM Plex Sans, DejaVu Sans, Helvetica, Arial, sans-serif">
+<rect x="0" y="0" width="760" height="400" fill="#fdfdfc"/>
+<text x="84" y="26" font-size="15.5" font-weight="600" fill="#1a1a19">Median time to first token vs concurrency</text>
+<text x="84" y="43" font-size="11" fill="#5b6169">Granite 3.3 8B on Spyre, aiops dataset, 25 prompts per unit concurrency; prefill budget 512 vs 2048 tokens</text>
+<line x1="84" y1="338.0" x2="628" y2="338.0" stroke="#e3e6ea" stroke-width="1"/>
+<text x="74" y="342.0" font-size="10.5" fill="#5b6169" text-anchor="end" font-family="IBM Plex Mono, DejaVu Sans Mono, monospace">0</text>
+<line x1="84" y1="266.5" x2="628" y2="266.5" stroke="#e3e6ea" stroke-width="1"/>
+<text x="74" y="270.5" font-size="10.5" fill="#5b6169" text-anchor="end" font-family="IBM Plex Mono, DejaVu Sans Mono, monospace">2,000</text>
+<line x1="84" y1="195.0" x2="628" y2="195.0" stroke="#e3e6ea" stroke-width="1"/>
+<text x="74" y="199.0" font-size="10.5" fill="#5b6169" text-anchor="end" font-family="IBM Plex Mono, DejaVu Sans Mono, monospace">4,000</text>
+<line x1="84" y1="123.5" x2="628" y2="123.5" stroke="#e3e6ea" stroke-width="1"/>
+<text x="74" y="127.5" font-size="10.5" fill="#5b6169" text-anchor="end" font-family="IBM Plex Mono, DejaVu Sans Mono, monospace">6,000</text>
+<line x1="84" y1="52.0" x2="628" y2="52.0" stroke="#e3e6ea" stroke-width="1"/>
+<text x="74" y="56.0" font-size="10.5" fill="#5b6169" text-anchor="end" font-family="IBM Plex Mono, DejaVu Sans Mono, monospace">8,000</text>
+<text x="74" y="38" font-size="10" fill="#5b6169" text-anchor="end">ms</text>
+<line x1="84" y1="338" x2="628" y2="338" stroke="#5b6169" stroke-width="1"/>
+<line x1="84.0" y1="338" x2="84.0" y2="342" stroke="#5b6169" stroke-width="1"/>
+<text x="84.0" y="357" font-size="11.5" fill="#1a1a19" text-anchor="middle" font-family="IBM Plex Mono, DejaVu Sans Mono, monospace">1</text>
+<line x1="265.3" y1="338" x2="265.3" y2="342" stroke="#5b6169" stroke-width="1"/>
+<text x="265.3" y="357" font-size="11.5" fill="#1a1a19" text-anchor="middle" font-family="IBM Plex Mono, DejaVu Sans Mono, monospace">2</text>
+<line x1="446.7" y1="338" x2="446.7" y2="342" stroke="#5b6169" stroke-width="1"/>
+<text x="446.7" y="357" font-size="11.5" fill="#1a1a19" text-anchor="middle" font-family="IBM Plex Mono, DejaVu Sans Mono, monospace">4</text>
+<line x1="628.0" y1="338" x2="628.0" y2="342" stroke="#5b6169" stroke-width="1"/>
+<text x="628.0" y="357" font-size="11.5" fill="#1a1a19" text-anchor="middle" font-family="IBM Plex Mono, DejaVu Sans Mono, monospace">8</text>
+<text x="356" y="382" font-size="11" fill="#5b6169" text-anchor="middle">max concurrency (= max-num-seqs), log scale</text>
+<polyline points="84.0,294.8 265.3,265.4 446.7,204.2 628.0,121.6" fill="none" stroke="#0679A8" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+<circle cx="84.0" cy="294.8" r="4.5" fill="#0679A8" stroke="#fdfdfc" stroke-width="2"/>
+<circle cx="265.3" cy="265.4" r="4.5" fill="#0679A8" stroke="#fdfdfc" stroke-width="2"/>
+<circle cx="446.7" cy="204.2" r="4.5" fill="#0679A8" stroke="#fdfdfc" stroke-width="2"/>
+<circle cx="628.0" cy="121.6" r="4.5" fill="#0679A8" stroke="#fdfdfc" stroke-width="2"/>
+<text x="641.0" y="125.6" font-size="11.5" fill="#1a1a19">budget 512</text>
+<text x="641.0" y="139.6" font-size="10" fill="#5b6169" font-family="IBM Plex Mono, DejaVu Sans Mono, monospace">6,054</text>
+<polyline points="84.0,279.2 265.3,241.0 446.7,175.7 628.0,66.1" fill="none" stroke="#C2570B" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round" stroke-dasharray="7 4"/>
+<circle cx="84.0" cy="279.2" r="4.5" fill="#C2570B" stroke="#fdfdfc" stroke-width="2"/>
+<circle cx="265.3" cy="241.0" r="4.5" fill="#C2570B" stroke="#fdfdfc" stroke-width="2"/>
+<circle cx="446.7" cy="175.7" r="4.5" fill="#C2570B" stroke="#fdfdfc" stroke-width="2"/>
+<circle cx="628.0" cy="66.1" r="4.5" fill="#C2570B" stroke="#fdfdfc" stroke-width="2"/>
+<text x="641.0" y="70.1" font-size="11.5" fill="#1a1a19">budget 2048</text>
+<text x="641.0" y="84.1" font-size="10" fill="#5b6169" font-family="IBM Plex Mono, DejaVu Sans Mono, monospace">7,604</text>
+</svg>
