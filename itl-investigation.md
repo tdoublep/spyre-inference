@@ -5,8 +5,15 @@ concurrency 4 on the merged #789 + #784 branch.
 
 **Headline: most of it was a torch-spyre bug fixed 6 commits after our pin.**
 Bumping `e02b78b -> da15ede` took median ITL from 2057 ms to 374 ms at identical
-config. A separate, still-open problem remains: per-block decode cost triples
-above 16 blocks of padded KV.
+config.
+
+Once fixed, decode cost is **linear** in padded KV: `ITL ~= 190 ms + 11.5 ms *
+num_blocks` (R^2 = 0.9995). An apparent cost cliff above 16 blocks turned out to be
+an artifact of varying prompt length in the sweep, and is retracted -- see
+section 4. The remaining levers are padding waste from the geometric KV buckets
+(~25% of blocks at 1500 tokens, more just above a power of two), prefill/decode
+contention driven by the 512-token `max_num_batched_tokens` cap, and the ~190 ms
+load-pattern-fixed term.
 
 - Date: 2026-09-06
 - Host: tpa-spyre-dev-4, pinned libs from `~/spyre-libs/env.sh`
@@ -85,19 +92,44 @@ The bump removes a large mostly-fixed layout cost. It does not fix length scalin
 Six commits moved, so this shows the bump fixes it, not that #4163 alone does;
 bisecting those six would pin it exactly, and is cheap now.
 
-## 4. Still open: a per-block cost cliff above 16 blocks
+## 4. There is no per-block cost cliff (retracted)
 
-On `da15ede`, per-block decode cost is flat-then-jump rather than smooth:
+The sweep in section 3 appeared to show per-block cost tripling above 16 blocks
+(23 -> 74 -> 69 ms per block). That was an artifact: it varied prompt length to
+reach different buckets, so prefill chunk count varied with it, and vLLM charges a
+shared prefill/decode step to the decoding request's ITL.
 
-| blocks | median ITL | per block |
-|---|---|---|
-| 16 | 374 ms | **23 ms** |
-| 32 | 2376 ms | **74 ms** |
-| 64 | 4390 ms | 69 ms |
+Isolated properly -- same 1500-token prompt in every run, forced into different
+padded-KV buckets by pinning `max_model_len` equal to a single
+`SPYRE_ATTN_KV_BUCKETS` entry, with `--num-gpu-blocks-override 2049` holding cache
+size constant (verified: `GPU KV cache size: 262,272 tokens` in all five runs):
 
-A 3.2x jump in per-block cost across one bucket boundary looks like a capacity
-cliff around 2048 tokens of padded KV. Real traffic straddles it: the original
-benchmark averaged 1674-token prompts growing over 54 decode steps.
+| blocks | bucket | median ITL | linear fit | residual |
+|---|---|---|---|---|
+| 16 | 2048 | 375.26 ms | 374.8 | +0.5 |
+| 20 | 2560 | 419.04 ms | 421.0 | -2.0 |
+| 24 | 3072 | 468.24 ms | 467.2 | +1.0 |
+| 28 | 3584 | 515.28 ms | 513.3 | +2.0 |
+| 32 | 4096 | 557.94 ms | 559.5 | -1.6 |
+
+```
+ITL ~= 190 ms + 11.5 ms * num_blocks       R^2 = 0.9995
+```
+
+Linear to within +/-2 ms across exactly the range that looked like a cliff.
+Per-block increments: 10.95, 12.30, 11.76, 10.67 ms.
+
+The artifact is quantified: at 32 blocks the isolated measurement is 558 ms where
+the sweep reported 2376 ms, so ~1818 ms was prefill contention (7 chunks per
+request at 3500 tokens). The fit extrapolates to ~926 ms at 64 blocks against the
+sweep's 4390 ms, i.e. ~3460 ms of contention at 14 chunks per request -- scaling
+with chunk count as expected.
+
+Reproducibility: 375.26 ms here vs 374 ms in section 3's A/B, despite different
+`max_model_len` and bucket counts. Also note the old build's cache-size penalty
+(804 ms at 513 blocks vs 2057 ms at 2049 blocks for the same prompt) is gone --
+2049 blocks now gives 375 ms, so that penalty was part of the same layout bug. A
+new-build run at 513 blocks would confirm no residual sensitivity; not measured.
 
 ## 5. Profiler traces
 
@@ -121,15 +153,37 @@ Per-call cost, 16 vs 32 blocks:
 | `launch::HostCallback` (largest total: 14.7 -> 29.9 s) | 4398 us | 7539 us | 1.71x |
 
 The attention kernel doubling is expected. The MLP kernel staying flat is correct.
-The anomaly is the **MLP jobplan launch doubling while its kernel is flat** — a
-launch cannot legitimately depend on KV length, so these `launch_jobplan` and
-`launch::HostCallback` spans are measuring the host blocking on the device queue
-behind the attention work, not launch cost. `launch::HostCallback` is the largest
-single line in both traces at 3335 calls x 4.4 ms, roughly 20x what a jobplan
-launch should cost. That suggests host and device are not overlapping.
+The **MLP jobplan launch doubles while its kernel is flat** — a launch cannot
+depend on KV length, so those spans measure the host waiting, not launch work.
+`launch::HostCallback` count is exactly 1:1 with device kernel count (3335/3335 and
+3960/3960) and its total (14668 / 29853 ms) nearly equals device-kernel busy time
+(14852 / 30071 ms), so it is the host blocking per kernel.
 
-Inferred from the scaling signature, not from an observed wait primitive — a
-strong hypothesis, not proven.
+But the device is ~94% busy in both traces (14852 ms of a 15816 ms window; 30071 of
+31924), so the host is not the bottleneck -- it waits because the device is
+working. There is only ~6% idle to reclaim, so pipelining submissions would buy
+almost nothing. The MLP-launch anomaly is backpressure behind attention, not an
+independent problem.
+
+Lane structure, for anyone reading these traces: tid 0 is the device kernel stream
+(`spyre_kernel_v1_*`), tid 100/200 are DMA copies, tid 400 memset/release, the
+named thread is the host, and the two `Spans` lanes (`__aiu_profiler__`,
+`PyTorch Profiler`) are single whole-window wrappers that must be excluded from any
+utilization sum.
+
+**Profiled device-kernel durations are inflated ~1.8x.** Section 4's fit gives a
+block-dependent term of 11.5 ms/block, i.e. 184 ms at 16 blocks; the trace implies
+40 layers x 8.60 ms = 344 ms. So AIUPTI's per-kernel instrumentation roughly
+doubles measured kernel time, and trace timings must not be read as absolute
+device cost. Honest split from the section 4 fit:
+
+| | block-dependent (attention) | fixed |
+|---|---|---|
+| 16 blocks | 184 ms (49%) | 190 ms (51%) |
+| 32 blocks | 369 ms (66%) | 190 ms (34%) |
+
+The 190 ms is fixed *under this load pattern* and includes the constant prefill
+contention held equal across runs, so it is not purely per-step model work.
 
 ## Notes for anyone repeating this
 
