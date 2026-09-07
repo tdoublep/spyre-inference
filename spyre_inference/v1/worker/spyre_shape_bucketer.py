@@ -169,7 +169,7 @@ def pooling_warmup_shapes(
 def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[int]:
     """Row widths the lm_head can see: each body bucket clipped to ``max_num_reqs``."""
     cap = max(1, max_num_reqs)
-    return sorted({min(int(size), cap) for size in bucket_sizes if int(size) > 0})
+    return sorted({min(size, cap) for size in bucket_sizes if size > 0})
 
 
 class EncoderBucketPad(NamedTuple):
