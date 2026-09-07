@@ -37,15 +37,19 @@ class _Bucketer:
 
 
 def _runner(bucket_sizes=BODY_BUCKETS, max_num_reqs=MAX_NUM_REQS):
+    compilation_config = types.SimpleNamespace(
+        compile_sizes=list(bucket_sizes),
+        inductor_compile_config={},
+        static_forward_context={},
+    )
     runner = TorchSpyreModelRunner.__new__(TorchSpyreModelRunner)
     runner.model_config = types.SimpleNamespace(runner_type="generate")
     runner.vllm_config = types.SimpleNamespace(
         model_config=types.SimpleNamespace(enforce_eager=False),
-        compilation_config=types.SimpleNamespace(
-            compile_sizes=list(bucket_sizes),
-            inductor_compile_config={},
-        ),
+        compilation_config=compilation_config,
     )
+    runner.compilation_config = compilation_config
+    runner._spyre_device = torch.device("cpu")
     runner.spyre_shape_bucketer = _Bucketer(list(bucket_sizes))
     runner.max_num_reqs = max_num_reqs
 

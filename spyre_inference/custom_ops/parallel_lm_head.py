@@ -22,6 +22,7 @@ Spyre Device Constraints:
 """
 
 import torch
+from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -79,6 +80,9 @@ class SpyreParallelLMHead(ParallelLMHead):
                 self._parameters["weight"] = weight
 
     def __init__(self, *args, **kwargs):
+        # Pad the vocab so every TP shard is a whole number of 64-element sticks, which
+        # lets the logits gather stay on device (see SpyreCommunicator.all_gather).
+        kwargs["padding_size"] = 64 * get_tensor_model_parallel_world_size()
         super().__init__(*args, **kwargs)
 
         # Only UnquantizedEmbeddingMethod supported. Fp8Config resolves to it;
