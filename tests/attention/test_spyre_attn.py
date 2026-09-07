@@ -361,6 +361,7 @@ def _run_spyre_attn_test(
     num_kv_heads: int = 8,
     head_size: int = 128,
     expect_fused_store: bool | None = None,
+    expect_query_widths: set[int] | None = None,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # The compiled attention kernel targets the Spyre device. On CPU it routes
@@ -509,6 +510,14 @@ def _run_spyre_attn_test(
         assert fused_calls, "no attention kernel ran"
         assert set(fused_calls) == {expect_fused_store}, (
             f"fused output store: expected {expect_fused_store}, got {set(fused_calls)}"
+        )
+
+    if expect_query_widths is not None:
+        # Kernel cache keys are (num_blocks, padded_query_len).
+        widths = {key[1] for key in attn_impl._attn_fns}
+        assert widths == expect_query_widths, (
+            f"query widths dispatched: expected {expect_query_widths}, got {widths} "
+            f"(kernel cache keys: {sorted(attn_impl._attn_fns)})"
         )
 
     ref_output = ref_attn(
@@ -946,6 +955,46 @@ def test_spyre_attn_chunked_prefill(
         sliding_window=None,
         configure_compilation=configure_compilation,
         configure_device=configure_device,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+def test_mixed_batch_dispatches_decode_at_query_width_one(
+    default_vllm_config,
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """A decoding sequence sharing a step with a prefill chunk keeps the
+    query_len=1 kernel instead of being padded to the chunk's query bucket.
+    """
+    from vllm.config import get_current_vllm_config
+
+    chunk_len = 64
+    chunk_bucket = SpyreAttnBucketer(get_current_vllm_config()).find_query_bucket(chunk_len)
+    assert chunk_bucket is not None and chunk_bucket > 1
+
+    _run_spyre_attn_test(
+        seq_lens=[(chunk_len, 256), (1, 256), (1, 512)],
+        block_size=128,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        expect_query_widths={1, chunk_bucket},
     )
 
 
@@ -1983,9 +2032,9 @@ def test_padded_mask_rows_equal_last_real_row(default_vllm_config, seq_lens):
     query_len = seq_lens[0][0]
     metadata = _padded_mask_metadata(seq_lens)
 
-    aligned = metadata.aligned_max_query_len
+    aligned = metadata.aligned_query_lens[0]
     if query_len == 1:
-        # A decode-only batch skips query padding entirely.
+        # A decoding sequence skips query padding entirely.
         assert aligned == 1
         return
     assert aligned >= query_len
@@ -2029,15 +2078,49 @@ def test_padded_mask_rows_isolated_across_sequences(default_vllm_config):
     torch.set_default_device("cpu")
     seq_lens = [(7, 256), (33, 512), (1, 128)]
     metadata = _padded_mask_metadata(seq_lens)
-    aligned = metadata.aligned_max_query_len
+    aligned = metadata.aligned_query_lens
+    # Widths are per sequence: the decoding sequence stays at 1 rather than
+    # padding to its prefill neighbours' bucket.
+    assert aligned[2] == 1
+    assert aligned[0] > 1 and aligned[1] > 1
 
     for seq_idx, (query_len, _) in enumerate(seq_lens):
         mask = _seq_mask(metadata, seq_idx)
+        assert mask.shape[0] == aligned[seq_idx]
         last_real = mask[query_len - 1]
-        for row in range(query_len, aligned):
+        for row in range(query_len, aligned[seq_idx]):
             assert torch.equal(mask[row], last_real), (
                 f"seq {seq_idx} padded row {row} does not match its own row {query_len - 1}"
             )
+
+
+@pytest.mark.parametrize(
+    "sliding_window",
+    [pytest.param(None, id="full_attention"), pytest.param(128, id="sliding_window128")],
+)
+def test_per_sequence_masks_match_a_solo_build(default_vllm_config, monkeypatch, sliding_window):
+    """Each sequence's mask must not depend on who else is in its batch.
+
+    Three query buckets, so the batch spans three distinct widths and the
+    grouped mask build runs more than once with causal masking on.
+    """
+    monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "1,8,64,512")
+    torch.set_default_device("cpu")
+    seq_lens = [(7, 256), (33, 512), (1, 128), (40, 300)]
+    # Headroom for the padded block counts, as a real engine's table has.
+    table_width = _num_blocks_buckets()[-1]
+
+    batched = _padded_mask_metadata(
+        seq_lens, sliding_window=sliding_window, max_num_blocks=table_width
+    )
+    assert sorted(set(batched.aligned_query_lens)) == [1, 8, 64]
+
+    for seq_idx, one in enumerate(seq_lens):
+        solo = _padded_mask_metadata(
+            [one], sliding_window=sliding_window, max_num_blocks=table_width
+        )
+        assert batched.aligned_query_lens[seq_idx] == solo.aligned_query_lens[0]
+        assert torch.equal(_seq_mask(batched, seq_idx), _seq_mask(solo, 0))
 
 
 def test_query_row_table_clamp_matches_mask_clamp(default_vllm_config):
@@ -2045,12 +2128,12 @@ def test_query_row_table_clamp_matches_mask_clamp(default_vllm_config):
     torch.set_default_device("cpu")
     seq_lens = [(7, 256), (33, 512)]
     metadata = _padded_mask_metadata(seq_lens)
-    aligned = metadata.aligned_max_query_len
 
     row_tables = _build_query_row_tables(metadata, torch.device("cpu"))
     starts = metadata.query_start_loc[:-1].tolist()
 
     for seq_idx, (query_len, _) in enumerate(seq_lens):
+        aligned = metadata.aligned_query_lens[seq_idx]
         rows = row_tables[seq_idx][:aligned].tolist()
         expected = [starts[seq_idx] + min(q, query_len - 1) for q in range(aligned)]
         assert rows == expected, f"seq {seq_idx} row table {rows} != {expected}"
@@ -2069,7 +2152,7 @@ def test_sliding_window_padded_mask_rows_equal_last_real_row(default_vllm_config
     query_len = seq_lens[0][0]
     metadata = _padded_mask_metadata(seq_lens, sliding_window=128)
 
-    aligned = metadata.aligned_max_query_len
+    aligned = metadata.aligned_query_lens[0]
     mask = _seq_mask(metadata, 0)
     last_real = mask[query_len - 1]
     for row in range(query_len, aligned):

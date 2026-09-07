@@ -206,6 +206,9 @@ class SpyreAttnBucketer:
         The two size axes aren't independent: ``kv_len >= query_len`` always, so
         a query bucket only pairs with block counts that can hold it -- the full
         cross product would record many unreachable variants at a long context.
+        This holds only because the backend buckets query length per sequence:
+        a batch-wide bucket would let a one-block sequence dispatch at the
+        widest bucket in its batch, which this pruning would have dropped.
         The bound is on the *smallest real* query_len that reaches a bucket, not
         the bucket itself, since a 2-token query on a 1-block sequence still
         dispatches to a large padded bucket; bounding by the bucket would prune

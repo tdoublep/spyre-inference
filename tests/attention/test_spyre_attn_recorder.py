@@ -160,7 +160,42 @@ class TestRecordGraphs:
             assert num_blocks in bucketer.num_blocks_buckets, (
                 f"kv_len={kv_len} produced an unrecorded block count {num_blocks}"
             )
-            impl._get_attn_fn(num_blocks, metadata.aligned_max_query_len)
+            impl._get_attn_fn(num_blocks, metadata.aligned_query_lens[0])
+
+        assert len(impl._attn_fns) == snapshot
+
+    def test_mixed_batch_dispatch_does_not_grow_the_cache(self, impl, kv_cache):
+        """A mixed batch dispatches two query widths; both must be recorded.
+
+        The decoding sequences use the query_len=1 kernel while the prefill
+        chunk uses its own bucket, so this covers a pairing that a batch-wide
+        query bucket never produced.
+        """
+        from vllm.config import get_current_vllm_config
+
+        from tests.attention.test_spyre_attn import _padded_mask_metadata
+
+        bucketer = SpyreAttnBucketer(get_current_vllm_config())
+        impl.record_graphs(torch.device("cpu"), bucketer, kv_cache)
+        snapshot = len(impl._attn_fns)
+        assert snapshot > 0
+
+        metadata = _padded_mask_metadata(
+            [(32, 300), (1, 200), (1, 65)],
+            block_size=BLOCK_SIZE,
+            num_query_heads=NUM_HEADS,
+            num_kv_heads=NUM_KV_HEADS,
+            head_size=HEAD_SIZE,
+            max_num_blocks=NUM_PAGES,
+        )
+        assert metadata.aligned_query_lens[0] > 1
+        assert metadata.aligned_query_lens[1:] == [1, 1]
+        assert metadata.padded_num_blocks is not None
+
+        for seq_idx, aligned in enumerate(metadata.aligned_query_lens):
+            num_blocks = metadata.padded_num_blocks[seq_idx]
+            assert num_blocks <= NUM_PAGES, "variant would have been skipped when recording"
+            impl._get_attn_fn(num_blocks, aligned)
 
         assert len(impl._attn_fns) == snapshot
 
