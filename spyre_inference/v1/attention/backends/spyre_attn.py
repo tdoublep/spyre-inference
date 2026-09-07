@@ -878,8 +878,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         num_seqs = common_attn_metadata.num_reqs
         query_lens = query_start_loc[1 : num_seqs + 1] - query_start_loc[:num_seqs]
 
-        # Per sequence, not batch-wide: a decoding sequence sharing a step with a
-        # prefill chunk would otherwise pay a prefill-width pass for its one row.
         aligned_query_lens: list[int] = []
         for query_len in query_lens.tolist():
             if query_len <= 1:
@@ -914,8 +912,6 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 real_num_blocks.append(n)
             padded_num_blocks = [self._pad_num_blocks(n) for n in real_num_blocks]
 
-            # One build per distinct query width, so a decoding sequence's tiles
-            # are not as wide as the prefill chunk's.
             # Padded tiles need no special construction — kv_valid = kv_pos <
             # seq_lens already emits finfo.min past the true length.
             # Each tile is [aligned_query_lens[s], block_size] -- _record_one
