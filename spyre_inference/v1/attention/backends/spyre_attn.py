@@ -451,6 +451,9 @@ def _call_kernel(label: str, fn, *args):
 
     Dynamo's counter is process-wide but attributable across just this call: a
     compiled region runs no eager ops, and torch-spyre compiles every eager aten op.
+    That assumes nothing else compiles concurrently on another thread, which holds for
+    a single-tenant serving process; if it ever stops holding, the cost is a spurious
+    warning, not a wrong result.
     """
     if not _warmup_complete:
         return fn(*args)
