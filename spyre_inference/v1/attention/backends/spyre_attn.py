@@ -466,6 +466,7 @@ def _lx_page_attn_kernel(
     alibi_bias_tiles=None,
     out=None,
     out_row_tables=None,
+    out_row_index=None,
 ):
     """As `_page_attn_kernel`, over the (page, kv_head)-folded cache.
 
@@ -565,7 +566,10 @@ def _lx_page_attn_kernel(
     attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
     attn = attn.reshape(padded_query_len, num_heads, head_size)
     if out is not None:
-        out.index_copy_(0, query_row_index[:padded_query_len], attn[:padded_query_len])
+        # Not query_row_index: when the query comes from this sequence's own narrow
+        # buffer that index is zero, while the output still lands on the batch row.
+        rows = out_row_index if out_row_index is not None else query_row_index
+        out.index_copy_(0, rows[:padded_query_len], attn[:padded_query_len])
         return out
     return attn
 
@@ -1832,6 +1836,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         rows = torch.zeros(index_len, dtype=torch.int32)
         rows[:q_len] = torch.arange(q_len, dtype=torch.int32)
         row_table = convert(rows, device=device)
+        out_row_index = row_table
+        # A one-row folded variant is dispatched on the sequence's own narrow buffer, so
+        # it has to be traced on one too or the recorded graph never matches.
+        if self._lx_kv_layout and q_len == 1:
+            query = self.seq_staging_buffers(device)[0]
+            row_table = convert(torch.zeros(index_len, dtype=torch.int32), device=device)
 
         page_index_table = convert(
             torch.zeros(bucket.num_blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32),
@@ -1914,6 +1924,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     lx_alibi_tiles,
                     self._lx_out_flat if fused_store else out_staging,
                     out_row_tables,
+                    out_row_index,
                 )
             return
 
@@ -2229,12 +2240,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             row_table = attn_metadata.query_row_tables[seq_idx]
 
             # A one-row sequence reads its own 2-row buffer, so the kernel's row gather
-            # costs a row rather than the whole batch buffer. Its row is always row 0
-            # there, so the table is all zeros -- which is why this is confined to the
-            # fused store: every other tail also indexes its *output* with that same
-            # table, and would write every sequence to row 0.
+            # costs a row rather than the whole batch buffer. Decided per sequence, not
+            # per batch: a decode sharing a batch with a prefill benefits too. Its row
+            # there is always row 0, so the gather table is all zeros and the real rows
+            # go to the kernel separately as out_row_index for the store.
             seq_query = q_staging
-            if lx_fused_store:
+            out_row_index = row_table
+            if self._lx_kv_layout and aligned_query_lens[seq_idx] == 1:
                 seq_buf = self.seq_staging_buffers(_target_device)[seq_idx]
                 seq_buf[0] = query_dev[q_start] if not pre_staged else q_staging[q_start]
                 seq_query = seq_buf
@@ -2275,6 +2287,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                             else None
                         ),
                         out_row_tables[seq_idx] if out_row_tables is not None else None,
+                        out_row_index,
                     )
             else:
                 result = _call_kernel(
