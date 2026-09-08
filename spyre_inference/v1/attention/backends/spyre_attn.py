@@ -1510,9 +1510,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Constant for the run, so the kernel's arguments never carry the model
         # graph's token count. The +1 keeps every gather a strict subset: selecting
         # a whole source faults the device (torch-spyre#4033).
-        self.staging_rows: int = (
-            get_current_vllm_config().scheduler_config.max_num_batched_tokens + 1
-        )
+        _sched = get_current_vllm_config().scheduler_config
+        self.staging_rows: int = _sched.max_num_batched_tokens + 1
+        # Read here, not at forward time: there is no vllm config context then.
+        self._max_num_seqs: int = _sched.max_num_seqs
         self._staging: tuple[torch.Tensor, torch.Tensor] | None = None
         self._lx_out_flat: torch.Tensor | None = None
         # One narrow query buffer per sequence slot. A decode sequence needs a single
@@ -1565,16 +1566,15 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Public accessor so ``attn_layer`` can stage inside the traced graph."""
         return self._staging_buffers(device)
 
-    def _seq_staging_buffers(self, device: torch.device) -> list[torch.Tensor]:
+    def seq_staging_buffers(self, device: torch.device) -> list[torch.Tensor]:
         """Per-sequence 2-row query buffers; 2 keeps the gather a strict subset (#4033)."""
         if self._seq_staging is None:
-            n = get_current_vllm_config().scheduler_config.max_num_seqs
             self._seq_staging = [
                 convert(
                     torch.zeros(2, self.num_heads, self.head_size, dtype=self.model_dtype),
                     device=device,
                 )
-                for _ in range(n)
+                for _ in range(self._max_num_seqs)
             ]
         return self._seq_staging
 
@@ -2235,7 +2235,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # table, and would write every sequence to row 0.
             seq_query = q_staging
             if lx_fused_store:
-                seq_buf = self._seq_staging_buffers(_target_device)[seq_idx]
+                seq_buf = self.seq_staging_buffers(_target_device)[seq_idx]
                 seq_buf[0] = query_dev[q_start] if not pre_staged else q_staging[q_start]
                 seq_query = seq_buf
                 if self._zero_row_table is None:
@@ -2322,3 +2322,4 @@ def allocate_staging_buffers(
         impl = getattr(layer, "impl", None)
         if isinstance(impl, SpyreAttentionImpl):
             impl.staging_buffers(device)
+            impl.seq_staging_buffers(device)
