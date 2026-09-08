@@ -496,11 +496,13 @@ def _lx_page_attn_kernel(
     # Gathered with an index rather than sliced: a compiled region reads a view from
     # offset 0 and ignores its strides, and `.contiguous()` clones that same view
     # (torch-spyre#3770).
-    q_groups = []
-    for g in range(num_queries_per_kv):
-        heads = query.index_select(1, head_index_tables[g])
-        heads = heads.index_select(0, query_row_index[:padded_query_len])
-        q_groups.append(heads.transpose(0, 1))
+    # Rows before heads: selecting heads first keeps every staging row, so each group
+    # builds a full-height intermediate and then gathers one row back out of it.
+    q_rows = query.index_select(0, query_row_index[:padded_query_len])
+    q_groups = [
+        q_rows.index_select(1, head_index_tables[g]).transpose(0, 1)
+        for g in range(num_queries_per_kv)
+    ]
 
     # Appended on the first block, then updated in place: one entry per group.
     tile_max: list[torch.Tensor] = []
