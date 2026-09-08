@@ -200,6 +200,26 @@ _SPYRE_CORES = 32
 _LX_ATTN_CORES = 8
 
 
+def _lx_head_index_tables(
+    num_kv_heads: int, num_queries_per_kv: int, device: torch.device
+) -> list[torch.Tensor]:
+    """Per query group, that group's head ids across the kv heads.
+
+    Doubles as the fused store's row table at query length 1, where a row's
+    (row, head) index reduces to the head id.
+    """
+    return [
+        convert(
+            torch.tensor(
+                [kv * num_queries_per_kv + g for kv in range(num_kv_heads)],
+                dtype=torch.int32,
+            ),
+            device=device,
+        )
+        for g in range(num_queries_per_kv)
+    ]
+
+
 def _attn_max_cores(output_units: int) -> int:
     """Core cap for one attention compile, 0 for uncapped.
 
@@ -1672,16 +1692,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
 
         if self._lx_kv_layout and self._head_index_tables is None:
-            self._head_index_tables = [
-                convert(
-                    torch.tensor(
-                        [kv * self.num_queries_per_kv + g for kv in range(self.num_kv_heads)],
-                        dtype=torch.int32,
-                    ),
-                    device=_target_device,
-                )
-                for g in range(self.num_queries_per_kv)
-            ]
+            self._head_index_tables = _lx_head_index_tables(
+                self.num_kv_heads, self.num_queries_per_kv, _target_device
+            )
 
         output = self._online_softmax_attention(
             query,
@@ -1820,6 +1833,66 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 )
                 for _ in range(bucket.num_blocks)
             ]
+
+        if self._lx_kv_layout:
+            # The folded kernel takes different index tables, a block_size argument,
+            # and ALiBi tiles split per query group. Every argument mirrors the
+            # forward path so the recorded graph is the one dispatch reuses.
+            heads_col = torch.arange(self.num_kv_heads, dtype=torch.int32).reshape(
+                self.num_kv_heads, 1
+            )
+            kv_index_tables = [
+                convert(b * self.num_kv_heads + heads_col, device=device)
+                for b in range(bucket.num_blocks)
+            ]
+            if self._head_index_tables is None:
+                self._head_index_tables = _lx_head_index_tables(
+                    self.num_kv_heads, self.num_queries_per_kv, device
+                )
+            lx_alibi_tiles = None
+            if self.alibi_slopes is not None:
+                lx_alibi_tiles = [
+                    [
+                        convert(
+                            torch.zeros(self.num_kv_heads, 1, block_size, dtype=self.model_dtype),
+                            device=device,
+                        )
+                        for _ in range(self.num_queries_per_kv)
+                    ]
+                    for _ in range(bucket.num_blocks)
+                ]
+            # q_len 1 selects the fused store, exactly as forward decides it. Row 0's
+            # (row, head) rows are then just the group's head ids.
+            fused_store = q_len == 1
+            out_row_tables = (
+                _lx_head_index_tables(self.num_kv_heads, self.num_queries_per_kv, device)
+                if fused_store
+                else None
+            )
+            # Wraps the call, not the definition: torch.compile is lazy, so the graph
+            # compiles here, and an uncapped recording would not match forward's.
+            with _capped_attn_cores(self.num_kv_heads * q_len):
+                self._lx_attn_fn(
+                    query,
+                    row_table,
+                    k_pages,
+                    v_pages,
+                    kv_index_tables,
+                    self._head_index_tables,
+                    mask_tiles,
+                    self.scale,
+                    bucket.num_blocks,
+                    q_len,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_size,
+                    block_size,
+                    self.logits_soft_cap,
+                    lx_alibi_tiles,
+                    self._lx_out_flat if fused_store else out_staging,
+                    out_row_tables,
+                )
+            return
 
         self._attn_fn(
             query,
