@@ -1545,6 +1545,29 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             "itself; a gather selecting its whole source faults the device"
         )
 
+    def _mirror_lx_index_tables(
+        self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
+    ) -> list[list[torch.Tensor]]:
+        """Per-block (page, kv_head) gather rows in the folded cache."""
+        if attn_metadata.kv_index_tables is None:
+            attn_metadata.kv_index_tables = {}
+        cached = attn_metadata.kv_index_tables.get(self.num_kv_heads)
+        if cached is not None:
+            return cached
+
+        tables_cpu = attn_metadata.page_index_tables_cpu
+        assert tables_cpu is not None
+        heads = torch.arange(self.num_kv_heads, dtype=torch.int32).reshape(self.num_kv_heads, 1)
+        tables = [
+            [
+                convert(table[b, 0] * self.num_kv_heads + heads, device=device)
+                for b in range(table.shape[0])
+            ]
+            for table in tables_cpu
+        ]
+        attn_metadata.kv_index_tables[self.num_kv_heads] = tables
+        return tables
+
     def _mirror_lx_out_row_tables(
         self, attn_metadata: "SpyreAttentionMetadata", device: torch.device
     ) -> list[list[torch.Tensor]]:
