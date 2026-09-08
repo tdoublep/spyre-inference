@@ -246,7 +246,7 @@ def _alibi_tile_shape(
     return (num_kv_heads, num_queries_per_kv, 1, block_size)
 
 
-def _create_folded_reshape_and_cache(num_kv_heads: int):
+def _folded_reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping, num_kv_heads):
     """Store into the (page, kv_head)-folded cache, one index_copy_ per kv head.
 
     Unrolled rather than one index_copy_ over a flattened source: every way of
@@ -254,14 +254,10 @@ def _create_folded_reshape_and_cache(num_kv_heads: int):
     fails to lower. The unrolled ops fuse into one kernel, so they cost no extra
     launches. `slot_mapping` is the per-head list from `SlotMapping.slots_for`.
     """
-
-    def store(key, value, k_slots, v_slots, slot_mapping):
-        for h in range(num_kv_heads):
-            rows = slot_mapping[h]
-            k_slots.index_copy_(0, rows, key.select(1, h))
-            v_slots.index_copy_(0, rows, value.select(1, h))
-
-    return store
+    for h in range(num_kv_heads):
+        rows = slot_mapping[h]
+        k_slots.index_copy_(0, rows, key.select(1, h))
+        v_slots.index_copy_(0, rows, value.select(1, h))
 
 
 def _mirror_mask_tiles(
@@ -1466,7 +1462,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Always compiled: eager index_copy_ rejects an int32 index and falls
         # back to CPU with an int64 one.
         self._reshape_fn = torch.compile(
-            _create_folded_reshape_and_cache(num_kv_heads)
+            _folded_reshape_and_cache_kernel
             if envs.SPYRE_LX_KV_LAYOUT
             else _reshape_and_cache_kernel,
             dynamic=False,
@@ -1882,7 +1878,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         k_slots, v_slots = self.kv_slot_views(kv_cache)
         # Eager index_copy_ rejects an int32 index and silently falls back to CPU with an
         # int64 one, so this always goes through the compiled artifact.
-        self._reshape_fn(key, value, k_slots, v_slots, slot_mapping)
+        if self._lx_kv_layout:
+            self._reshape_fn(key, value, k_slots, v_slots, slot_mapping, self.num_kv_heads)
+        else:
+            self._reshape_fn(key, value, k_slots, v_slots, slot_mapping)
         # Only k_slots is returned, but Inductor fuses both index_copy_ calls into one
         # kernel, so ordering the read after it covers the V write too.
         return k_slots
