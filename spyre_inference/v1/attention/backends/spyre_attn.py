@@ -1515,6 +1515,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         )
         self._staging: tuple[torch.Tensor, torch.Tensor] | None = None
         self._lx_out_flat: torch.Tensor | None = None
+        # One narrow query buffer per sequence slot. A decode sequence needs a single
+        # row, but the kernel's gather indexes an axis the buffer's layout does not put
+        # outermost, so it costs the whole buffer rather than the row -- reading from a
+        # 2-row buffer instead of the batch-wide one removes that. All slots share one
+        # shape, so Dynamo still sees a single variant, and the choice is per sequence,
+        # so a decode in a mixed batch benefits too.
+        self._seq_staging: list[torch.Tensor] | None = None
+        self._zero_row_table: torch.Tensor | None = None
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
@@ -1556,6 +1564,19 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
     def staging_buffers(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
         """Public accessor so ``attn_layer`` can stage inside the traced graph."""
         return self._staging_buffers(device)
+
+    def _seq_staging_buffers(self, device: torch.device) -> list[torch.Tensor]:
+        """Per-sequence 2-row query buffers; 2 keeps the gather a strict subset (#4033)."""
+        if self._seq_staging is None:
+            n = get_current_vllm_config().scheduler_config.max_num_seqs
+            self._seq_staging = [
+                convert(
+                    torch.zeros(2, self.num_heads, self.head_size, dtype=self.model_dtype),
+                    device=device,
+                )
+                for _ in range(n)
+            ]
+        return self._seq_staging
 
     def _assert_query_fits_staging(self, padded_query_len: int) -> None:
         assert padded_query_len < self.staging_rows, (
@@ -2207,6 +2228,22 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 )
             row_table = attn_metadata.query_row_tables[seq_idx]
 
+            # A one-row sequence reads its own 2-row buffer, so the kernel's row gather
+            # costs a row rather than the whole batch buffer. Its row is always row 0
+            # there, so the table is all zeros -- which is why this is confined to the
+            # fused store: every other tail also indexes its *output* with that same
+            # table, and would write every sequence to row 0.
+            seq_query = q_staging
+            if lx_fused_store:
+                seq_buf = self._seq_staging_buffers(_target_device)[seq_idx]
+                seq_buf[0] = query_dev[q_start] if not pre_staged else q_staging[q_start]
+                seq_query = seq_buf
+                if self._zero_row_table is None:
+                    self._zero_row_table = convert(
+                        torch.zeros(_stick_aligned_len(1), dtype=torch.int32), device=_target_device
+                    )
+                row_table = self._zero_row_table
+
             # Run attention on target device
             if self._lx_kv_layout:
                 assert kv_index_tables is not None and self._head_index_tables is not None
@@ -2216,7 +2253,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                     result = _call_kernel(
                         "LX page attention",
                         self._lx_attn_fn,
-                        q_staging,
+                        seq_query,
                         row_table,
                         k_pages,
                         v_pages,
@@ -2243,7 +2280,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 result = _call_kernel(
                     "page attention",
                     self._attn_fn,
-                    q_staging,
+                    seq_query,
                     row_table,
                     k_pages,
                     v_pages,
