@@ -2139,17 +2139,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Where this loop writes. With a fused store the kernel writes the staging
         # buffer and it is copied back once, after the loop.
         dest = out_staging if store_out else output
-        # The folded kernel's fused store needs a destination indexed by (row, head).
-        # Whole-batch, not per sequence: the fused store hands the kernel the flat
-        # (row, head) buffer, and a sequence taking the non-fused path would index
-        # that flat buffer by row. Query lengths are per sequence since #796, so
-        # every one must be 1 for the fused destination to be safe.
-        lx_fused_store = (
-            self._lx_kv_layout and store_out and max(aligned_query_lens, default=1) == 1
-        )
+        # Per sequence, not per batch: sequences write disjoint rows, so a fused store
+        # (handed the flat (row, head) base) and a non-fused one (the 3-D view aliasing
+        # it) coexist in one batch. Batch-wide, a decode beside a prefill dispatched
+        # query length 1 without the fused store, which the recorder never traces.
         out_row_tables = (
             self._mirror_lx_out_row_tables(attn_metadata, _target_device)
-            if lx_fused_store
+            if self._lx_kv_layout and store_out and any(q == 1 for q in aligned_query_lens)
             else None
         )
 
@@ -2246,6 +2242,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # go to the kernel separately as out_row_index for the store.
             seq_query = q_staging
             out_row_index = row_table
+            fused = out_row_tables is not None and aligned_query_lens[seq_idx] == 1
             if self._lx_kv_layout and aligned_query_lens[seq_idx] == 1:
                 seq_buf = self.seq_staging_buffers(_target_device)[seq_idx]
                 seq_buf[0] = query_dev[q_start] if not pre_staged else q_staging[q_start]
@@ -2281,12 +2278,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                         block_size,
                         self.logits_soft_cap,
                         alibi_bias_tiles,
-                        (
-                            (self._lx_out_flat if lx_fused_store else out_staging)
-                            if store_out
-                            else None
-                        ),
-                        out_row_tables[seq_idx] if out_row_tables is not None else None,
+                        (self._lx_out_flat if fused else out_staging) if store_out else None,
+                        out_row_tables[seq_idx] if fused else None,
                         out_row_index,
                     )
             else:
