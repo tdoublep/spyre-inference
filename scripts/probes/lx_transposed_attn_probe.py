@@ -111,6 +111,7 @@ def flat_folded_attn(
     head_size,
     block_size,
     no_combine=False,
+    permute_v=True,
 ):
     """Folded entry axis kept FLAT at num_kv_heads * G, so every op stays 3-D.
 
@@ -135,10 +136,17 @@ def flat_folded_attn(
             scores = scores + mask_tile
             m = torch.amax(scores, dim=1, keepdim=True)
             p = torch.exp(scores - m)
-            o = torch.matmul(p.transpose(1, 2), v_f)
-            # Everything stays rank 3: a 2-D [kv, Q] pointwise has no supported layout.
-            s = p.sum(dim=1, keepdim=True).transpose(1, 2)
-            mq = m.transpose(1, 2)
+            if permute_v:
+                # V permuted, not consumed raw: with both pages raw the two matmuls
+                # impose competing divisions and NEITHER gather pins (measured).
+                o = torch.matmul(v_f.permute(0, 2, 1), p)  # [E, head_size, Q]
+                s = p.sum(dim=1, keepdim=True)  # [E, 1, Q]
+                mq = m
+            else:
+                o = torch.matmul(p.transpose(1, 2), v_f)
+                # Everything stays rank 3: a 2-D [kv, Q] pointwise has no supported layout.
+                s = p.sum(dim=1, keepdim=True).transpose(1, 2)
+                mq = m.transpose(1, 2)
 
             if no_combine:
                 # Isolates the pages' residency from the combine: the per-entry partials
@@ -171,6 +179,9 @@ def flat_folded_attn(
 
     groups = [tile_out[g] / tile_sum[g] for g in range(num_queries_per_kv)]
     attn = torch.stack(groups, dim=1)
+    if permute_v:
+        attn = attn.reshape(num_kv_heads * num_queries_per_kv, head_size, padded_query_len)
+        return attn.permute(2, 0, 1)
     attn = attn.reshape(num_kv_heads * num_queries_per_kv, padded_query_len, head_size)
     return attn.transpose(0, 1)
 
@@ -383,6 +394,7 @@ if FLAT:
         D,
         B,
         os.environ.get("NO_COMBINE") == "1",
+        os.environ.get("PERMUTE_V", "1") == "1",
     )
     _kernel = flat_folded_attn
 else:
