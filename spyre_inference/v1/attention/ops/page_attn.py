@@ -39,6 +39,7 @@ def page_attn_kernel(
     num_kv_heads,
     head_size,
     logits_soft_cap=0.0,
+    page_group=1,
     alibi_bias_tiles=None,
     out=None,
 ):
@@ -57,6 +58,8 @@ def page_attn_kernel(
             tensor, row i holding the i-th active block's page index at
             column 0.
         mask_tiles: [num_blocks]
+        page_group: number of adjacent pages fused into one online-softmax
+            update. The final group may be shorter.
         alibi_bias_tiles: list of [num_kv_heads, num_queries_per_kv, 1, block_size],
             or None for no ALiBi. The query-axis dim is 1 because softmax absorbs
             per-query-row constants — see the derivation at the bias-tile
@@ -80,17 +83,24 @@ def page_attn_kernel(
     tile_sum = None
     tile_output = None
 
-    for i in range(num_blocks):
+    for group_start in range(0, num_blocks, page_group):
+        group_end = min(group_start + page_group, num_blocks)
         # index_select, not `k_pages[page_idx]`: subscripting lowers to
         # aten.index, which upcasts the int32 index to int64 and fails eager.
-        page_idx = page_index_table[i, 0:1]
+        page_idx = page_index_table[group_start:group_end, 0]
         k_page = k_pages.index_select(0, page_idx)
         v_page = v_pages.index_select(0, page_idx)
-        # Token-major page to head-major for the matmuls; permutes on device.
-        k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
-        v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+        # Token-major pages to head-major for the matmuls; permutes on device.
+        # A group's pages are concatenated along the token axis.
+        tile_tokens = (group_end - group_start) * k_page.shape[1]
+        k_page_4d = (
+            k_page.permute(2, 0, 1, 3).reshape(num_kv_heads, tile_tokens, head_size).unsqueeze(1)
+        )
+        v_page_4d = (
+            v_page.permute(2, 0, 1, 3).reshape(num_kv_heads, tile_tokens, head_size).unsqueeze(1)
+        )
 
-        mask_tile = mask_tiles[i]
+        mask_tile = torch.cat(mask_tiles[group_start:group_end], dim=-1)
 
         scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
         if logits_soft_cap > 0.0:
@@ -102,17 +112,17 @@ def page_attn_kernel(
             # ALiBi bias slope[h] * (kv_pos - context_len). The additive
             # mask_tile below uses finfo.min for masked positions, so this
             # bias cannot un-mask them.
-            scores = scores + alibi_bias_tiles[i]
+            scores = scores + torch.cat(alibi_bias_tiles[group_start:group_end], dim=-1)
         scores = scores + mask_tile
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
 
-        if i == 0:
+        if group_start == 0:
             tile_max = scores_max
             tile_probs = torch.exp(scores - tile_max)
             tile_output = torch.matmul(tile_probs, v_page_4d)
             tile_sum = tile_probs.sum(dim=-1, keepdim=True)
         else:
-            # i > 0 only reachable after the i == 0 branch initialized these.
+            # Only reachable after the group_start == 0 branch initialized these.
             assert tile_max is not None
             assert tile_sum is not None
             assert tile_output is not None
