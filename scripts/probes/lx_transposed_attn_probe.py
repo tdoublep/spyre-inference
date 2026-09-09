@@ -17,8 +17,16 @@ broadcast. The online softmax reduces along block_size (dim 1) instead of the la
 
     Q_LEN=512 SEQ_LEN=1024 python scripts/probes/lx_transposed_attn_probe.py
 
+`FLAT=1 G=4` widens the gather's entry axis to num_kv_heads * G = 32. That variant is
+numerically correct but needs an upstream fix to compile at all:
+`propagate_layouts._is_supported_layout` constructs a SpyreTensorLayout to *test* a
+candidate dim_order and lets a RuntimeError escape, so an invalid candidate aborts the
+compile instead of being rejected. Even with that fixed, work_division splits the 32
+entries only 4 ways (`((0,4),(1,8))`, the other 8 on block_size), and a gather mirrors
+only its entry-axis split, so the pages still land in HBM.
+
 Env: Q_LEN, SEQ_LEN, BLOCK_SIZE, KV_HEADS, QPK, HEAD_SIZE, NUM_PAGES, MAX_CORES,
-     LAYOUT_SOLVER, OUT_DIR
+     G, FLAT, LAYOUT_SOLVER, OUT_DIR
 """
 
 import contextlib
@@ -124,10 +132,11 @@ def flat_folded_attn(
             m = torch.amax(scores, dim=1, keepdim=True)
             p = torch.exp(scores - m)
             o = torch.matmul(p.transpose(1, 2), v_f)
-            s = p.sum(dim=1)
-            mq = m.squeeze(1)
+            # Everything stays rank 3: a 2-D [kv, Q] pointwise has no supported layout.
+            s = p.sum(dim=1, keepdim=True).transpose(1, 2)
+            mq = m.transpose(1, 2)
 
-            # Collapse the G partials, one 3-D slice per folded block.
+            # Collapse the G partials, one slice per folded block.
             for j in range(g_blocks):
                 pick = entry_pick[j]
                 o_j = o.index_select(0, pick)
@@ -141,11 +150,11 @@ def flat_folded_attn(
                 new_max = torch.maximum(tile_max[g], m_j)
                 r_old = torch.exp(tile_max[g] - new_max)
                 r_new = torch.exp(m_j - new_max)
-                tile_out[g] = tile_out[g] * r_old.unsqueeze(-1) + o_j * r_new.unsqueeze(-1)
+                tile_out[g] = tile_out[g] * r_old + o_j * r_new
                 tile_sum[g] = tile_sum[g] * r_old + s_j * r_new
                 tile_max[g] = new_max
 
-    groups = [tile_out[g] / tile_sum[g].unsqueeze(-1) for g in range(num_queries_per_kv)]
+    groups = [tile_out[g] / tile_sum[g] for g in range(num_queries_per_kv)]
     attn = torch.stack(groups, dim=1)
     attn = attn.reshape(num_kv_heads * num_queries_per_kv, padded_query_len, head_size)
     return attn.transpose(0, 1)
