@@ -22,8 +22,11 @@ numerically correct but needs an upstream fix to compile at all:
 `propagate_layouts._is_supported_layout` constructs a SpyreTensorLayout to *test* a
 candidate dim_order and lets a RuntimeError escape, so an invalid candidate aborts the
 compile instead of being rejected. Even with that fixed, work_division splits the 32
-entries only 4 ways (`((0,4),(1,8))`, the other 8 on block_size), and a gather mirrors
-only its entry-axis split, so the pages still land in HBM.
+entries only 4 ways (`((0,4),(1,8))`, the other 8 on block_size) -- invariant to entry
+width (8/32/64) and to block_size (128/64). `NO_COMBINE=1` drops the in-kernel G-reduction
+and does get the planner to a single 32-way entry split (`((0,32),)`), but the gathers'
+own views still cover only 16, so the pages remain in HBM. Best spill measured is the
+unfolded transposed kernel: 6920 KB vs 22528 KB for #783 at the same shape.
 
 Env: Q_LEN, SEQ_LEN, BLOCK_SIZE, KV_HEADS, QPK, HEAD_SIZE, NUM_PAGES, MAX_CORES,
      G, FLAT, LAYOUT_SOLVER, OUT_DIR
@@ -107,6 +110,7 @@ def flat_folded_attn(
     num_queries_per_kv,
     head_size,
     block_size,
+    no_combine=False,
 ):
     """Folded entry axis kept FLAT at num_kv_heads * G, so every op stays 3-D.
 
@@ -136,6 +140,14 @@ def flat_folded_attn(
             s = p.sum(dim=1, keepdim=True).transpose(1, 2)
             mq = m.transpose(1, 2)
 
+            if no_combine:
+                # Isolates the pages' residency from the combine: the per-entry partials
+                # leave the kernel and are reduced on the host instead.
+                tile_out.append(o)
+                tile_sum.append(s)
+                tile_max.append(mq)
+                continue
+
             # Collapse the G partials, one slice per folded block.
             for j in range(g_blocks):
                 pick = entry_pick[j]
@@ -153,6 +165,9 @@ def flat_folded_attn(
                 tile_out[g] = tile_out[g] * r_old + o_j * r_new
                 tile_sum[g] = tile_sum[g] * r_old + s_j * r_new
                 tile_max[g] = new_max
+
+    if no_combine:
+        return tile_out + tile_sum + tile_max
 
     groups = [tile_out[g] / tile_sum[g] for g in range(num_queries_per_kv)]
     attn = torch.stack(groups, dim=1)
@@ -367,6 +382,7 @@ if FLAT:
         QPK,
         D,
         B,
+        os.environ.get("NO_COMBINE") == "1",
     )
     _kernel = flat_folded_attn
 else:
@@ -404,7 +420,12 @@ def _cores(n):
 
 with _cores(MAX_CORES):
     got = torch.compile(_kernel, dynamic=False)(*dev_args)
-got = got.cpu()[:Q_LEN]
+if os.environ.get("NO_COMBINE") == "1":
+    n = len(got) // 3
+    print(f"no-combine: returned {len(got)} partial tensors, shapes {tuple(got[0].shape)}")
+    got = None
+else:
+    got = got.cpu()[:Q_LEN]
 
 k_flat = k_dev.cpu().float().reshape(NUM_PAGES, KV, B, D)
 v_flat = v_dev.cpu().float().reshape(NUM_PAGES, KV, B, D)
@@ -415,7 +436,10 @@ q = query[:Q_LEN].float().reshape(Q_LEN, KV, QPK, D).permute(1, 2, 0, 3)
 scores = torch.matmul(q, k_ctx.unsqueeze(1).transpose(-2, -1)) * SCALE + mask_ctx
 probs = torch.softmax(scores, dim=-1)
 want = torch.matmul(probs, v_ctx.unsqueeze(1)).reshape(NUM_HEADS, Q_LEN, D).transpose(0, 1)
-check("attention vs SDPA", got, want, 2e-2)
+if got is not None:
+    check("attention vs SDPA", got, want, 2e-2)
+else:
+    print("skip  attention vs SDPA: no-combine mode returns partials")
 
 text = PLANNER_LOG.read_text(errors="replace") if PLANNER_LOG.is_file() else ""
 verdicts = re.findall(r"lx_pinning: (\S+) \(([^)]+)\)\s*.\s*([^\n]+)", text)
