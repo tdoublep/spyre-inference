@@ -1257,7 +1257,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
 
         # Padded to match key/value by upstream once forward_includes_kv_cache_update is
         # False, so the traced write keeps one shape per bucket, not one per token count.
-        self._slot_mapping.publish(slot_mapping)
+        # Which batch row each one-row sequence owns, so the traced scatter can send it
+        # to that sequence's slot. Resolved to a full-width tensor by the holder, which
+        # is where the slot count lives.
+        starts = query_start_loc[:num_seqs].tolist()
+        narrow_pairs = [
+            (int(starts[s]), s) for s, aligned in enumerate(aligned_query_lens) if aligned == 1
+        ]
+        self._slot_mapping.publish(slot_mapping, narrow_pairs)
 
         # Batched-decode precomputes: only when Q=1 and num_seqs is within the
         # buckets. None-valued fields signal fallback. Sliding-window batches are
@@ -1520,14 +1527,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._max_num_seqs: int = _sched.max_num_seqs
         self._staging: tuple[torch.Tensor, torch.Tensor] | None = None
         self._lx_out_flat: torch.Tensor | None = None
-        # One narrow query buffer per sequence slot. A decode sequence needs a single
-        # row, but the kernel's gather indexes an axis the buffer's layout does not put
-        # outermost, so it costs the whole buffer rather than the row -- reading from a
-        # 2-row buffer instead of the batch-wide one removes that. All slots share one
-        # shape, so Dynamo still sees a single variant, and the choice is per sequence,
-        # so a decode in a mixed batch benefits too.
-        self._seq_staging: list[torch.Tensor] | None = None
-        self._zero_row_table: torch.Tensor | None = None
+        # One row per sequence slot plus a spare, so a gather of one row is always a
+        # strict subset (torch-spyre#4033) and every batch row has somewhere to land.
+        self.narrow_spare_slot: int = self._max_num_seqs
+        self._narrow: torch.Tensor | None = None
+        self._narrow_rows: list[torch.Tensor] | None = None
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
@@ -1570,17 +1574,39 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Public accessor so ``attn_layer`` can stage inside the traced graph."""
         return self._staging_buffers(device)
 
-    def seq_staging_buffers(self, device: torch.device) -> list[torch.Tensor]:
-        """Per-sequence 2-row query buffers; 2 keeps the gather a strict subset (#4033)."""
-        if self._seq_staging is None:
-            self._seq_staging = [
-                convert(
-                    torch.zeros(2, self.num_heads, self.head_size, dtype=self.model_dtype),
-                    device=device,
-                )
-                for _ in range(self._max_num_seqs)
-            ]
-        return self._seq_staging
+    def narrow_query_buffer(self, device: torch.device) -> torch.Tensor | None:
+        """Query rows for one-row sequences, one slot each plus a spare.
+
+        Rows outermost so the scatter that fills it and the kernel's row gather both
+        address device dim 0. Small enough (max_num_seqs + 1 rows) that its layout
+        costs nothing, unlike the batch-wide buffer, whose consumers lose their work
+        division if it is laid out this way.
+        """
+        if not self._lx_kv_layout:
+            return None
+        if self._narrow is None:
+            rows = self._max_num_seqs + 1
+            flat_rows = rows * self.num_heads
+            base = torch.zeros(  # ty: ignore[no-matching-overload]
+                flat_rows, self.head_size, dtype=self.model_dtype
+            ).to(
+                device,
+                device_layout=flat_row_layout(flat_rows, self.head_size, self.model_dtype),
+            )
+            self._narrow = base.view(rows, self.num_heads, self.head_size)
+        return self._narrow
+
+    def narrow_row_tables(self, device: torch.device) -> list[torch.Tensor]:
+        """Per slot, the one-entry gather table naming that slot's row."""
+        if self._narrow_rows is None:
+            width = _stick_aligned_len(1)
+            tables = []
+            for slot in range(self._max_num_seqs):
+                table = torch.zeros(width, dtype=torch.int32)
+                table[0] = slot
+                tables.append(convert(table, device=device))
+            self._narrow_rows = tables
+        return self._narrow_rows
 
     def _assert_query_fits_staging(self, padded_query_len: int) -> None:
         assert padded_query_len < self.staging_rows, (
@@ -1837,11 +1863,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         rows[:q_len] = torch.arange(q_len, dtype=torch.int32)
         row_table = convert(rows, device=device)
         out_row_index = row_table
-        # A one-row folded variant is dispatched on the sequence's own narrow buffer, so
-        # it has to be traced on one too or the recorded graph never matches.
+        # A one-row folded variant is dispatched on the narrow buffer, so it has to be
+        # traced on it too or the recorded graph never matches.
         if self._lx_kv_layout and q_len == 1:
-            query = self.seq_staging_buffers(device)[0]
-            row_table = convert(torch.zeros(index_len, dtype=torch.int32), device=device)
+            narrow = self.narrow_query_buffer(device)
+            assert narrow is not None
+            query = narrow
+            row_table = self.narrow_row_tables(device)[0]
 
         page_index_table = convert(
             torch.zeros(bucket.num_blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32),
@@ -2235,11 +2263,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 )
             row_table = attn_metadata.query_row_tables[seq_idx]
 
-            # A one-row sequence reads its own 2-row buffer, so the kernel's row gather
-            # costs a row rather than the whole batch buffer. Decided per sequence, not
-            # per batch: a decode sharing a batch with a prefill benefits too. Its row
-            # there is always row 0, so the gather table is all zeros and the real rows
-            # go to the kernel separately as out_row_index for the store.
+            # A one-row sequence reads its slot of the narrow buffer, filled by the
+            # traced scatter in attn_layer, so the kernel's row gather costs a row
+            # rather than the whole batch buffer. Decided per sequence: a decode
+            # sharing a batch with a prefill benefits too. The real batch rows go to
+            # the kernel separately as out_row_index for the store.
             seq_query = q_staging
             out_row_index = row_table
             seq_out_rows = (
@@ -2248,14 +2276,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 else None
             )
             if self._lx_kv_layout and aligned_query_lens[seq_idx] == 1:
-                seq_buf = self.seq_staging_buffers(_target_device)[seq_idx]
-                seq_buf[0] = query_dev[q_start] if not pre_staged else q_staging[q_start]
-                seq_query = seq_buf
-                if self._zero_row_table is None:
-                    self._zero_row_table = convert(
-                        torch.zeros(_stick_aligned_len(1), dtype=torch.int32), device=_target_device
-                    )
-                row_table = self._zero_row_table
+                narrow = self.narrow_query_buffer(_target_device)
+                assert narrow is not None
+                seq_query = narrow
+                row_table = self.narrow_row_tables(_target_device)[seq_idx]
 
             # Run attention on target device
             if self._lx_kv_layout:
@@ -2334,4 +2358,5 @@ def allocate_staging_buffers(
         impl = getattr(layer, "impl", None)
         if isinstance(impl, SpyreAttentionImpl):
             impl.staging_buffers(device)
-            impl.seq_staging_buffers(device)
+            impl.narrow_query_buffer(device)
+            impl.narrow_row_tables(device)

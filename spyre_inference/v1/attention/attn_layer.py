@@ -48,6 +48,9 @@ class SlotMapping:
         self._layers = layers
         self._device: torch.device | None = None
         self.slots: torch.Tensor | None = None
+        # Per batch row, the narrow-query slot it belongs to; see narrow_query_buffer.
+        self.narrow_rows: torch.Tensor | None = None
+        self._narrow_spare: int | None = None
         self._published = False
         # Keyed by (num_kv_heads, block_size): a hybrid model's layers need not share
         # either.
@@ -61,24 +64,37 @@ class SlotMapping:
             if not self._layers:
                 return None
             self._device = self._layers[0].kv_cache[0].device
+            self._narrow_spare = getattr(self._layers[0].impl, "narrow_spare_slot", None)
             # Must exist before tracing; see SpyreAttentionImpl.kv_slot_views.
             for layer in self._layers:
-                layer.impl.kv_slot_views(layer.kv_cache)  # ty: ignore[possibly-missing-attribute]
+                layer.impl.kv_slot_views(layer.kv_cache)
         return self._device
 
-    def publish(self, slot_mapping: torch.Tensor) -> None:
+    def publish(
+        self, slot_mapping: torch.Tensor, narrow_pairs: list[tuple[int, int]] | None = None
+    ) -> None:
         """Mirror a step's host slot mapping to device for the traced write to read."""
-        self._publish_host(slot_mapping.clamp(min=_NULL_SLOT))
+        self._publish_host(slot_mapping.clamp(min=_NULL_SLOT), narrow_pairs)
 
     def publish_null(self, num_tokens: int) -> None:
-        self._publish_host(torch.full((num_tokens,), _NULL_SLOT, dtype=torch.int64))
+        self._publish_host(torch.full((num_tokens,), _NULL_SLOT, dtype=torch.int64), None)
 
-    def _publish_host(self, host: torch.Tensor) -> None:
+    def _publish_host(
+        self, host: torch.Tensor, narrow_pairs: list[tuple[int, int]] | None = None
+    ) -> None:
         device = self._resolve_device()
         if device is None:
             return
         self._published = True
         self._folded.clear()
+        # int64: index_copy_ takes only a long index. Every row a decode does not own
+        # points at the spare slot, so the scatter covers the whole bucket at one shape.
+        if self._narrow_spare is not None:
+            rows = torch.full((host.shape[0],), self._narrow_spare, dtype=torch.int64)
+            for row, slot in narrow_pairs or ():
+                if row < rows.shape[0]:
+                    rows[row] = slot
+            self.narrow_rows = convert(rows, device=device)
         if not envs.SPYRE_LX_KV_LAYOUT:
             self.slots = convert(host, device=device)
             return
@@ -168,6 +184,21 @@ def _spyre_attention_forward(
     else:
         q_in, out_buf = buffers
         q_in[:rows] = query
+        # Scatter every row to its decode slot in one op, so a one-row sequence reads a
+        # buffer of max_num_seqs + 1 rows instead of the batch-wide one -- index_select
+        # costs O(source), and this source is small whatever the batch. A gather would
+        # need an index shorter than the source (torch-spyre#4033), impossible when the
+        # token bucket equals max_num_seqs; a scatter has no such rule. Rows no decode
+        # owns land on the spare slot, which nothing reads. Traced, never eager: eager
+        # index_copy_ falls back to CPU and segfaults.
+        narrow_buf = getattr(self.impl, "narrow_query_buffer", None)
+        narrow = narrow_buf(query.device) if narrow_buf is not None else None
+        if narrow is not None:
+            slots = cast(SlotMapping, self.spyre_slots).narrow_rows
+            assert slots is not None and slots.shape[0] == rows, (
+                "narrow scatter rows must be published at the token bucket's width"
+            )
+            narrow.index_copy_(0, slots, query)
 
     torch.ops.vllm.unified_attention_with_output(
         q_in,  # ty: ignore[invalid-argument-type]
