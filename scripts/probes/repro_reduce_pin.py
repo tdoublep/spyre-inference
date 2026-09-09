@@ -135,9 +135,25 @@ def run(variant):
 
     k_host = torch.randn(num_rows, B, D, dtype=DTYPE)
     v_host = torch.randn(num_rows, B, D, dtype=DTYPE)
-    idx_host = [
-        (torch.arange(E, dtype=torch.int32) + blk * E).reshape(E, 1) for blk in range(nblocks)
-    ]
+    # Index VALUE pattern, holding shape/dtype/count fixed. The folded kernel gathers
+    # (page, kv_head) rows kv-major, which is a strided permutation, not arange.
+    pattern = os.environ.get("INDEX_PATTERN", "arange")
+    gg = int(os.environ.get("IDX_G", 4))
+    if pattern == "arange":
+        base = torch.arange(E, dtype=torch.int32)
+    elif pattern == "strided":  # exactly the folded kernel's kv-major order
+        kvn = max(E // gg, 1)
+        base = torch.tensor(
+            [j * kvn + kv for kv in range(kvn) for j in range(gg)], dtype=torch.int32
+        )
+    elif pattern == "reversed":
+        base = torch.arange(E, dtype=torch.int32).flip(0)
+    elif pattern == "shuffled":
+        base = torch.randperm(E, generator=torch.Generator().manual_seed(0)).to(torch.int32)
+    else:
+        raise SystemExit(f"unknown INDEX_PATTERN {pattern}")
+    assert sorted(base.tolist()) == list(range(E)), "must stay a permutation of 0..E-1"
+    idx_host = [(base + blk * E).reshape(E, 1) for blk in range(nblocks)]
     q_host = [torch.randn(E, D, Q, dtype=DTYPE) for _ in range(ngroups)]
     mshape = (B, Q) if mask2d else (E, B, Q)
     mask_host = [torch.zeros(*mshape, dtype=DTYPE) for _ in range(nblocks)]
@@ -184,7 +200,7 @@ def run(variant):
     tag = ",".join(k for k, v in [("permV", permute_v), ("mask2d", mask2d), ("tail", tail)] if v)
     print(
         f"\n--- V{variant}  blocks={nblocks} groups={ngroups} [{tag or 'none'}]"
-        f"   numerics {err:.2e}"
+        f" idx={os.environ.get('INDEX_PATTERN', 'arange')}   numerics {err:.2e}"
     )
     print(f"    pinned {pinned}/{len(verdicts)} gathers   splits={splits[:3]}")
     if covers:
