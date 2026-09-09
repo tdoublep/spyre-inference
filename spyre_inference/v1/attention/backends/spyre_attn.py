@@ -1529,7 +1529,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._lx_out_flat: torch.Tensor | None = None
         # One row per sequence slot plus a spare, so a gather of one row is always a
         # strict subset (torch-spyre#4033) and every batch row has somewhere to land.
-        self.narrow_spare_slot: int = self._max_num_seqs
+        # None off the folded path, which is what stops the holder publishing scatter
+        # rows nothing would read.
+        self.narrow_spare_slot: int | None = self._max_num_seqs if self._lx_kv_layout else None
         self._narrow: torch.Tensor | None = None
         self._narrow_rows: list[torch.Tensor] | None = None
 
