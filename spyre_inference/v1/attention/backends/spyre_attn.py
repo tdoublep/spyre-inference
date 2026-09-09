@@ -2242,7 +2242,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             # go to the kernel separately as out_row_index for the store.
             seq_query = q_staging
             out_row_index = row_table
-            fused = out_row_tables is not None and aligned_query_lens[seq_idx] == 1
+            seq_out_rows = (
+                out_row_tables[seq_idx]
+                if out_row_tables is not None and aligned_query_lens[seq_idx] == 1
+                else None
+            )
             if self._lx_kv_layout and aligned_query_lens[seq_idx] == 1:
                 seq_buf = self.seq_staging_buffers(_target_device)[seq_idx]
                 seq_buf[0] = query_dev[q_start] if not pre_staged else q_staging[q_start]
@@ -2278,8 +2282,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                         block_size,
                         self.logits_soft_cap,
                         alibi_bias_tiles,
-                        (self._lx_out_flat if fused else out_staging) if store_out else None,
-                        out_row_tables[seq_idx] if fused else None,
+                        (self._lx_out_flat if seq_out_rows is not None else out_staging)
+                        if store_out
+                        else None,
+                        seq_out_rows,
                         out_row_index,
                     )
             else:
