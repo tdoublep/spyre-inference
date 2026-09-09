@@ -95,6 +95,13 @@ def spyre_vllm_config(compiled: bool):
         compilation_config=CompilationConfig(custom_ops=["all"], mode=mode),
         model_config=ModelConfig(dtype=DTYPE),
     )
+    # Diagnostic only: SpyreAttentionImpl sizes its staging buffers as
+    # max_num_batched_tokens + 1, so this shrinks them without touching the product.
+    # Used to separate the kernel's own cost from the staging gather/store cost.
+    _rows = os.environ.get("MB_STAGING_ROWS", "")
+    if _rows:
+        config.scheduler_config.max_num_batched_tokens = int(_rows) - 1
+
     with set_current_vllm_config(config), set_forward_context(None, config):
         yield
 
@@ -279,6 +286,21 @@ def build_inputs_from_requests(
         if cache_device.type != "spyre" or kv_layout == "plain":
             return cache.to(cache_device)
         nb, bsz, h, d = cache.shape
+        if kv_layout == "folded":
+            # Imported here, not at the top: baseline checkouts predating the folded
+            # frame have no head_major_kv_layout, and they only ever ask for 'plain'.
+            from spyre_inference.v1.attention.backends.spyre_attn import (
+                head_major_kv_layout,
+            )
+
+            # SPYRE_LX_KV_LAYOUT's frame: [num_blocks * num_kv_heads, block_size,
+            # head_size], row = page * num_kv_heads + kv_head, which is the index
+            # _mirror_lx_index_tables gathers with.
+            folded = cache.permute(0, 2, 1, 3).contiguous().reshape(nb * h, bsz, d)
+            return folded.to(
+                cache_device,
+                device_layout=head_major_kv_layout(nb * h, bsz, d, cache.dtype),
+            )
         layout = slot_major_kv_layout(nb * bsz, h, d, cache.dtype)
         if kv_layout == "slot_major":
             return cache.to(cache_device, device_layout=layout)
@@ -312,7 +334,23 @@ def build_inputs_from_requests(
         "query_lens": list(query_lens),
         "seq_lens": list(seq_lens),
         "total_query_tokens": total_q,
+        "kv_fold": (num_blocks, num_kv_heads) if kv_layout == "folded" else None,
     }
+
+
+def ref_pages(inputs, key):
+    """Device pages in the reference's [num_blocks, block_size, num_kv_heads, head_size]
+    frame. Reading back from the device rather than using the host copy is deliberate:
+    under a non-plain layout the on-device contents are what the kernel actually read.
+    """
+    pages = inputs[key].to("cpu")
+    fold = inputs.get("kv_fold")
+    if fold is None:
+        return pages
+    num_blocks, num_kv_heads = fold
+    return pages.reshape(num_blocks, num_kv_heads, pages.shape[1], pages.shape[2]).permute(
+        0, 2, 1, 3
+    )
 
 
 def grid_to_requests(
@@ -560,8 +598,8 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         got = output.to("cpu").float()
         ref = ref_attn(
             inputs["query_cpu"],
-            inputs["k_pages"].to("cpu"),
-            inputs["v_pages"].to("cpu"),
+            ref_pages(inputs, "k_pages"),
+            ref_pages(inputs, "v_pages"),
             inputs["query_lens"],
             inputs["seq_lens"],
             inputs["block_tables"],
@@ -694,13 +732,15 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument(
         "--kv-layout",
-        choices=["plain", "slot_major", "slot_major_devfill"],
+        choices=["plain", "slot_major", "slot_major_devfill", "folded"],
         default=None,
         help="KV page device layout. 'plain' (default) is correct for a "
         "host-populated cache. 'slot_major_devfill' matches the "
         "worker: zeroed slot-major alloc, history written on device. "
         "'slot_major' pins the worker layout on a host-populated "
-        "cache and is numerically wrong; kept to reproduce that.",
+        "cache and is numerically wrong; kept to reproduce that. "
+        "'folded' is the SPYRE_LX_KV_LAYOUT (page, kv_head) frame and has to be "
+        "paired with SPYRE_LX_KV_LAYOUT=1.",
     )
     ap.add_argument(
         "--span",
@@ -728,6 +768,17 @@ def main():
         cfg["variants"] = args.variants
     cfg["stop_on_failure"] = args.stop_on_failure
     cfg.setdefault("device", "spyre")
+
+    from spyre_inference import envs
+
+    # The impl reads the flag at construction and the cache frame has to match it, so a
+    # half-set pair produces a plausible-looking number for the wrong configuration.
+    lx_flag = getattr(envs, "SPYRE_LX_KV_LAYOUT", False)
+    if lx_flag != (cfg.get("kv_layout") == "folded"):
+        raise SystemExit(
+            "SPYRE_LX_KV_LAYOUT=1 and --kv-layout folded must be set together; got "
+            f"SPYRE_LX_KV_LAYOUT={lx_flag}, kv_layout={cfg.get('kv_layout')!r}"
+        )
 
     variants = [v for v in cfg["variants"] if VARIANT_REGISTRY[v]["available"]()]
     if not variants:
@@ -786,6 +837,10 @@ def main():
             cfg["block_size"],
             cfg["num_blocks"],
             cfg["device"],
+            # The probe builds a real cache for a real impl, so it needs the same frame
+            # the measured runs use: under SPYRE_LX_KV_LAYOUT the impl indexes the
+            # folded rows and a plain 4-D cache fails to trace at all.
+            kv_layout=cfg.get("kv_layout", "plain"),
         )
         probe_run, _ = make_forward(
             probe_inputs, cfg["num_query_heads"], cfg["num_kv_heads"], cfg["head_size"]

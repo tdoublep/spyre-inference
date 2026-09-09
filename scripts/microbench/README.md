@@ -67,6 +67,21 @@ Both lower onto the same `(query_lens, seq_lens)` path.
 
 `block_sizes: [64, 128]` sweeps block size as an extra axis.
 
+### KV cache layout
+
+`--kv-layout` (or `"kv_layout"` in a config) picks the device layout of the KV pages.
+`plain` is correct for a host-populated cache; `slot_major_devfill` reproduces the
+worker's layout. `folded` is the `(page, kv_head)` frame that `SPYRE_LX_KV_LAYOUT`
+introduces and **must be paired with `SPYRE_LX_KV_LAYOUT=1`** — the impl reads the flag
+at construction, so a half-set pair would benchmark a different configuration than the
+cache frame implies. The runner refuses to start on a mismatch.
+
+```bash
+SPYRE_ATTN_PROFILING=1 SPYRE_LX_KV_LAYOUT=1 .venv/bin/python3 \
+    scripts/microbench/spyre_attn_microbench.py \
+    --config scripts/microbench/configs/lx_ab_short.json --kv-layout folded
+```
+
 ## Output
 
 Tab-separated, written after every measurement (a crash keeps what completed) plus a
