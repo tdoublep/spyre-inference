@@ -35,9 +35,17 @@ echo "SENTIENT_BASE_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR:-<unset>}"
 # torch-spyre was built with USE_SPYRE_PROFILER=1 (this repo pins "0"). Without
 # it the run still completes but reports no device time, which is the one number
 # that matters -- so fail here instead.
-if ! nm -D --defined-only "$(uv run --no-sync python -c \
-        'import torch_spyre, pathlib; print(pathlib.Path(torch_spyre.__file__).parent / "_C.so")' \
-        2>/dev/null)" 2>/dev/null | grep -q AIUActivityProfiler; then
+# Import torch before torch_spyre: the other order trips torch's backend
+# autoload against a partially initialized module and the probe prints nothing.
+# Count with grep -c rather than grep -q: -q exits at the first match, SIGPIPEs
+# nm mid-stream, and `set -o pipefail` then reports a profiler-enabled build as
+# missing.
+SPYRE_C_SO="$(uv run --no-sync python -c \
+    'import torch, torch_spyre, pathlib; print(pathlib.Path(torch_spyre.__file__).parent / "_C.so")' \
+    2>/dev/null | tail -1)"
+PROFILER_SYMS="$(nm -D --defined-only "${SPYRE_C_SO:-/nonexistent}" 2>/dev/null \
+    | grep -c AIUActivityProfiler || true)"
+if [[ "${PROFILER_SYMS:-0}" -eq 0 ]]; then
     cat >&2 <<'MSG'
 error: torch-spyre has no AIUActivityProfiler, so device time cannot be measured.
 Rebuild it with the profiler compiled in (see experimental/MISSION.md):
