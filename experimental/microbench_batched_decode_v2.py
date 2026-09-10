@@ -71,7 +71,8 @@ since GreedyLayoutSolver is the only solver with supports_paired_buffers=True):
 RESULTS (tpa-spyre-dev-2, granite shapes: 4 seqs, 16 blocks x 128, 8 KV heads,
 4 queries/KV, head 128; #4347 active via LAYOUT_SOLVER=greedy). Wall median, ms:
 
-    chunked_ktile chunk=8 tile=64  2.707 - 2.716  <- BEATS THE BAR, 0.93x
+    chunked_ktile chunk=16 tile=64 2.534   *** WRONG ANSWER, see below ***
+    chunked_ktile chunk=8 tile=64  2.707   *** WRONG ANSWER, see below ***
     unrolled (the bar)            2.923 - 3.006   (five runs)
     per_seq                       3.067 - 3.082
     chunked_gather chunk=8        3.623           (block-major index)
@@ -121,29 +122,39 @@ What it IS. Two independent effects, found by scaling num_seqs 1/2/4:
      at per-op working set (a batch-wide per-block tensor is 1 MB here against
      256 KB per sequence) rather than at any shape property.
 
-THE ANSWER: fix both, and a batched kernel beats the unrolled one.
+WHERE THIS ACTUALLY LANDS -- and a retracted result.
 
-    batched (shipped)                          8.129   2.76x the bar
-      + gather chunk=8, block-major index      3.623   1.23x
-      + KV tiling kv_tile=64                   2.716   0.92x  <- chunked_ktile
+The KV-tiled kernels (batched_ktile, chunked_ktile) looked like the answer at
+2.53-2.72 ms against a 2.92 ms bar. They are WRONG: both disagree with the
+per-sequence reference by max_abs 0.145 on a reference whose absmax is 0.118,
+and both by exactly the same amount, so the fault is in the tiling itself.
 
-Reproduced back-to-back in one process at 30 iterations, which is the fairest
-comparison available (same process, same device state):
+The likely mechanism also explains the speed, which is why the number has to go
+rather than merely carry a caveat. KV tiling slices the slot axis at lo=kv_tile,
+producing a nonzero-storage_offset view; torch-spyre#3770, which
+_page_attn_kernel's own comments already document, is that "a compiled region
+reads a view from offset 0, ignoring storage_offset". If tile 1 re-reads tile 0
+then the kernel processes half the KV twice -- wrong, and about half the work.
+Two independent facts line up with that: kv_tile=128 is the only tiling value
+that creates no offset view, and it is the only one that showed no speedup
+(3.586 ms, i.e. chunked_gather's 3.623); and every untiled variant is bit-exact.
+probe_offset_view.py tests the mechanism directly.
 
-    unrolled        2.923
-    chunked_ktile   2.707      0.926x
+So the best CORRECT batched kernel here is chunked_gather, and it does not beat
+the unrolled bar:
 
-Neither fix alone is enough, and they are superadditive -- tiling on its own is
-worth only 11% because the 32 wide gathers hide it, and it is worth a further 25%
-once they are gone:
+    batched (shipped)                          8.129   2.78x the bar
+      + gather chunk=8, block-major index      3.623   1.24x   bit-exact
+    unrolled (the bar)                         2.923   1.00x
 
-    batched                      8.129
-    batched + tiling only        7.252   -11%
-    batched + chunking only      3.623   -55%
-    batched + both               2.716   -67%
+Chunking is a real and large win on its own (8.13 -> 3.62, all of it verified
+bit-exact against the shipped per-sequence kernel), and it is the part of this
+work worth keeping. Closing the remaining 1.24x needs the per-op working set
+addressed by some means other than slicing the slot axis -- gathering each tile
+rather than slicing it would avoid the offset view, at the cost of more gathers,
+which is the exact trade chunking exists to avoid.
 
-That mutual masking is why every single-axis fix tried before this failed.
-`chunked_ktile` is the design --
+`chunked_ktile`, kept here as the broken-but-instructive variant, is --
 batch every sequence into one launch, gather `chunk` blocks per index_select so
 gather ops fall from 2*num_blocks to 2*num_blocks/chunk, and keep every matmul
 operand and score tile at kv_tile slots so the per-op working set does not grow
@@ -163,19 +174,22 @@ Both knobs are constrained:
     larger block_size for the gather, but is the better lever because it leaves
     cache allocation granularity (and fragmentation) alone.
 
-    The win needs chunk=8; smaller chunks do not reach the bar. At kv_tile=64:
+    chunk needs to be at least 8 to reach the bar. At kv_tile=64:
 
-        chunk    gathers   wall ms   beats the 2.92 bar?
-          2        16       5.632    no
-          4         8       3.681    no
-          8         4       2.71     yes
-         16         2       (see below)
+        chunk   gathers   wall ms   vs 2.92 bar   scratch K+V @ batch 4
+          2       16       5.632      1.93x            4.2 MB
+          4        8       3.681      1.26x            8.4 MB
+          8        4       2.71       0.93x           16.8 MB
+         16        2       2.534      0.87x           33.6 MB
 
-    So the demonstrated advantage is specific to chunk=8, which at batch 4 costs
-    16.8 MB of transient for K+V. That figure grows with the batch (~134 MB at
-    batch 32), so chunk has to shrink as batch grows and the advantage shown here
-    should not be assumed to carry to large batch without re-measuring -- or
-    without a larger block_size doing the same job for free.
+    chunk=16 is NOT the un-paged gather_all_once: it coincides with the whole
+    sequence only because this configuration happens to have num_blocks=16. As a
+    fixed constant, chunk=16 costs batch*16 blocks of transient regardless of
+    max_model_len -- at an 8k context (64 blocks) it is 4 gathers with the same
+    33.6 MB. What actually bounds chunk is the batch, since scratch goes as
+    batch*chunk (~134 MB at chunk=8 / batch 32, ~268 MB at chunk=16), so the
+    advantage measured at batch 4 should be re-measured before assuming it holds
+    at serving batch sizes.
 
 Backend limits hit while exploring (all torch-spyre, not local bugs):
   * merged_slot_gather: insert_restickify_padding rejects the interleaved slot
@@ -192,10 +206,14 @@ Against an eager per-sequence reference (absmax 0.118) it reports:
     chunked_gather, merged_sk, merged_cat   max_abs 0.00000   bit-exact
     batched, batched_masklist               max_abs 0.00049
     qgroup_loop                             max_abs 0.08268   WRONG
+    batched_ktile, chunked_ktile            max_abs 0.14465   WRONG
 
-qgroup_loop is numerically broken, not merely slow -- do not read its timing as a
-valid data point for the query-group-loop idea. It was already the slowest
-variant so nothing here rests on it, and it has not been debugged.
+Run the check before believing any timing here. Two variants are numerically
+broken and neither is merely a little off: chunked_ktile is the one that appeared
+to beat the bar, and qgroup_loop is the one that appeared to prove work division
+irrelevant (that conclusion survives anyway -- it rests on `batched` at batch 1
+emitting all 32 lossy divisions while running 10x faster, which is a correct
+kernel).
 """
 
 import argparse
