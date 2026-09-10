@@ -62,7 +62,7 @@ absolute numbers needs this stack:
 | host | `tpa-spyre-dev-2`, 4 AIU devices present, 1 used (TP=1) |
 | spyre-inference | `main` @ `0da2a5e` (the base of this branch) |
 | torch-spyre | `AdnanHoque/torch-spyre` @ `927c3b83f1e4ebfb46a376f75db905c8229b8fd9` |
-| torch-spyre build var | `USE_SPYRE_PROFILER=1` |
+| torch-spyre build var | `USE_SPYRE_PROFILER=1` — **required to measure device time** |
 | vLLM | `v0.28.0`, built with `VLLM_TARGET_DEVICE=empty` |
 | torch | `2.13.0+cpu` |
 | `LAYOUT_SOLVER` | `greedy` |
@@ -78,11 +78,14 @@ Two caveats, because neither matches what this branch checks in:
   `main`. That PR rewrites the LX work-division planner — the same machinery
   that emits the fallback warnings discussed below — so it is directly relevant,
   and results may differ on the committed pin.
-- **The build had the profiler compiled in** (`USE_SPYRE_PROFILER=1`, versus
-  `"0"` on this branch), because the same build served the vLLM profiling runs.
-  That inflates wall clock by roughly 30% but not device kernel time, which is
-  measured on-device. So `dev ms/call` should carry over; `wall med ms` may
-  improve on a `USE_SPYRE_PROFILER=0` build.
+- **`USE_SPYRE_PROFILER=1` is required, not incidental.** This branch pins `"0"`.
+  The `dev ms/call` column comes from AIU device events in the torch profiler,
+  and those are emitted by the Kineto `AIUActivityProfiler` that this build
+  variable compiles into `torch_spyre/_C.so` (against `libaiupti`). Build with
+  `"0"` and there is no device-side timing to read — the number the whole
+  exercise optimises. It also costs roughly 30% on wall clock, so `wall med ms`
+  and `host resid` are inflated relative to a production build; that is the
+  price of having device time at all.
 
 To recreate that stack:
 
@@ -138,6 +141,11 @@ Prerequisites:
 
 - A Spyre host with a free device. The device takes one process at a time —
   never run two Spyre commands concurrently.
+- **`torch-spyre` built with `USE_SPYRE_PROFILER=1`.** Without it there is no
+  device-side timing and `dev ms/call` is unusable. See the environment section
+  above for the rebuild, and note `uv cache clean torch-spyre` is mandatory —
+  the wheel cache keys on the git rev alone, so flipping the build variable is
+  otherwise ignored.
 - `torch-spyre` built against whichever `ibm-*` libraries are active.
 - No model weights or HF cache needed; the harness builds its own tensors.
 

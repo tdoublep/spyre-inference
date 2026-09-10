@@ -31,6 +31,26 @@ export SPYRE_NUM_CPUS="${SPYRE_NUM_CPUS:-8}"
 echo "LAYOUT_SOLVER=${LAYOUT_SOLVER} SPYRE_NUM_CPUS=${SPYRE_NUM_CPUS}"
 echo "SENTIENT_BASE_INSTALL_DIR=${SENTIENT_BASE_INSTALL_DIR:-<unset>}"
 
+# Device timings come from the Kineto AIUActivityProfiler, which only exists when
+# torch-spyre was built with USE_SPYRE_PROFILER=1 (this repo pins "0"). Without
+# it the run still completes but reports no device time, which is the one number
+# that matters -- so fail here instead.
+if ! nm -D --defined-only "$(uv run --no-sync python -c \
+        'import torch_spyre, pathlib; print(pathlib.Path(torch_spyre.__file__).parent / "_C.so")' \
+        2>/dev/null)" 2>/dev/null | grep -q AIUActivityProfiler; then
+    cat >&2 <<'MSG'
+error: torch-spyre has no AIUActivityProfiler, so device time cannot be measured.
+Rebuild it with the profiler compiled in (see experimental/MISSION.md):
+
+  sed -i 's|^USE_SPYRE_PROFILER = "0"|USE_SPYRE_PROFILER = "1"|' pyproject.toml
+  source ~/spyre-libs/env.sh
+  export SEN_COMMON_HEADERS="${SENTIENT_BASE_INSTALL_DIR}/runtime/include"
+  uv cache clean torch-spyre
+  uv sync --group dev --reinstall-package torch-spyre
+MSG
+    exit 1
+fi
+
 # --no-sync: `uv run` otherwise re-resolves from pyproject.toml and would
 # silently replace a locally built torch-spyre.
 exec uv run --no-sync python experimental/microbench_batched_decode.py "$@"

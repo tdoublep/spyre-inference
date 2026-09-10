@@ -13,6 +13,10 @@ Variants
 
 Defaults reproduce granite-3.3-8b decode at batch 4 / 2048 KV / block 128.
 
+torch-spyre must be built with USE_SPYRE_PROFILER=1 (this repo pins "0"), or the
+`dev ms/call` column is empty: device timings come from the Kineto
+AIUActivityProfiler that build variable compiles in. See MISSION.md.
+
 Run it through the wrapper, which sets the environment the numbers below were
 taken with:
 
