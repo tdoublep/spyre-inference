@@ -1012,9 +1012,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._compile_attn = _mode == CompilationMode.STOCK_TORCH_COMPILE
         self._page_group = envs.SPYRE_ATTN_PAGE_GROUP
         if self._page_group < 1:
-            raise ValueError(
-                f"SPYRE_ATTN_PAGE_GROUP must be >= 1, got {self._page_group}"
-            )
+            raise ValueError(f"SPYRE_ATTN_PAGE_GROUP must be >= 1, got {self._page_group}")
         if sliding_window is not None and self._page_group != 1:
             raise ValueError(
                 "SPYRE_ATTN_PAGE_GROUP > 1 is not supported with sliding-window "
@@ -1022,8 +1020,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             )
         if envs.SPYRE_BATCHED_DECODE and self._page_group != 1:
             raise ValueError(
-                "SPYRE_ATTN_PAGE_GROUP > 1 is not supported with "
-                "SPYRE_BATCHED_DECODE=1"
+                "SPYRE_ATTN_PAGE_GROUP > 1 is not supported with SPYRE_BATCHED_DECODE=1"
             )
 
         # ALiBi slopes: per-head linear-bias coefficients (BLOOM/MPT style).
