@@ -159,11 +159,23 @@ Both knobs are constrained:
     block-major was also worth 7% on chunked_gather (3.902 -> 3.623).
   * chunk must divide num_blocks, and scratch is num_seqs*chunk*block*KV*D per
     tensor -- bounded by chunk and the batch, never by max_model_len, so the
-    cache stays paged. chunk=8 at batch 4 is 16.8 MB for K+V. The benefit is
-    therefore batch-dependent: at large batch, chunk must shrink to hold the
-    scratch budget. Note chunking is arithmetically the same as a chunk x larger
-    block_size for the gather, but is the better lever because it leaves cache
-    allocation granularity (and fragmentation) alone.
+    cache stays paged. Note chunking is arithmetically the same as a chunk x
+    larger block_size for the gather, but is the better lever because it leaves
+    cache allocation granularity (and fragmentation) alone.
+
+    The win needs chunk=8; smaller chunks do not reach the bar. At kv_tile=64:
+
+        chunk    gathers   wall ms   beats the 2.92 bar?
+          2        16       5.632    no
+          4         8       3.681    no
+          8         4       2.71     yes
+         16         2       (see below)
+
+    So the demonstrated advantage is specific to chunk=8, which at batch 4 costs
+    16.8 MB of transient for K+V. That figure grows with the batch (~134 MB at
+    batch 32), so chunk has to shrink as batch grows and the advantage shown here
+    should not be assumed to carry to large batch without re-measuring -- or
+    without a larger block_size doing the same job for free.
 
 Backend limits hit while exploring (all torch-spyre, not local bugs):
   * merged_slot_gather: insert_restickify_padding rejects the interleaved slot
