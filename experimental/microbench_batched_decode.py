@@ -8,26 +8,25 @@ Variants
   per_seq   num_seqs sequential calls to _page_attn_kernel (what production does
             with SPYRE_BATCHED_DECODE=0)
   batched   one call to _batched_decode_kernel (SPYRE_BATCHED_DECODE=1)
-  unrolled  the "dumbest thing": one compiled graph containing the num_seqs
-            per-sequence bodies. One launch, per-sequence shapes/schedules.
-            Separates launch overhead from schedule quality: if unrolled ~=
-            per_seq, launch overhead is not the win; if unrolled << batched,
-            the batched kernel's shapes are what cost, not the batching idea.
+  unrolled  one compiled graph containing the num_seqs per-sequence bodies:
+            a single launch that keeps the per-sequence shapes
 
 Defaults reproduce granite-3.3-8b decode at batch 4 / 2048 KV / block 128.
 
-Run (needs a Spyre device; the RPM env must be sourced):
-    source ~/spyre-libs/env.sh
-    uv run --no-sync python experimental/microbench_batched_decode.py
+Run it through the wrapper, which sets the environment the numbers below were
+taken with:
 
-Useful knobs:
-    --num-seqs 4 --num-blocks 16 --block-size 128
-    --iters 20 --variants per_seq,batched,unrolled
-    --show-warnings          print each lossy work-division message
+    bash experimental/run_microbench_batched_decode.sh
+
+Knobs are forwarded, e.g.:
+
+    bash experimental/run_microbench_batched_decode.sh --num-blocks 8 --block-size 256
+    bash experimental/run_microbench_batched_decode.sh --variants per_seq,batched
+    bash experimental/run_microbench_batched_decode.sh --show-warnings
 
 STATUS
 ------
-Run on tpa-spyre-dev-2, granite shapes, 2026-09-10:
+Run on tpa-spyre-dev-2, granite shapes, LAYOUT_SOLVER=greedy, 2026-09-10:
 
     variant   dev ms/call  kernels  wall med ms  lossy  warmup s
     per_seq         2.343        4        3.129      0      30.6
@@ -46,9 +45,9 @@ per_seq is optimistic by ~23% because the harness skips the metadata handling
 and output scatter the production per-call path also does. The batched
 pathology itself lands within 1.5%.
 
-Getting here required matching two things that a naive harness gets wrong, and
-both mattered enormously -- with either wrong, per_seq collapsed to 1.7 GB/s
-and the ranking INVERTED (batched looked 1.7x faster):
+Two things must match production or the whole comparison is worthless -- with
+either wrong, per_seq collapsed to 1.7 GB/s and the ranking INVERTED (batched
+looked 1.7x faster than per_seq):
 
   1. k/v_pages must be allocated the way initialize_kv_cache_tensors does:
      host zeros then .to(device, device_layout=slot_major_kv_layout(...)).
@@ -59,27 +58,30 @@ and the ranking INVERTED (batched looked 1.7x faster):
      = 513 rows), not num_seqs. The batched kernel takes a query[:num_seqs]
      prefix of it and the per-sequence kernel gathers out of it.
 
-Findings so far:
-  * The batched kernel is the only variant that trips work-division
-    fallbacks: 32 x `lossy work-division ... output:d4=absent`, matching the
-    count in the full vLLM run exactly.
-  * The batched path DOES win on launch overhead, in the expected direction --
-    it is just far too small to pay for the kernel. Host residual
-    (wall - device) is 0.786 ms over 4 launches for per_seq vs 0.403 ms over
-    1 launch for batched, so batching saves +0.383 ms of host time while
-    costing +5.350 ms of device time: net +4.967 ms, and the saving offsets
-    only 7% of the cost. The device penalty is 14x the entire launch-overhead
-    prize, so no launch saving available in this shape could rescue it.
-    `unrolled` isolates the launch effect with the per-sequence schedule
-    intact: 4 launches -> 1 saves 0.148 ms with device time unchanged.
-  * `unrolled` is the fastest variant: one graph holding the num_seqs
-    per-sequence bodies gets a single dispatch AND keeps the per-sequence
-    schedule the planner handles well (0 fallbacks). It beats the purpose-built
-    batched kernel by 3.4x. So the problem is the batched kernel's shapes, not
-    the idea of batching. Cost of that approach: num_seqs is baked into the
-    graph, so it needs one compiled variant per seq bucket.
+Findings
+  * Launch overhead is a real but tiny credit to the batched path, nowhere near
+    enough to pay for it. Host residual (wall - device) is 0.786 ms over 4
+    launches for per_seq vs 0.403 ms over 1 launch for batched: batching saves
+    0.383 ms of host time while costing 5.350 ms of device time. The device
+    penalty is 14x the entire launch-overhead prize, so no launch saving
+    available in this shape could rescue it. `unrolled` isolates the launch
+    effect with the per-sequence schedule intact: 4 launches -> 1 saves
+    0.148 ms with device time unchanged.
+  * `unrolled` is the fastest variant, so a single dispatch over the whole
+    decode batch is achievable at per-sequence cost. Note it is not a drop-in
+    for the batched path: num_seqs bakes into the graph (one variant per seq
+    bucket), and it needs the per-sequence metadata, not the batched kernel's.
+  * The batched kernel is the only variant that trips work-division fallbacks
+    (32 x `lossy work-division ... output:d4=absent`, matching the count in the
+    full vLLM run). That is a correlation, not a demonstrated cause -- nothing
+    here rules out the gather pattern or the two-batch-axis matmul lowering
+    being the real cost, and the fallback is only reported, never priced.
 
-Open: why the unrolled variant reports 2 device kernels for 4 sequence bodies.
+Untested
+  * LAYOUT_SOLVER: every number above used `greedy`, which is what the vLLM
+    benchmarks ran with. torch-spyre defaults to `cpsat`. The batched kernel's
+    shapes are exactly the kind a greedy layout solver could mishandle, so
+    re-running under cpsat is the obvious next experiment.
 """
 
 import argparse
@@ -287,7 +289,11 @@ def make_callables(a, t):
             t["mask_tiles"], scale, a.num_seqs, a.num_blocks, nh, nkv, hs,
         )
 
-    return {"per_seq": per_seq, "batched": batched, "unrolled": unrolled}
+    return {
+        "per_seq": per_seq,
+        "batched": batched,
+        "unrolled": unrolled,
+    }
 
 
 def device_kernel_ms(fn, iters):
