@@ -129,16 +129,22 @@ The KV-tiled kernels (batched_ktile, chunked_ktile) looked like the answer at
 per-sequence reference by max_abs 0.145 on a reference whose absmax is 0.118,
 and both by exactly the same amount, so the fault is in the tiling itself.
 
-The likely mechanism also explains the speed, which is why the number has to go
-rather than merely carry a caveat. KV tiling slices the slot axis at lo=kv_tile,
-producing a nonzero-storage_offset view; torch-spyre#3770, which
-_page_attn_kernel's own comments already document, is that "a compiled region
-reads a view from offset 0, ignoring storage_offset". If tile 1 re-reads tile 0
-then the kernel processes half the KV twice -- wrong, and about half the work.
-Two independent facts line up with that: kv_tile=128 is the only tiling value
-that creates no offset view, and it is the only one that showed no speedup
-(3.586 ms, i.e. chunked_gather's 3.623); and every untiled variant is bit-exact.
-probe_offset_view.py tests the mechanism directly.
+The cause is NOT yet known, and one plausible mechanism has been ruled out. The
+first guess was torch-spyre#3770 ("a compiled region reads a view from offset 0,
+ignoring storage_offset", cited in _page_attn_kernel), since tiling slices the
+slot axis at lo=kv_tile. probe_offset_view.py tests exactly that and it does not
+hold: the compiled second tile comes back bit-identical to the host's second tile
+and differs from the first by 0.25, so an offset slot slice reads correctly.
+
+What is still suspicious, and untested, is that the probe .clone()s the permuted
+slice while the kernels feed it into a matmul as an operand, where the view is
+folded into the matmul's index expression instead of being materialised. The
+circumstantial evidence that something about the tiling is skipping work: the
+error is identical in both tiled kernels and survives full context with no
+masking, and kv_tile=128 -- the one value that produces no offset slice at all --
+is also the one value with no speedup (3.586 ms, i.e. chunked_gather's 3.623).
+Until that is explained the 2.53-2.72 ms figures must be treated as measuring a
+kernel that does less work than the problem requires, not as a result.
 
 So the best CORRECT batched kernel here is chunked_gather, and it does not beat
 the unrolled bar:
@@ -149,10 +155,14 @@ the unrolled bar:
 
 Chunking is a real and large win on its own (8.13 -> 3.62, all of it verified
 bit-exact against the shipped per-sequence kernel), and it is the part of this
-work worth keeping. Closing the remaining 1.24x needs the per-op working set
-addressed by some means other than slicing the slot axis -- gathering each tile
-rather than slicing it would avoid the offset view, at the cost of more gathers,
-which is the exact trade chunking exists to avoid.
+work worth keeping.
+
+Closing the remaining 1.24x still looks like a working-set problem -- the residual
+scales superlinearly in num_seqs while per-sequence compute scales sublinearly --
+so KV tiling remains the right idea. It just needs a correct implementation, and
+the next step is to find why this one loses work: instrument one tile in
+isolation feeding a matmul (rather than a clone, which reads fine), or build the
+tile with its own narrow gather instead of a slice.
 
 `chunked_ktile`, kept here as the broken-but-instructive variant, is --
 batch every sequence into one launch, gather `chunk` blocks per index_select so
