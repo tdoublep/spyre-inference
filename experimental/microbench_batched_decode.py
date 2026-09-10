@@ -120,34 +120,31 @@ So the merged flat batch axis is worth 1.79x over per_seq at batch 8 once the
 groups are sized to the cores, and 25.3 GB/s is the same rate the lanes=32
 single-group case gets.
 
-Correctness limit: NOT lanes, and it blocks all of this
------------------------------------------------------
-Above some size the flat variants return the WRONG ANSWER -- rel l2 ~0.7-0.8
-against the CPU reference where a correct variant sits at 0.004. It is not the
-lane count: flatchunk's groups are exactly 32 lanes, the width that is correct
-on its own, and it is still wrong at num_seqs=8.
+Correctness limit: total lanes > 32, and it blocks all of this
+-------------------------------------------------------------
+Above 32 lanes the flat variants return the WRONG ANSWER -- rel l2 ~0.71-0.80
+against the CPU reference where a correct variant sits at 0.004. Two runs
+separate lanes from the folded cache's row count (num_pages * num_kv_heads,
+the gather's index range), which is the other thing that grows here:
 
-What every run so far correlates with is the row count of the folded cache,
-num_pages * num_kv_heads, which is the index range of the gather:
+    num_seqs  kv_heads  num_blocks  lanes  cache rows  correct?
+           4         8          32     32        1032  ok, rel l2 0.0046
+           8         8           8     64         520  WRONG, rel l2 0.7140
 
-    num_seqs  kv_heads  num_blocks  pages  rows  lanes  correct?
-           1         8          16     17   136      8  ok
-           2         8          16     33   264     16  ok
-           4         8           8*    33   264     32  ok
-           4         8          16     65   520     32  ok
-           8         4          16    129   516     32  ok
-           2        16          16     33   528     32  ok
-           4        16          16     65  1040     64  WRONG, rel l2 0.6997
-           8         8          16    129  1032     64  WRONG, rel l2 0.7016
-    * the --block-size 256 point
+520 and 1032 rows each appear on both sides, so the index range is not it: the
+trigger is lanes = num_seqs * num_kv_heads exceeding the 32 cores. Every
+lanes <= 32 point measured is correct (at 136, 264, 516, 520, 528 and 1032 rows)
+and every lanes = 64 point is wrong (at 520, 1032 and 1040 rows), with the
+failures agreeing to four figures in both time and error across different
+(num_seqs, kv_heads).
 
-Correct at <= 528 rows, wrong at >= 1032, so the boundary looks like 1024. The
-two 64-lane failures agree to four figures in both time (5.754 / 5.753) and
-error (0.6997 / 0.7016) across completely different (num_seqs, kv_heads), so it
-is deterministic rather than a numerical edge. This is the one thing that blocks
-the flat form, and it wants a standalone repro filed against torch-spyre. Note
-it is a numerical failure, distinct from the gather-per-core-view saturation
-that spyre-inference PR #783 documents in
+Chunking the bmm does NOT avoid it. flatchunk runs groups of exactly 32 lanes --
+the width that is correct on its own -- and is still wrong whenever the total is
+64, so what matters is the lane extent present in the graph rather than the width
+of any one matmul. That is why flatchunk buys the rate but not usability, and it
+is the single thing blocking the flat form. It wants a standalone repro filed
+against torch-spyre, and note it is a numerical failure, distinct from the
+gather-per-core-view saturation PR #783 documents in
 scripts/probes/repro_gather_view_width.py.
 
 Relation to PR #783
@@ -211,13 +208,12 @@ prefill included, so it has to be decided globally rather than per kernel.
 
 Next
 ----
-  * Pin down the wrong-answer boundary (looks like num_pages * num_kv_heads >
-    1024) and reduce it to a standalone repro for torch-spyre. Nothing here can
-    land until it is fixed: granite's kv_heads=8 crosses it at any realistic
-    cache size.
-  * Chunk the lane axis in production rather than sizing lanes to the cores --
-    flatchunk shows the rate holds at batch 8, so the kernel does not need
-    num_seqs * num_kv_heads to equal 32.
+  * Reduce the lanes > 32 wrong answer to a standalone repro for torch-spyre.
+    Nothing here can land until it is fixed: granite's kv_heads=8 puts the limit
+    at num_seqs = 4, and chunking the bmm does not work around it.
+  * Once it is fixed, chunk the lane axis rather than sizing lanes to the cores:
+    flatchunk already shows the rate holds at batch 8 (2.651 ms, 25.3 GB/s
+    against per_seq's 4.753) and collapses to flatbc at one group.
   * Decide the page order globally, not per kernel: the flat form wants it,
     _page_attn_kernel is 1.30x worse under it, and PR #783 already carries it
     behind a flag.
