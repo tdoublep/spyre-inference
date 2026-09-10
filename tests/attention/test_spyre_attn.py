@@ -32,7 +32,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _batched_decode_kernel,
     _build_query_row_tables,
     _mirror_mask_tiles,
-    _stick_aligned_len,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
@@ -1836,29 +1835,40 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
     set_random_seed(0)
 
     num_seqs, num_blocks, num_kv_heads, qpk, block_size, head_size = 4, 2, 2, 1, 16, 8
-    lead = num_seqs * num_kv_heads
+    # One chunk covering both blocks, so entries = num_seqs * 2.
+    bpc = num_blocks
+    num_chunks = num_blocks // bpc
+    entries = num_seqs * bpc
 
     n_pages = num_blocks * num_seqs
     # Scaled up so the logits exceed the cap and tanh actually clamps.
     query = torch.randn(num_seqs, num_kv_heads * qpk * head_size, dtype=torch.float32) * 20.0
     k_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32) * 20.0
     v_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
-    # [num_blocks, stick-padded num_seqs]: row b holds each sequence's b-th page.
-    block_ids = torch.zeros(num_blocks, _stick_aligned_len(num_seqs), dtype=torch.int64)
-    block_ids[:, :num_seqs] = torch.arange(n_pages, dtype=torch.int64).reshape(num_blocks, num_seqs)
-    mask_by_block = torch.zeros(num_blocks, lead, 1, block_size, dtype=torch.float32)
+    # int64 here, not the production int32: this runs eager on CPU, where
+    # advanced indexing needs int64.
+    rep_row_ids = torch.arange(num_seqs, dtype=torch.int64).repeat_interleave(bpc)
+    # [num_blocks, num_seqs] transposed to entry order (seq major, slot minor).
+    block_ids = torch.arange(n_pages, dtype=torch.int64).reshape(num_blocks, num_seqs)
+    chunk_page_ids = [
+        block_ids[c * bpc : (c + 1) * bpc].t().reshape(entries, 1).contiguous()
+        for c in range(num_chunks)
+    ]
+    mask_by_chunk = torch.zeros(
+        num_chunks, entries * num_kv_heads, 1, block_size, dtype=torch.float32
+    )
 
     def run(cap: float):
         return _batched_decode_kernel(
             query,
-            None,
+            rep_row_ids,
             k_pages,
             v_pages,
-            block_ids,
-            mask_by_block,
+            chunk_page_ids,
+            mask_by_chunk,
             1.0,
             num_seqs,
-            num_blocks,
+            bpc,
             num_kv_heads,
             qpk,
             block_size,
