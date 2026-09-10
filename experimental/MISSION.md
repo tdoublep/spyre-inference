@@ -1,5 +1,69 @@
 # Mission: make a batched decode attention kernel beat the per-sequence one
 
+## OUTCOME (2026-09-10): met, by `blockpar`
+
+`blockpar` runs the whole decode batch in **one** kernel at **1.953 ms** against
+the `per_seq` bar of 2.351 ms -- 1.20x faster, and 3.95x faster than today's
+`batched` -- over the production KV cache **unchanged**. It passes `--check`
+against a CPU fp32 reference. Run it with:
+
+    bash experimental/run_microbench_batched_decode.sh --variants per_seq,blockpar
+
+`dev ms/call` reads 0.000 unless torch-spyre is built `USE_SPYRE_PROFILER=1`;
+`pyproject.toml` forces it to `0`, so a stock install measures wall clock only.
+
+**The cause was the gather, not the work division.** `blockpar` changes only how
+KV is fetched -- `num_seqs*nc` pages per step through a 2-D index instead of
+`num_seqs` through a 1-D one, which also cuts the block loop from `num_blocks`
+steps to `num_blocks/nc`. A gather can only be core-split on its index-entry
+axis, and for a 1-D int32 index that axis is counted in whole 32-entry sticks, so
+the batched kernel's 4-entry gather has zero splittable units and runs on one
+core. The 2-D index removes the /32. Full result table, the `nc` sweep that
+confirms the mechanism, and the two layout variants that are faster but not
+shippable are in the `microbench_batched_decode.py` docstring.
+
+**Both named suspects are now closed:**
+
+- **Work division: not the cause, and now priced.** `pretrans` emits the same 32
+  fallbacks and is 1.26x *faster* than `batched`; `blockpar` still emits 4 and is
+  the fastest unchanged-cache variant; `headmaj` emits 0 and is barely faster
+  than `batched`. The count is 2 per bmm with M>1, tracking the shape, not the
+  cost. Do not chase it further.
+- **Layout solver: dead.** `cpsat` leaves `batched` unchanged (7.673 vs 7.656)
+  and makes `per_seq` 1.9x *worse* (4.440 vs 2.342).
+
+**A faster option exists, at a cost that is now measured.** `headmaj_bp` runs
+decode attention in 1.645 ms over a `[pages, KV, block_size, head_size]` cache
+that K and V can share. Both of the obvious objections were chased down:
+
+- **Its store works and is cheap.** PR #783's per-KV-head `index_copy_` against a
+  flat view compiles, fuses into ONE kernel, and places exactly (`--store`
+  verifies placement, not just that it runs): 0.020 ms vs production's 0.004 ms,
+  so +0.016 ms/layer against a 0.308 ms/layer gain. `pretrans_bp` (1.525 ms) is
+  faster still and is genuinely **not** deliverable -- K's token axis ends up last,
+  which is exactly why its store fails to lower.
+- **It does make the per-sequence kernel slower**, which is what prefill, mixed
+  batches and every decode fallback run: 1.29x at decode shape (3.075 vs 2.375)
+  and 1.07x at prefill (8.549 vs 8.016), even though the layout gives that kernel
+  strictly fewer ops. Net it still wins, because the frequencies differ -- decode
+  saves 0.690 ms/layer per output token while prefill costs 0.533 ms/layer once
+  per request, so the second decode step repays it. The case to watch is a batch
+  that misses the batched path: it pays 1.29x with no compensating win.
+
+So: `blockpar` if you want the win with zero blast radius, `headmaj_bp` for
+1.18x more if the batched path reliably covers the buckets that occur.
+
+**Not adaptable to prefill.** `lower_bmm`'s 4-D form has two batch axes and
+prefill already spends both on `(KV, G)` with `M=q_len`; an `nc` axis needs a
+third, or the axis merge the backend rejects. Decode needs the gather for
+parallelism only because its `M` is 1. (Reasoning from the documented
+constraints, not measured.)
+
+The original brief follows unchanged.
+
+---
+
+
 ## The goal
 
 Design a **batched** decode attention kernel — one that serves all `num_seqs`
