@@ -89,31 +89,78 @@ That matches the KG3 weight-stationary dataflow both attention matmuls lower to
 stationary in the 64KB per-core XRF while Q streams through it, so one flat lane
 per core keeps each core's stationary tile distinct and reads KV once.
 
-What governs flatbc: lanes, not num_seqs
----------------------------------------
+What governs flatbc's speed: lanes per bmm group
+-----------------------------------------------
 flatbc's parallelism is lanes = num_seqs * num_kv_heads against the 32 cores.
 Hold lanes at 32 and move the split between sequences and KV heads, and flatbc
 does not care while per_seq does:
 
-    num_seqs  kv_heads  lanes   per_seq   flatbc   flatbc correct?
-           1         8      8     0.593    1.213   ok
-           2         8     16     1.185    2.552   ok
-           2        16     32     4.214    1.377   ok
-           4         8     32     2.371    1.342   ok
-           8         4     32     3.257    1.344   ok
-           4        16     64     8.415    5.754   MISMATCH, rel l2 0.6997
-           8         8     64     4.766    5.753   MISMATCH, rel l2 0.7016
+    num_seqs  kv_heads  lanes   per_seq   flatbc
+           1         8      8     0.593    1.213
+           2         8     16     1.185    2.552
+           2        16     32     4.214    1.377
+           4         8     32     2.371    1.342
+           8         4     32     3.257    1.344
+           8         8     64     4.766    5.743
 
-At every lanes=32 point flatbc is ~1.35 ms at 25.0 GB/s, so it is a function of
-lanes and not of batch size, and its margin over per_seq runs from 1.77x to
-3.06x. Below 32 lanes it under-fills the cores and loses.
+At every lanes=32 point flatbc is ~1.35 ms at 25.0 GB/s, so speed is a function
+of lanes per bmm group and not of batch size; below 32 it under-fills the cores
+and above 32 it falls off. Nothing forces one group, though: flatchunk cuts the
+lane axis into fixed groups of 32 inside the same dispatch, which restores the
+rate at any batch and removes num_kv_heads and num_seqs from the question of
+whether the kernel is usable at all:
 
-Above 32 lanes it returns the WRONG ANSWER: rel l2 ~0.70 where a correct variant
-sits at 0.004. The two 64-lane points agree to four figures in both time
-(5.754 / 5.753) and error (0.6997 / 0.7016) despite completely different
-(num_seqs, kv_heads), so this is deterministic and keyed on lanes exceeding the
-core count -- it wants a standalone repro filed against torch-spyre. That, not
-batch size, is what blocks flatbc.
+    num_seqs=8, kv_heads=8, lanes=64      dev ms/call  kernels   GB/s
+    per_seq                                     4.753        8   14.1
+    batched                                     9.316        1    7.2
+    flatbc  (one group of 64)                   5.743        1   11.7
+    flatchunk (two groups of 32)                2.651        2   25.3
+
+So the merged flat batch axis is worth 1.79x over per_seq at batch 8 once the
+groups are sized to the cores, and 25.3 GB/s is the same rate the lanes=32
+single-group case gets.
+
+Correctness limit: NOT lanes, and it blocks all of this
+-----------------------------------------------------
+Above some size the flat variants return the WRONG ANSWER -- rel l2 ~0.7-0.8
+against the CPU reference where a correct variant sits at 0.004. It is not the
+lane count: flatchunk's groups are exactly 32 lanes, the width that is correct
+on its own, and it is still wrong at num_seqs=8.
+
+What every run so far correlates with is the row count of the folded cache,
+num_pages * num_kv_heads, which is the index range of the gather:
+
+    num_seqs  kv_heads  num_blocks  pages  rows  lanes  correct?
+           1         8          16     17   136      8  ok
+           2         8          16     33   264     16  ok
+           4         8           8*    33   264     32  ok
+           4         8          16     65   520     32  ok
+           8         4          16    129   516     32  ok
+           2        16          16     33   528     32  ok
+           4        16          16     65  1040     64  WRONG, rel l2 0.6997
+           8         8          16    129  1032     64  WRONG, rel l2 0.7016
+    * the --block-size 256 point
+
+Correct at <= 528 rows, wrong at >= 1032, so the boundary looks like 1024. The
+two 64-lane failures agree to four figures in both time (5.754 / 5.753) and
+error (0.6997 / 0.7016) across completely different (num_seqs, kv_heads), so it
+is deterministic rather than a numerical edge. This is the one thing that blocks
+the flat form, and it wants a standalone repro filed against torch-spyre. Note
+it is a numerical failure, distinct from the gather-per-core-view saturation
+that spyre-inference PR #783 documents in
+scripts/probes/repro_gather_view_width.py.
+
+Relation to PR #783
+-------------------
+PR #783 (SPYRE_LX_KV_LAYOUT) already folds the cache on (page, kv_head), which
+is the same page order the flat variants here use, so these numbers are evidence
+for that layout rather than a separate proposal. Two things it reports line up:
+its note that the batched query form "makes inductor clone the page out to an
+axis it does not have" matches flat3d failing to compile where only the M=1
+broadcast form reaches the merged axis, and its SPYRE_ATTN_MAX_CORES matches the
+under-fill measured below 32 lanes. It needs torch-spyre #4153; the runs here
+are on the #4347 tip, which descends from #4153, which is the likely reason the
+flat form reaches 25 GB/s at the full 32 cores without capping them.
 
 Leads closed, negatively
 ------------------------
@@ -164,11 +211,16 @@ prefill included, so it has to be decided globally rather than per kernel.
 
 Next
 ----
-  * Reduce the >32-lane miscompute to a repro and file it; flatbc cannot land
-    until lanes > 32 is correct, and granite's kv_heads=8 puts num_seqs=4 at
-    exactly 32.
-  * Decide the page order globally, not per kernel: flatbc wants KV-major,
-    _page_attn_kernel is 1.30x worse under it.
+  * Pin down the wrong-answer boundary (looks like num_pages * num_kv_heads >
+    1024) and reduce it to a standalone repro for torch-spyre. Nothing here can
+    land until it is fixed: granite's kv_heads=8 crosses it at any realistic
+    cache size.
+  * Chunk the lane axis in production rather than sizing lanes to the cores --
+    flatchunk shows the rate holds at batch 8, so the kernel does not need
+    num_seqs * num_kv_heads to equal 32.
+  * Decide the page order globally, not per kernel: the flat form wants it,
+    _page_attn_kernel is 1.30x worse under it, and PR #783 already carries it
+    behind a flag.
 """
 
 import argparse
