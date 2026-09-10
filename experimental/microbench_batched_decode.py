@@ -63,10 +63,15 @@ Findings so far:
   * The batched kernel is the only variant that trips work-division
     fallbacks: 32 x `lossy work-division ... output:d4=absent`, matching the
     count in the full vLLM run exactly.
-  * Launch overhead cannot explain the regression. Host residual
-    (wall - device) is 0.786 ms over 4 launches for per_seq vs 0.638 ms over
-    1 launch for unrolled, so collapsing 4 launches to 1 saves 0.148 ms --
-    3% of the batched kernel's +5.350 ms/call device penalty.
+  * The batched path DOES win on launch overhead, in the expected direction --
+    it is just far too small to pay for the kernel. Host residual
+    (wall - device) is 0.786 ms over 4 launches for per_seq vs 0.403 ms over
+    1 launch for batched, so batching saves +0.383 ms of host time while
+    costing +5.350 ms of device time: net +4.967 ms, and the saving offsets
+    only 7% of the cost. The device penalty is 14x the entire launch-overhead
+    prize, so no launch saving available in this shape could rescue it.
+    `unrolled` isolates the launch effect with the per-sequence schedule
+    intact: 4 launches -> 1 saves 0.148 ms with device time unchanged.
   * `unrolled` is the fastest variant: one graph holding the num_seqs
     per-sequence bodies gets a single dispatch AND keeps the per-sequence
     schedule the planner handles well (0 fallbacks). It beats the purpose-built
