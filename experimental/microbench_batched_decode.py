@@ -25,40 +25,56 @@ Useful knobs:
     --iters 20 --variants per_seq,batched,unrolled
     --show-warnings          print each lossy work-division message
 
-STATUS -- READ BEFORE TRUSTING THE NUMBERS
-------------------------------------------
-First run on tpa-spyre-dev-2, granite shapes, 2026-09-10:
+STATUS
+------
+Run on tpa-spyre-dev-2, granite shapes, 2026-09-10:
 
     variant   dev ms/call  kernels  wall med ms  lossy  warmup s
-    per_seq        19.251        4       19.899      0      52.8
-    batched        11.437        1       12.149     32      39.8
-    unrolled       18.658        2       19.610      0     142.0
+    per_seq         2.343        4        3.129      0      30.6
+    batched         7.693        1        8.096     32      37.5
+    unrolled        2.267        2        2.905      0     123.0
 
-What reproduces:
-  * The 32 `lossy work-division ... output:d4=absent` fallbacks, exactly the
-    count seen in the full vLLM run, and only for the batched variant.
-  * The "dumb unroll" result: folding 4 launches into 1 graph (2 kernels after
-    fusion) buys only ~3% (18.658 vs 19.251 ms). So launch overhead is NOT
-    where the batching win was supposed to come from -- which is the puzzle
-    this script exists to explain.
+This reproduces the production regression:
 
-What does NOT reproduce yet -- the open bug in this harness:
-  * Absolute time is ~6x off production for per_seq: 19.251 ms/call here vs
-    4 x 763.4 us = 3.05 ms/layer in the profiled vLLM run (1.7 GB/s vs
-    11.0 GB/s effective on KV).
-  * Consequently the ranking INVERTS: batched looks 1.7x *faster* here, while
-    in production it is 2.5x slower. Do not draw batched-vs-per_seq
-    conclusions from this script until that gap is closed.
+    metric                    harness    production   delta
+    batched, device/layer     7.693 ms     7.581 ms   +1.5%
+    batched KV bandwidth      4.4 GB/s     4.4 GB/s   exact
+    per_seq, device/layer     2.343 ms     3.054 ms   -23%
+    batched / per_seq            3.28x        2.48x   same direction
 
-Most likely cause, and the first thing to try: the K/V page tensors are built
-with a plain `convert()` of a fresh CPU tensor, which does not give them the
-device layout the production KV cache has. They are `index_select` gather
-sources on dim 0, and spyre_inference.custom_ops.utils.place_row_gathered
-exists precisely to "move a 2D gather source to device with its rows
-outermost". Suspect the gather is hitting a slow/re-tiling path here for both
-variants, compressing the difference between them. Cross-check against the
-buffers TorchSpyreModelRunner.initialize_kv_cache_tensors produces, and
-against SpyreAttentionImpl._staging_buffers for `query`.
+per_seq is optimistic by ~23% because the harness skips the metadata handling
+and output scatter the production per-call path also does. The batched
+pathology itself lands within 1.5%.
+
+Getting here required matching two things that a naive harness gets wrong, and
+both mattered enormously -- with either wrong, per_seq collapsed to 1.7 GB/s
+and the ranking INVERTED (batched looked 1.7x faster):
+
+  1. k/v_pages must be allocated the way initialize_kv_cache_tensors does:
+     host zeros then .to(device, device_layout=slot_major_kv_layout(...)).
+     A plain convert() leaves the default tiled layout, which spreads the slot
+     index across two device dims (torch-spyre#3705) and makes the in-graph
+     page gather slow for every variant.
+  2. `query` must be the production staging width (max_num_batched_tokens + 1
+     = 513 rows), not num_seqs. The batched kernel takes a query[:num_seqs]
+     prefix of it and the per-sequence kernel gathers out of it.
+
+Findings so far:
+  * The batched kernel is the only variant that trips work-division
+    fallbacks: 32 x `lossy work-division ... output:d4=absent`, matching the
+    count in the full vLLM run exactly.
+  * Launch overhead cannot explain the regression. Host residual
+    (wall - device) is 0.786 ms over 4 launches for per_seq vs 0.638 ms over
+    1 launch for unrolled, so collapsing 4 launches to 1 saves 0.148 ms --
+    3% of the batched kernel's +5.350 ms/call device penalty.
+  * `unrolled` is the fastest variant: one graph holding the num_seqs
+    per-sequence bodies gets a single dispatch AND keeps the per-sequence
+    schedule the planner handles well (0 fallbacks). It beats the purpose-built
+    batched kernel by 3.4x. So the problem is the batched kernel's shapes, not
+    the idea of batching. Cost of that approach: num_seqs is baked into the
+    graph, so it needs one compiled variant per seq bucket.
+
+Open: why the unrolled variant reports 2 device kernels for 4 sequence bodies.
 """
 
 import argparse
@@ -75,6 +91,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _batched_decode_kernel,
     _page_attn_kernel,
     _stick_aligned_len,
+    slot_major_kv_layout,
 )
 
 DEV = torch.device("spyre")
@@ -149,13 +166,32 @@ def build_inputs(a):
     num_pages = a.num_seqs * a.num_blocks + 1
 
     torch.manual_seed(0)
-    k_cpu = torch.randn(num_pages, a.block_size, a.num_kv_heads, a.head_size).to(dtype)
-    v_cpu = torch.randn(num_pages, a.block_size, a.num_kv_heads, a.head_size).to(dtype)
-    k_pages = convert(k_cpu, device=DEV)
-    v_pages = convert(v_cpu, device=DEV)
+    # Allocated exactly as TorchSpyreModelRunner.initialize_kv_cache_tensors does:
+    # host zeros then .to(device, device_layout=slot-major). The default tiled
+    # layout spreads the slot index across two device dims (torch-spyre#3705),
+    # which changes what the in-graph page gather costs -- so a plain convert()
+    # here does NOT measure the same thing production does.
+    layout = slot_major_kv_layout(
+        num_pages * a.block_size, a.num_kv_heads, a.head_size, dtype
+    )
+    k_pages = torch.zeros(
+        num_pages, a.block_size, a.num_kv_heads, a.head_size, dtype=dtype
+    ).to(DEV, device_layout=layout)
+    v_pages = torch.zeros(
+        num_pages, a.block_size, a.num_kv_heads, a.head_size, dtype=dtype
+    ).to(DEV, device_layout=layout)
 
-    # Decode: one query row per sequence, rows 0..num_seqs-1.
-    query = convert(torch.randn(max(a.num_seqs, 8), num_heads, a.head_size).to(dtype), device=DEV)
+    # Decode: one query row per sequence in rows 0..num_seqs-1, but the buffer is
+    # the production staging buffer width (max_num_batched_tokens + 1), not
+    # num_seqs: the batched kernel takes a query[:num_seqs] prefix of it and the
+    # per-sequence kernel gathers out of it, and both cost differently against a
+    # 513-row source than against a snug one.
+    query = convert(
+        torch.randn(a.staging_rows, num_heads, a.head_size).to(dtype), device=DEV
+    )
+    out_buf = convert(
+        torch.zeros(a.staging_rows, num_heads, a.head_size).to(dtype), device=DEV
+    )
 
     # --- per-sequence / unrolled inputs -------------------------------------
     # query_row_index: stick-aligned int32, first padded_query_len entries are
@@ -200,6 +236,7 @@ def build_inputs(a):
 
     return dict(
         query=query,
+        out_buf=out_buf,
         k_pages=k_pages,
         v_pages=v_pages,
         row_idx=row_idx,
@@ -287,6 +324,8 @@ def main():
     p.add_argument("--num-queries-per-kv", type=int, default=4, help="32 heads / 8 kv")
     p.add_argument("--head-size", type=int, default=128)
     p.add_argument("--layers", type=int, default=40, help="only scales the report")
+    p.add_argument("--staging-rows", type=int, default=513,
+                   help="production is max_num_batched_tokens + 1 (512 + 1)")
     p.add_argument("--iters", type=int, default=20)
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--variants", default="per_seq,batched,unrolled")
