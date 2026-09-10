@@ -71,7 +71,7 @@ since GreedyLayoutSolver is the only solver with supports_paired_buffers=True):
 RESULTS (tpa-spyre-dev-2, granite shapes: 4 seqs, 16 blocks x 128, 8 KV heads,
 4 queries/KV, head 128; #4347 active via LAYOUT_SOLVER=greedy). Wall median, ms:
 
-    chunked_ktile chunk=8 tile=64  2.716          <- BEATS THE BAR, 0.92x
+    chunked_ktile chunk=8 tile=64  2.707 - 2.716  <- BEATS THE BAR, 0.93x
     unrolled (the bar)            2.923 - 3.006   (five runs)
     per_seq                       3.067 - 3.082
     chunked_gather chunk=8        3.623           (block-major index)
@@ -79,12 +79,13 @@ RESULTS (tpa-spyre-dev-2, granite shapes: 4 seqs, 16 blocks x 128, 8 KV heads,
     chunked_gather chunk=16       3.912
     chunked_gather chunk=4        4.822
     chunked_gather chunk=2        6.261
+    batched_ktile tile=64         7.252           (tiling with no chunking)
     batched_masklist              8.039
     batched (shipped)             8.129
     merged_sk                     8.243
     merged_cat                    8.822
     gather_shared                 8.941
-    qgroup_loop                  11.114
+    qgroup_loop                  11.114           (also numerically WRONG, below)
 
 What the regression is NOT. Each was varied on its own and none tracks runtime:
   * work division. qgroup_loop removed all 32 lossy divisions and got SLOWER
@@ -150,7 +151,9 @@ with the batch.
 
 Both knobs are constrained:
   * kv_tile must be a multiple of the fp16 stick (64). kv_tile=32 fails with
-    "no mechanism to resolve stick incompatibility".
+    "no mechanism to resolve stick incompatibility", and kv_tile=128 is no
+    tiling at all (3.586 ms, and the 32 lossy divisions come back), so at
+    block_size 128 the value 64 is the only tiling available and is the optimum.
   * the chunk index must be BLOCK-major. Sequence-major makes the per-block
     slice's host dim 0 strided, which insert_restickify_padding rejects; going
     block-major was also worth 7% on chunked_gather (3.902 -> 3.623).
