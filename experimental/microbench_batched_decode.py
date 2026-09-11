@@ -856,11 +856,14 @@ def build_inputs(a):
     # --- per-sequence / unrolled inputs -------------------------------------
     # query_row_index: stick-aligned int32, first padded_query_len entries are
     # this sequence's absolute query rows (padded_query_len == 1 for decode).
-    idx_len = _stick_aligned_len(1)
+    q_len = a.query_len
+    idx_len = _stick_aligned_len(q_len)
     row_idx = []
     for s in range(a.num_seqs):
         t = torch.zeros(idx_len, dtype=torch.int32)
-        t[0] = s
+        # Absolute query rows, contiguous per sequence, exactly as
+        # _build_query_row_tables lays them out from query_start_loc.
+        t[:q_len] = torch.arange(s * q_len, (s + 1) * q_len, dtype=torch.int32)
         row_idx.append(convert(t, device=DEV))
 
     # page_index_table: [num_blocks, INT32_ELEMS_PER_STICK], page index at col 0.
@@ -897,7 +900,7 @@ def build_inputs(a):
 
     # mask_tiles: [padded_query_len, block_size] additive, zeros = nothing masked.
     mask_tiles = [
-        convert(torch.zeros(1, a.block_size, dtype=dtype), device=DEV)
+        convert(torch.zeros(q_len, a.block_size, dtype=dtype), device=DEV)
         for _ in range(a.num_blocks)
     ]
 
@@ -1171,7 +1174,7 @@ def make_callables(a, t):
             per_seq_c(
                 t["query"], t["row_idx"][s], t["k_pages"], t["v_pages"],
                 t["page_tables"][s], t["mask_tiles"], scale,
-                a.num_blocks, 1, nh, nkv, hs, 0.0, None, per_seq_out,
+                a.num_blocks, a.query_len, nh, nkv, hs, 0.0, None, per_seq_out,
             )
         return per_seq_out
 
@@ -1208,7 +1211,7 @@ def make_callables(a, t):
             per_seq_kvm_c(
                 t["query"], t["row_idx"][sq], t["k_pages_kvm"], t["v_pages_kvm"],
                 t["page_tables"][sq], t["mask_tiles"], scale,
-                a.num_blocks, 1, nh, nkv, hs, per_seq_kvm_out,
+                a.num_blocks, a.query_len, nh, nkv, hs, per_seq_kvm_out,
             )
         return per_seq_kvm_out
 
@@ -1220,7 +1223,7 @@ def make_callables(a, t):
             per_seq_fold3d_c(
                 t["query"], t["row_idx"][sq], t["k_pages_flat"], t["v_pages_flat"],
                 t["page_tables_fold"][sq], t["mask_tiles"], scale,
-                a.num_blocks, 1, nh, nkv, hs, per_seq_fold3d_out,
+                a.num_blocks, a.query_len, nh, nkv, hs, per_seq_fold3d_out,
             )
         return per_seq_fold3d_out
 
@@ -1241,7 +1244,7 @@ def make_callables(a, t):
                 args = (
                     t["query"], t["row_idx"][s], t[kpg], t[vpg],
                     t["page_tables"][s], t["mask_tiles"], scale,
-                    a.num_blocks, 1, nh, nkv, hs,
+                    a.num_blocks, a.query_len, nh, nkv, hs,
                 )
                 if kvm:
                     fn(*args, buf)
@@ -1263,7 +1266,7 @@ def make_callables(a, t):
             per_seq_c(
                 t["query"], t["row_idx"][s], t["k_pages"], t["v_pages"],
                 t["page_tables"][s], t["mask_tiles"], scale,
-                a.num_blocks, 1, nh, nkv, hs, 0.0, None, per_seq_narrow_out,
+                a.num_blocks, a.query_len, nh, nkv, hs, 0.0, None, per_seq_narrow_out,
             )
         return per_seq_narrow_out
 
@@ -1274,7 +1277,7 @@ def make_callables(a, t):
             per_seq_kvm_c(
                 t["query"], t["row_idx"][sq], t["k_pages_kvm"], t["v_pages_kvm"],
                 t["page_tables"][sq], t["mask_tiles"], scale,
-                a.num_blocks, 1, nh, nkv, hs, per_seq_kvm_narrow_out,
+                a.num_blocks, a.query_len, nh, nkv, hs, per_seq_kvm_narrow_out,
             )
         return per_seq_kvm_narrow_out
 
@@ -1384,6 +1387,10 @@ def main():
     p.add_argument("--num-queries-per-kv", type=int, default=4, help="32 heads / 8 kv")
     p.add_argument("--head-size", type=int, default=128)
     p.add_argument("--layers", type=int, default=40, help="only scales the report")
+    p.add_argument("--query-len", type=int, default=1,
+                   help="padded_query_len: 1 is decode, >1 prices the prefill shape "
+                        "the per-sequence kernel also runs (batched variants are "
+                        "decode-only and are skipped)")
     p.add_argument("--staging-rows", type=int, default=513,
                    help="production is max_num_batched_tokens + 1 (512 + 1)")
     p.add_argument("--iters", type=int, default=20)
