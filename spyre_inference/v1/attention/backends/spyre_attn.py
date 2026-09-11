@@ -1165,19 +1165,24 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 tile_ids_padded_cpu = torch.zeros(
                     b_blocks, _stick_aligned_len(b_seqs * self.num_kv_heads), dtype=torch.int32
                 )
-                for s, n in enumerate(decode_blocks):
-                    n_use = min(n, b_blocks)
-                    # Position i is the i-th ACTIVE block, matching the mask tiles.
-                    blocks_s = (
-                        range(n_use)
-                        if active_block_indices is None
-                        else active_block_indices[s][:n_use]
-                    )
-                    lane = s * self.num_kv_heads
-                    for b, abs_b in enumerate(blocks_s):
-                        tile_ids_padded_cpu[b, lane : lane + self.num_kv_heads] = (
-                            int(block_table[s, abs_b]) * self.num_kv_heads + heads
-                        )
+                if active_block_indices is None:
+                    bt = block_table[:num_decode_seqs].to(torch.int32)
+                    w = min(b_blocks, bt.shape[1])
+                    in_range = torch.arange(w).unsqueeze(0) < torch.tensor(
+                        [min(n, b_blocks) for n in decode_blocks], dtype=torch.int64
+                    ).unsqueeze(1)
+                    tiles = (bt[:, :w, None] * self.num_kv_heads + heads) * in_range[..., None]
+                    tile_ids_padded_cpu[:w, : num_decode_seqs * self.num_kv_heads] = tiles.permute(
+                        1, 0, 2
+                    ).reshape(w, -1)
+                else:
+                    for s, n in enumerate(decode_blocks):
+                        lane = s * self.num_kv_heads
+                        # Position i is the i-th ACTIVE block, matching the mask tiles.
+                        for b, abs_b in enumerate(active_block_indices[s][: min(n, b_blocks)]):
+                            tile_ids_padded_cpu[b, lane : lane + self.num_kv_heads] = (
+                                int(block_table[s, abs_b]) * self.num_kv_heads + heads
+                            )
                 # -inf on padded rows/blocks and past-kv-len positions; 0 on
                 # valid positions. Broadcast to KV heads and reshape to the
                 # kernel input shape [B_blocks, B_seqs * KV, 1, block_size].
