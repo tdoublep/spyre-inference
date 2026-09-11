@@ -91,8 +91,6 @@ def _record_block(name: str):
 # SpyreAttentionMetadata.page_index_tables.
 INT32_ELEMS_PER_STICK = 32
 
-# Cores the gather's entry axis is split across. Equal to INT32_ELEMS_PER_STICK
-# today but unrelated to it: a core count, not a byte width.
 _SPYRE_CORE_COUNT = 32
 
 
@@ -395,11 +393,10 @@ def _batched_decode_kernel(
     tile_output = None
 
     for c, page_idx in enumerate(chunk_page_ids):
-        # page_idx is [entries, 1], so this is advanced indexing rather than
-        # index_select, which takes only a 1-D index. The extra axis is the whole
-        # point: behind a 1-D index the entry axis is counted in whole 32-entry
-        # sticks, so a gather narrower than one stick has no splittable unit and
-        # runs on a single core. A 2-D index counts entries individually.
+        # Advanced indexing on a [entries, 1] index, not index_select on a 1-D
+        # one: behind a 1-D index the entry axis splits in whole 32-entry sticks,
+        # so a narrow gather gets one core. It costs the eager path, which
+        # _batched_decode_preconditions_met gives up.
         # Token-major cache page to head-major; a view, so do not add
         # .contiguous() -- merging these axes is what materializes the page.
         k_page = k_pages[page_idx].squeeze(1).permute(0, 2, 1, 3)
@@ -1100,12 +1097,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # Entries target the cores: fewer under-fills them, more than one
                 # stick's worth hits a backend axis-merge limit.
                 blocks_per_chunk = max(1, min(_SPYRE_CORE_COUNT // b_seqs, b_blocks))
-                # Neither lattice is all powers of two (_powers_of_two_up_to appends
-                # n itself), so pad the block axis up instead of shrinking the chunk
-                # to a divisor, which would forfeit the wide gather (b_blocks=79 is
-                # prime). Padding columns gather page 0 under an all--inf mask and
-                # contribute zero: chunk 0 still holds every real row's block 0, so
-                # the running max stays finite.
+                # blocks_per_chunk need not divide b_blocks, so pad the block axis
+                # up to a whole chunk. Padding columns gather page 0 under an
+                # all--inf mask and contribute zero; chunk 0 still holds every real
+                # row's block 0, so the running max stays finite.
                 num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
                 padded_batch_blocks = num_chunks * blocks_per_chunk
                 assert padded_batch_blocks >= b_blocks
@@ -1137,7 +1132,10 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # One tensor per chunk, not slices of a stack: an index tensor
                 # reaches the device as a real argument and a view's storage
                 # offset is dropped (torch-spyre#3770), so a sliced chunk c > 0
-                # would silently gather chunk 0's pages.
+                # would silently gather chunk 0's pages. Probed by
+                # test_spyre_compile_input_honors_storage_offset; when that
+                # strict xfail flips, one stacked tensor also collapses the
+                # per-chunk H2D transfers into one.
                 chunk_page_ids_cpu = [
                     block_ids_padded[c * blocks_per_chunk : (c + 1) * blocks_per_chunk]
                     .t()
