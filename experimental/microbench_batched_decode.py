@@ -1154,6 +1154,12 @@ def make_callables(a, t):
             torch.zeros(a.staging_rows, nh, hs, dtype=torch.float16, device="cpu"), device=DEV
         )
 
+    def _batched_out():
+        """vLLM's per-layer output buffer: num_seqs rows, offset 0."""
+        return convert(
+            torch.zeros(a.num_seqs, nh, hs, dtype=torch.float16, device="cpu"), device=DEV
+        )
+
     per_seq_c = torch.compile(_page_attn_kernel, dynamic=False)
     batched_c = torch.compile(_batched_decode_kernel, dynamic=False)
     unrolled_c = torch.compile(_unrolled_decode_kernel, dynamic=False)
@@ -1220,6 +1226,36 @@ def make_callables(a, t):
 
     per_seq_kvm3d_c = torch.compile(_per_seq_kvm3d_kernel, dynamic=False)
 
+    def _rows_buf(rows):
+        return convert(
+            torch.zeros(rows, nh, hs, dtype=torch.float16, device="cpu"), device=DEV
+        )
+
+    def _per_seq_out(rows, kvm):
+        buf = _rows_buf(rows)
+        fn = per_seq_kvm_c if kvm else per_seq_c
+        kpg, vpg = ("k_pages_kvm", "v_pages_kvm") if kvm else ("k_pages", "v_pages")
+
+        def run():
+            for s in range(a.num_seqs):
+                args = (
+                    t["query"], t["row_idx"][s], t[kpg], t[vpg],
+                    t["page_tables"][s], t["mask_tiles"], scale,
+                    a.num_blocks, 1, nh, nkv, hs,
+                )
+                if kvm:
+                    fn(*args, buf)
+                else:
+                    fn(*args, 0.0, None, buf)
+            return buf
+
+        return run
+
+    out_sweep = {}
+    for _rows in (a.num_seqs, 33, 129, a.staging_rows):
+        out_sweep[f"per_seq_out{_rows}"] = _per_seq_out(_rows, False)
+        out_sweep[f"per_seq_kvm_out{_rows}"] = _per_seq_out(_rows, True)
+
     per_seq_narrow_out = _batched_out()
 
     def per_seq_narrowout():
@@ -1255,12 +1291,6 @@ def make_callables(a, t):
 
     flat_c = torch.compile(_flat_decode_kernel, dynamic=False)
     flatchunk_c = torch.compile(_flat_chunked_decode_kernel, dynamic=False)
-
-    def _batched_out():
-        """vLLM's per-layer output buffer: num_seqs rows, offset 0."""
-        return convert(
-            torch.zeros(a.num_seqs, nh, hs, dtype=torch.float16, device="cpu"), device=DEV
-        )
 
     def _flat(form):
         out_buf = _batched_out()
@@ -1307,6 +1337,7 @@ def make_callables(a, t):
         "per_seq_fold3d": per_seq_fold3d,
         "per_seq_narrowout": per_seq_narrowout,
         "per_seq_kvm_narrowout": per_seq_kvm_narrowout,
+        **out_sweep,
         "flat_from4dview": flat_from4dview,
         "flat3d": _flat("3d"),
         "flatbc": _flat("bcast"),
