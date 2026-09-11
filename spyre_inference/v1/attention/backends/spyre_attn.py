@@ -131,9 +131,15 @@ class SpyrePagedKVCache(NamedTuple):
     """Per-layer paged KV cache for the Spyre backend.
 
     Each field is one dense tensor of shape
-    [num_blocks * num_kv_heads, block_size, head_size] on the Spyre device: the
-    (block, kv head) pair is folded into one axis so each is a contiguous tile.
-    See `head_major_kv_layout`.
+    [num_blocks, num_kv_heads, block_size, head_size] on the Spyre device: a
+    (block, kv head) pair is one contiguous tile, so the cache is head-major
+    within a block. See `head_major_kv_layout`.
+
+    The three consumers read the same bytes through different views, all built
+    outside any graph: the per-sequence kernel takes this 4-D form (one
+    contiguous page per gather entry), the batched decode kernel takes
+    `kv_tile_views` (one row per (page, kv head) tile), and the KV store takes
+    `kv_slot_views`.
 
     NamedTuple (not dataclass) because it is a tuple at runtime, so unpacking
     (`k_pages, v_pages = cache`) traces cleanly under Dynamo without relying on
@@ -165,10 +171,13 @@ def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtyp
 
 
 def head_major_kv_layout(num_rows: int, block_size: int, head_size: int, dtype: torch.dtype):
-    """Rows-outermost layout for the (page, kv_head)-folded cache.
+    """Tile-outermost layout for the head-major cache; `num_rows` counts (page, kv head).
 
     The indexed axis must sit at device position 0 or index_select costs the whole
-    tensor, so the fold is materialised with this layout, not viewed out of slot-major.
+    tensor, so the cache is materialised with this layout rather than viewed out of
+    slot-major. The allocation is 4-D while the device layout keeps (page, kv head) as
+    one extent: merging device dims is the direction torch-spyre lowers, splitting
+    device dim 0 is not.
     """
     from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
 
@@ -293,11 +302,10 @@ def _page_attn_kernel(
         query: [num_tokens, num_heads, head_size], the whole batch's query
         query_row_index: int32 device tensor whose first padded_query_len
             entries are this sequence's absolute query rows.
-        k_pages: [num_blocks_total * num_kv_heads, block_size, head_size]
-        v_pages: [num_blocks_total * num_kv_heads, block_size, head_size]
+        k_pages: [num_blocks_total, num_kv_heads, block_size, head_size]
+        v_pages: [num_blocks_total, num_kv_heads, block_size, head_size]
         page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
-            tensor, row i holding the i-th active block's ``page * num_kv_heads
-            + kv`` rows in columns 0..num_kv_heads-1.
+            tensor, row i holding the i-th active block's page index at column 0.
         mask_tiles: [num_blocks]
         alibi_bias_tiles: list of [num_kv_heads, num_queries_per_kv, 1, block_size],
             or None for no ALiBi. The query-axis dim is 1 because softmax absorbs
@@ -325,9 +333,12 @@ def _page_attn_kernel(
     for i in range(num_blocks):
         # index_select, not `k_pages[page_idx]`: subscripting lowers to
         # aten.index, which upcasts the int32 index to int64 and fails eager.
-        page_idx = page_index_table[i, 0:num_kv_heads]
-        k_page_4d = k_pages.index_select(0, page_idx).unsqueeze(1)
-        v_page_4d = v_pages.index_select(0, page_idx).unsqueeze(1)
+        page_idx = page_index_table[i, 0:1]
+        # One entry, hence one contiguous page: num_kv_heads scattered entries over a
+        # flattened cache move the same bytes and cost 1.89x. squeeze/unsqueeze rather
+        # than a permute, since head-major already lands [KV, block_size, head_size].
+        k_page_4d = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+        v_page_4d = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
 
         mask_tile = mask_tiles[i]
 
@@ -1076,10 +1087,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         for s, n in enumerate(num_active):
             blocks_s = slice(n) if active_block_indices is None else active_block_indices[s]
             table = torch.zeros(n, INT32_ELEMS_PER_STICK, dtype=torch.int32)
-            # Columns 0..KV-1 are the block's folded (page, kv head) rows.
-            table[:, : self.num_kv_heads] = block_table[s, blocks_s].to(torch.int32).unsqueeze(
-                1
-            ) * self.num_kv_heads + torch.arange(self.num_kv_heads, dtype=torch.int32)
+            # Column 0 is the page index: the per-sequence kernel reads the cache 4-D,
+            # so one entry reaches every kv head of that block.
+            table[:, 0] = block_table[s, blocks_s].to(torch.int32)
             page_index_tables_cpu.append(table)
 
         # Padded to match key/value by upstream once forward_includes_kv_cache_update is
@@ -1323,6 +1333,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._decode_fn = _batched_decode_compiled if self._compile_attn else _batched_decode_kernel
 
         self._kv_slots: SpyrePagedKVCache | None = None
+        self._kv_tiles: SpyrePagedKVCache | None = None
 
         # Constant for the run, so the kernel's arguments never carry the model
         # graph's token count. The +1 keeps every gather a strict subset: selecting
@@ -1472,8 +1483,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             return 0
 
         k_pages, v_pages = kv_cache
-        num_rows, block_size = k_pages.shape[0], k_pages.shape[1]
-        num_pages = num_rows // self.num_kv_heads
+        num_pages, block_size = k_pages.shape[0], k_pages.shape[2]
         variants = bucketer.variants()
         t_start = time.time()
 
@@ -1598,18 +1608,27 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             out_staging,
         )
 
-    def kv_slot_views(self, kv_cache: SpyrePagedKVCache) -> SpyrePagedKVCache:
-        """One row per (page, kv head, token), built once outside any graph.
+    def kv_tile_views(self, kv_cache: SpyrePagedKVCache) -> SpyrePagedKVCache:
+        """One row per (page, kv head), for the batched decode kernel's gather."""
+        if self._kv_tiles is None:
+            k_pages, v_pages = kv_cache
+            shape = (-1, k_pages.shape[2], k_pages.shape[3])
+            self._kv_tiles = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
+        return self._kv_tiles
 
-        Inductor cannot lower a store through a view of a Spyre-layout tensor created
-        inside a graph. KV heads cannot stay a trailing axis: under the KV-major page
-        order a token's heads are block_size rows apart, so no 3-D view reaches them.
+    def kv_slot_views(self, kv_cache: SpyrePagedKVCache) -> SpyrePagedKVCache:
+        """One row per (page, kv head, token), for the KV store.
+
+        Both views are built once outside any graph: Inductor cannot lower through a
+        view of a Spyre-layout tensor created inside one. KV heads cannot stay a
+        trailing axis here -- under the head-major page order a token's heads are
+        block_size rows apart, so no view keeps them adjacent.
         """
         if self._kv_slots is None:
             k_pages, v_pages = kv_cache
             # head_size is a multiple of the stick, so collapsing the leading dims
             # is a pure re-view of the same bytes.
-            shape = (-1, k_pages.shape[2])
+            shape = (-1, k_pages.shape[3])
             self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._kv_slots
 
@@ -1777,7 +1796,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         assert page_index_tables is not None, "page_index_tables must be mirrored by forward()"
 
         if self._batched_decode_preconditions_met(attn_metadata):
-            self._run_batched_decode_dispatch(query_dev, k_pages, v_pages, attn_metadata, output)
+            k_tiles, v_tiles = self.kv_tile_views(SpyrePagedKVCache(k_pages, v_pages))
+            self._run_batched_decode_dispatch(
+                query_dev, k_tiles, v_tiles, attn_metadata, output
+            )
             return output
 
         # Mirrors the batch layout row for row, so the absolute query_start_loc
