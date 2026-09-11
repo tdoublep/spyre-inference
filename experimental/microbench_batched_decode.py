@@ -361,6 +361,7 @@ def _flat_decode_kernel(
     block_size,
     head_size,
     form,
+    out=None,
 ):
     """Batched decode with (num_seqs, KV) pre-merged into one bmm batch axis.
 
@@ -422,7 +423,13 @@ def _flat_decode_kernel(
             tile_max = new_max
 
     assert tile_output is not None and tile_sum is not None
-    return (tile_output / tile_sum).reshape(S, KV * QPK, D)
+    attn = (tile_output / tile_sum).reshape(S, KV * QPK, D)
+    if out is not None:
+        # Matches _run_batched_decode_dispatch: a contiguous prefix copy into
+        # vLLM's own output buffer at offset 0, not the 513-row staging buffer.
+        out[:num_seqs].copy_(attn)
+        return out
+    return attn
 
 
 def _per_seq_kvm_kernel(
@@ -438,6 +445,7 @@ def _per_seq_kvm_kernel(
     num_heads,
     num_kv_heads,
     head_size,
+    out=None,
 ):
     """_page_attn_kernel over KV-major pages, to price the layout change itself.
 
@@ -490,7 +498,89 @@ def _per_seq_kvm_kernel(
     assert tile_output is not None and tile_sum is not None
     attn = tile_output / tile_sum
     attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
-    return attn.reshape(padded_query_len, num_heads, head_size)
+    attn = attn.reshape(padded_query_len, num_heads, head_size)
+    if out is not None:
+        out.index_copy_(0, query_row_index[:padded_query_len], attn[:padded_query_len])
+        return out
+    return attn
+
+
+def _per_seq_fold3d_kernel(
+    query,
+    query_row_index,
+    k_pages,
+    v_pages,
+    page_index_table,
+    mask_tiles,
+    scale,
+    num_blocks,
+    padded_query_len,
+    num_heads,
+    num_kv_heads,
+    head_size,
+    out=None,
+):
+    """The per-sequence kernel exactly as PR 855 ships it, over FLAT folded pages.
+
+    The variant the microbench was missing. per_seq_kvm keeps the page axis at dim 0
+    of a 4-D [pages, KV, block, D] cache and gathers ONE entry per block; PR 855's
+    initialize_kv_cache_tensors materialises the cache flattened to
+    [pages * KV, block, D], so the kernel gathers num_kv_heads separate rows per
+    block. Same bytes, same device layout, num_kv_heads times the index entries --
+    and under the 32-entry stick rule neither 1 nor num_kv_heads entries is
+    core-splittable, so nothing compensates.
+
+    page_index_table row i holds block i's `page * num_kv_heads + h` in columns
+    0..num_kv_heads-1.
+    """
+    num_queries_per_kv = num_heads // num_kv_heads
+    q_rows = query.index_select(0, query_row_index[:padded_query_len])
+    q = (
+        q_rows.unsqueeze(0)
+        .transpose(1, 2)
+        .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
+    )
+
+    tile_max = None
+    tile_sum = None
+    tile_output = None
+
+    for i in range(num_blocks):
+        page_idx = page_index_table[i, 0:num_kv_heads]
+        k_page_4d = k_pages.index_select(0, page_idx).unsqueeze(1)
+        v_page_4d = v_pages.index_select(0, page_idx).unsqueeze(1)
+        mask_tile = mask_tiles[i]
+
+        scores = torch.matmul(q, k_page_4d.transpose(-2, -1)) * scale
+        scores = scores + mask_tile
+        scores_max = torch.amax(scores, dim=-1, keepdim=True)
+
+        if i == 0:
+            tile_max = scores_max
+            tile_probs = torch.exp(scores - tile_max)
+            tile_output = torch.matmul(tile_probs, v_page_4d)
+            tile_sum = tile_probs.sum(dim=-1, keepdim=True)
+        else:
+            assert tile_max is not None
+            assert tile_sum is not None
+            assert tile_output is not None
+            new_max = torch.maximum(tile_max, scores_max)
+            rescale = torch.exp(tile_max - new_max)
+            tile_output = tile_output * rescale
+            tile_sum = tile_sum * rescale
+            tile_probs = torch.exp(scores - new_max)
+            tile_output += torch.matmul(tile_probs, v_page_4d)
+            tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
+            tile_max = new_max
+
+    assert tile_output is not None and tile_sum is not None
+    attn = tile_output / tile_sum
+    attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
+    attn = attn.reshape(padded_query_len, num_heads, head_size)
+    if out is not None:
+        out.index_copy_(0, query_row_index[:padded_query_len], attn[:padded_query_len])
+        return out
+    return attn
 
 
 def _per_seq_kvm3d_kernel(
@@ -505,6 +595,7 @@ def _per_seq_kvm3d_kernel(
     num_heads,
     num_kv_heads,
     head_size,
+    out=None,
 ):
     """Per-sequence decode over KV-major pages using a 3-D bmm, M=queries_per_kv.
 
@@ -553,7 +644,11 @@ def _per_seq_kvm3d_kernel(
             tile_max = new_max
 
     assert tile_output is not None and tile_sum is not None
-    return (tile_output / tile_sum).reshape(1, num_heads, head_size)
+    attn = (tile_output / tile_sum).reshape(1, num_heads, head_size)
+    if out is not None:
+        out.index_copy_(0, query_row_index[:1], attn)
+        return out
+    return attn
 
 
 def _flat_chunked_decode_kernel(
@@ -776,6 +871,30 @@ def build_inputs(a):
             t[b, 0] = s * a.num_blocks + b
         page_tables.append(convert(t, device=DEV))
 
+    # Folded per-sequence page tables: row b holds block b's
+    # `page * num_kv_heads + h` in columns 0..num_kv_heads-1, exactly as PR 855's
+    # metadata builder fills them for _page_attn_kernel over the flat cache.
+    heads_ar = torch.arange(a.num_kv_heads, dtype=torch.int32)
+    page_tables_fold = []
+    for s in range(a.num_seqs):
+        tf = torch.zeros(a.num_blocks, INT32_ELEMS_PER_STICK, dtype=torch.int32)
+        for b in range(a.num_blocks):
+            tf[b, 0 : a.num_kv_heads] = (s * a.num_blocks + b) * a.num_kv_heads + heads_ar
+        page_tables_fold.append(convert(tf, device=DEV))
+
+    # One allocation serving both kernels: the flat batched kernel wants
+    # [rows, block, D], the per-sequence kernel wants the 4-D form. Merging
+    # (page, kv head) is the direction known to lower (kv_slot_views does the
+    # same); splitting device dim 0 is not, so allocate 4-D and merge down.
+    # Built outside any graph -- Inductor cannot lower through a view of a
+    # Spyre-layout tensor created inside one.
+    try:
+        k_kvm_flatview = k_pages_kvm.view(flat_shape)
+        v_kvm_flatview = v_pages_kvm.view(flat_shape)
+    except Exception as exc:  # noqa: BLE001 - reported as an unavailable variant
+        print(f"note: 4-D -> flat view unavailable ({exc}); flat_from4dview disabled")
+        k_kvm_flatview = v_kvm_flatview = None
+
     # mask_tiles: [padded_query_len, block_size] additive, zeros = nothing masked.
     mask_tiles = [
         convert(torch.zeros(1, a.block_size, dtype=dtype), device=DEV)
@@ -820,6 +939,9 @@ def build_inputs(a):
         num_pages=num_pages,
         row_idx=row_idx,
         page_tables=page_tables,
+        page_tables_fold=page_tables_fold,
+        k_kvm_flatview=k_kvm_flatview,
+        v_kvm_flatview=v_kvm_flatview,
         mask_tiles=mask_tiles,
         block_ids=block_ids,
         mask_by_block=mask_by_block,
@@ -859,7 +981,7 @@ def run_check(a, t, fns, names, num_heads):
     k_host = torch.randn(t["page_shape"]).to(dtype)
     v_host = torch.randn(t["page_shape"]).to(dtype)
     keys = ("k_pages", "v_pages", "k_pages_kvm", "v_pages_kvm",
-            "k_pages_flat", "v_pages_flat")
+            "k_pages_flat", "v_pages_flat", "k_kvm_flatview", "v_kvm_flatview")
     saved = {k: t[k] for k in keys}
     t["k_pages"] = k_host.to(DEV, device_layout=t["layout"])
     t["v_pages"] = v_host.to(DEV, device_layout=t["layout"])
@@ -878,6 +1000,13 @@ def run_check(a, t, fns, names, num_heads):
         .to(DEV, device_layout=t["layout_kvm"])
     )
 
+    # Rebuilt onto the randn allocations: a view captured in build_inputs still
+    # points at the all-zero timing cache, which would return zeros and score a
+    # rel l2 of exactly 1.0 -- a harness artefact, not a wrong kernel.
+    if t["k_kvm_flatview"] is not None:
+        t["k_kvm_flatview"] = t["k_pages_kvm"].view(t["flat_shape"])
+        t["v_kvm_flatview"] = t["v_pages_kvm"].view(t["flat_shape"])
+
     ref = cpu_reference(a, t["q_host"], k_host, v_host, num_heads)
     print("\ncorrectness vs fp32 CPU reference (randn KV, production layouts):")
     print("%-9s %12s %12s %8s" % ("variant", "max abs err", "rel l2", "verdict"))
@@ -889,6 +1018,10 @@ def run_check(a, t, fns, names, num_heads):
             got = torch.cat([o.to("cpu").float() for o in val], 0)
         else:
             got = val.to("cpu").float()
+        if got.shape[0] == a.staging_rows:
+            # Storing variants return the staging buffer; row s is sequence s
+            # because row_idx[s][0] == s.
+            got = got[: a.num_seqs]
         got = got.reshape(a.num_seqs, num_heads, a.head_size)
         aerr = (got - ref).abs().max().item()
         rel = ((got - ref).norm() / ref.norm()).item()
@@ -1008,21 +1141,33 @@ def make_callables(a, t):
     scale = a.head_size**-0.5
     nh, nkv, hs = t["num_heads"], a.num_kv_heads, a.head_size
 
+    def _out_buf():
+        """A private staging buffer per storing variant.
+
+        Production always hands _page_attn_kernel the staging buffer, so the
+        in-kernel index_copy_ output scatter is part of every call it makes. The
+        harness used to omit `out`, which compiled a different graph and is why the
+        per_seq bar came out ~23% under production. One buffer per variant, so a
+        variant that writes nothing cannot inherit another's rows and pass --check.
+        """
+        return convert(
+            torch.zeros(a.staging_rows, nh, hs, dtype=torch.float16, device="cpu"), device=DEV
+        )
+
     per_seq_c = torch.compile(_page_attn_kernel, dynamic=False)
     batched_c = torch.compile(_batched_decode_kernel, dynamic=False)
     unrolled_c = torch.compile(_unrolled_decode_kernel, dynamic=False)
 
+    per_seq_out = _out_buf()
+
     def per_seq():
-        outs = []
         for s in range(a.num_seqs):
-            outs.append(
-                per_seq_c(
-                    t["query"], t["row_idx"][s], t["k_pages"], t["v_pages"],
-                    t["page_tables"][s], t["mask_tiles"], scale,
-                    a.num_blocks, 1, nh, nkv, hs,
-                )
+            per_seq_c(
+                t["query"], t["row_idx"][s], t["k_pages"], t["v_pages"],
+                t["page_tables"][s], t["mask_tiles"], scale,
+                a.num_blocks, 1, nh, nkv, hs, 0.0, None, per_seq_out,
             )
-        return outs
+        return per_seq_out
 
     def batched():
         return batched_c(
@@ -1050,43 +1195,99 @@ def make_callables(a, t):
 
     per_seq_kvm_c = torch.compile(_per_seq_kvm_kernel, dynamic=False)
 
+    per_seq_kvm_out = _out_buf()
+
     def per_seq_kvm():
-        outs = []
         for sq in range(a.num_seqs):
-            outs.append(
-                per_seq_kvm_c(
-                    t["query"], t["row_idx"][sq], t["k_pages_kvm"], t["v_pages_kvm"],
-                    t["page_tables"][sq], t["mask_tiles"], scale,
-                    a.num_blocks, 1, nh, nkv, hs,
-                )
+            per_seq_kvm_c(
+                t["query"], t["row_idx"][sq], t["k_pages_kvm"], t["v_pages_kvm"],
+                t["page_tables"][sq], t["mask_tiles"], scale,
+                a.num_blocks, 1, nh, nkv, hs, per_seq_kvm_out,
             )
-        return outs
+        return per_seq_kvm_out
+
+    per_seq_fold3d_c = torch.compile(_per_seq_fold3d_kernel, dynamic=False)
+    per_seq_fold3d_out = _out_buf()
+
+    def per_seq_fold3d():
+        for sq in range(a.num_seqs):
+            per_seq_fold3d_c(
+                t["query"], t["row_idx"][sq], t["k_pages_flat"], t["v_pages_flat"],
+                t["page_tables_fold"][sq], t["mask_tiles"], scale,
+                a.num_blocks, 1, nh, nkv, hs, per_seq_fold3d_out,
+            )
+        return per_seq_fold3d_out
 
     per_seq_kvm3d_c = torch.compile(_per_seq_kvm3d_kernel, dynamic=False)
 
-    def per_seq_kvm3d():
-        outs = []
-        for sq in range(a.num_seqs):
-            outs.append(
-                per_seq_kvm3d_c(
-                    t["query"], t["row_idx"][sq], t["k_pages_kvm"], t["v_pages_kvm"],
-                    t["page_tables"][sq], t["mask_tiles"], scale,
-                    a.num_blocks, nh, nkv, hs,
-                )
+    per_seq_narrow_out = _batched_out()
+
+    def per_seq_narrowout():
+        for s in range(a.num_seqs):
+            per_seq_c(
+                t["query"], t["row_idx"][s], t["k_pages"], t["v_pages"],
+                t["page_tables"][s], t["mask_tiles"], scale,
+                a.num_blocks, 1, nh, nkv, hs, 0.0, None, per_seq_narrow_out,
             )
-        return outs
+        return per_seq_narrow_out
+
+    per_seq_kvm_narrow_out = _batched_out()
+
+    def per_seq_kvm_narrowout():
+        for sq in range(a.num_seqs):
+            per_seq_kvm_c(
+                t["query"], t["row_idx"][sq], t["k_pages_kvm"], t["v_pages_kvm"],
+                t["page_tables"][sq], t["mask_tiles"], scale,
+                a.num_blocks, 1, nh, nkv, hs, per_seq_kvm_narrow_out,
+            )
+        return per_seq_kvm_narrow_out
+
+    per_seq_kvm3d_out = _out_buf()
+
+    def per_seq_kvm3d():
+        for sq in range(a.num_seqs):
+            per_seq_kvm3d_c(
+                t["query"], t["row_idx"][sq], t["k_pages_kvm"], t["v_pages_kvm"],
+                t["page_tables"][sq], t["mask_tiles"], scale,
+                a.num_blocks, nh, nkv, hs, per_seq_kvm3d_out,
+            )
+        return per_seq_kvm3d_out
 
     flat_c = torch.compile(_flat_decode_kernel, dynamic=False)
     flatchunk_c = torch.compile(_flat_chunked_decode_kernel, dynamic=False)
 
+    def _batched_out():
+        """vLLM's per-layer output buffer: num_seqs rows, offset 0."""
+        return convert(
+            torch.zeros(a.num_seqs, nh, hs, dtype=torch.float16, device="cpu"), device=DEV
+        )
+
     def _flat(form):
+        out_buf = _batched_out()
+
         def run():
             return flat_c(
                 t["query"], t["k_pages_flat"], t["v_pages_flat"], t["flat_ids"],
                 t["mask_by_block"], scale, a.num_seqs, a.num_blocks, nkv,
-                a.num_queries_per_kv, a.block_size, hs, form,
+                a.num_queries_per_kv, a.block_size, hs, form, out_buf,
             )
         return run
+
+    flat_view_out = _batched_out()
+
+    def flat_from4dview():
+        """flatbc over a merged view of the 4-D allocation, not its own cache.
+
+        Proves whether ONE allocation can serve both kernels: the per-sequence
+        kernel reading it 4-D with a 1-entry gather, the batched kernel reading
+        the same bytes as [rows, block, D].
+        """
+        assert t["k_kvm_flatview"] is not None, "4-D -> flat view did not lower"
+        return flat_c(
+            t["query"], t["k_kvm_flatview"], t["v_kvm_flatview"], t["flat_ids"],
+            t["mask_by_block"], scale, a.num_seqs, a.num_blocks, nkv,
+            a.num_queries_per_kv, a.block_size, hs, "bcast", flat_view_out,
+        )
 
     def flatchunk():
         return flatchunk_c(
@@ -1103,6 +1304,10 @@ def make_callables(a, t):
         "kvm3d": _kvm(True),
         "per_seq_kvm": per_seq_kvm,
         "per_seq_kvm3d": per_seq_kvm3d,
+        "per_seq_fold3d": per_seq_fold3d,
+        "per_seq_narrowout": per_seq_narrowout,
+        "per_seq_kvm_narrowout": per_seq_kvm_narrowout,
+        "flat_from4dview": flat_from4dview,
         "flat3d": _flat("3d"),
         "flatbc": _flat("bcast"),
         "flatchunk": flatchunk,
