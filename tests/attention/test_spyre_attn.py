@@ -33,6 +33,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _build_query_row_tables,
     _mirror_mask_tiles,
     _stick_aligned_len,
+    head_major_kv_layout,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
@@ -259,6 +260,43 @@ def assert_close_outliers(
         ) from e
 
 
+def _fold_pages(pages_cpu: torch.Tensor) -> torch.Tensor:
+    """Logical pages to the folded frame the runner allocates."""
+    num_blocks, block_size, num_kv_heads, head_size = pages_cpu.shape
+    return (
+        pages_cpu.permute(0, 2, 1, 3)
+        .contiguous()
+        .reshape(num_blocks * num_kv_heads, block_size, head_size)
+    )
+
+
+def _fold_pages_onto(pages_cpu: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Fold the pages onto `device` with the layout the runner uses.
+
+    A plain `.to()` leaves the default tiled layout, which spreads the folded row
+    index across two device dims and reads the wrong rows (torch-spyre#3705).
+    """
+    folded = _fold_pages(pages_cpu)
+    if device.type != "spyre":
+        return folded
+    rows, block_size, head_size = folded.shape
+    layout = head_major_kv_layout(rows, block_size, head_size, folded.dtype)
+    return folded.to(device, device_layout=layout)
+
+
+def _folded_slot_rows(
+    slots: list[int], block_size: int, num_kv_heads: int, device: torch.device
+) -> list[torch.Tensor]:
+    """The per-KV-head row indices the folded store takes, as attn_layer publishes them."""
+    host = torch.tensor(slots, dtype=torch.int64)
+    pages = torch.div(host, block_size, rounding_mode="floor")
+    offsets = host - pages * block_size
+    return [
+        convert((pages * num_kv_heads + h) * block_size + offsets, device)
+        for h in range(num_kv_heads)
+    ]
+
+
 def _alibi_slopes(num_heads: int) -> list[float]:
     """Standard ALiBi slope generator (Press et al. 2022).
 
@@ -438,8 +476,8 @@ def _run_spyre_attn_test(
         q_offset += query_len
     slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
-    k_pages = k_pages_cpu.to(cache_device)
-    v_pages = v_pages_cpu.to(cache_device)
+    k_pages = _fold_pages_onto(k_pages_cpu, cache_device)
+    v_pages = _fold_pages_onto(v_pages_cpu, cache_device)
 
     attn_metadata = _build_metadata(
         num_query_heads=num_query_heads,
@@ -488,7 +526,9 @@ def _run_spyre_attn_test(
         key_src,
         value_src,
         kv_cache,
-        convert(attn_metadata.slot_mapping, cache_device),
+        _folded_slot_rows(
+            attn_metadata.slot_mapping.tolist(), block_size, num_kv_heads, cache_device
+        ),
     )
     # The impl expects q/k/v already on device, as in production (QKV runs
     # on-device); the CPU `query` still feeds the reference below.
@@ -1194,9 +1234,10 @@ def test_kv_cache_shape_matches_runner_allocation():
         num_blocks, block_size, num_kv_heads, head_size
     )
 
-    # get_kv_cache_shape must return a single tuple, not a list of K/V tuples.
-    # The base-class get_kv_cache_block_dim does shape.index(_S), which fails
-    # if shape is a list. Spyre stores K and V as separate NamedTuple fields.
+    # get_kv_cache_shape advertises the logical frame; the allocation below folds
+    # (block, kv head) into one axis. num_blocks stays dim 0 either way.
+    # It must return a single tuple, not a list of K/V tuples: the base-class
+    # get_kv_cache_block_dim does shape.index(_S), which fails if shape is a list.
     assert isinstance(shape, tuple), f"get_kv_cache_shape must return a tuple, got {type(shape)}"
     assert shape == (
         num_blocks,
@@ -1241,19 +1282,17 @@ def test_kv_cache_shape_matches_runner_allocation():
     k_pages = caches["layers.0.self_attn"].k_pages
     v_pages = caches["layers.0.self_attn"].v_pages
 
-    assert k_pages.shape == shape
-    assert v_pages.shape == shape
+    # Folded: the advertised shape's element count in three dims, not four.
+    num_rows = num_blocks * num_kv_heads
+    folded = (num_rows, block_size, head_size)
+    assert k_pages.shape == folded
+    assert v_pages.shape == folded
+    assert math.prod(folded) == math.prod(shape)
 
-    # Sanity: the physical layout is token-major (block_size before num_kv_heads),
-    # and each page is contiguous in the last two dims.
-    assert k_pages.shape == (num_blocks, block_size, num_kv_heads, head_size)
-
-    # The paged scatter indexes dim 0, so the slot axis has to stay whole at device
-    # position 0: the default tiled layout splits it across two device dims and writes
-    # the wrong rows (torch-spyre#3705).
-    num_slots = num_blocks * block_size
+    # The page gather indexes dim 0, so the folded row axis has to stay whole at
+    # device position 0 (torch-spyre#3705).
     for pages in (k_pages, v_pages):
-        assert pages.device_tensor_layout().device_size[0] == num_slots
+        assert pages.device_tensor_layout().device_size[0] == num_rows
 
 
 def test_sliding_window_none_equivalence(default_vllm_config):
@@ -1564,8 +1603,8 @@ def test_reshape_and_cache_scatter(
         k_expected[block][offset] = key[t]
         v_expected[block][offset] = value[t]
 
-    k_actual = fresh_pages().to(cache_device)
-    v_actual = fresh_pages().to(cache_device)
+    k_actual = _fold_pages(fresh_pages()).to(cache_device)
+    v_actual = _fold_pages(fresh_pages()).to(cache_device)
 
     if source_layout == "qkv_split":
         query = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
@@ -1589,7 +1628,7 @@ def test_reshape_and_cache_scatter(
             key_src,
             value_src,
             SpyrePagedKVCache(k_pages=k_actual, v_pages=v_actual),
-            convert(torch.tensor(slots, dtype=torch.int64), cache_device),
+            _folded_slot_rows(slots, block_size, num_kv_heads, cache_device),
         )
 
     fallback_msgs = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]
@@ -1598,8 +1637,8 @@ def test_reshape_and_cache_scatter(
     )
 
     # A Spyre round trip perturbs fp16 by up to an ulp, so this is not bit-exact.
-    torch.testing.assert_close(k_actual.to("cpu"), k_expected, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(v_actual.to("cpu"), v_expected, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(k_actual.to("cpu"), _fold_pages(k_expected), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(v_actual.to("cpu"), _fold_pages(v_expected), atol=1e-2, rtol=1e-2)
 
     # Release Spyre DMA mappings eagerly (see _run_spyre_attn_test).
     if configure_device == "spyre":
@@ -1635,8 +1674,8 @@ def test_kv_cache_update_traced_by_caller(default_vllm_config, configure_device:
         k_expected[slot // block_size][slot % block_size] = key[t]
         v_expected[slot // block_size][slot % block_size] = value[t]
 
-    k_actual = fresh_pages().to(cache_device)
-    v_actual = fresh_pages().to(cache_device)
+    k_actual = _fold_pages(fresh_pages()).to(cache_device)
+    v_actual = _fold_pages(fresh_pages()).to(cache_device)
 
     attn_impl = SpyreAttentionImpl(
         num_heads=num_kv_heads,
@@ -1659,7 +1698,7 @@ def test_kv_cache_update_traced_by_caller(default_vllm_config, configure_device:
         torch.compile(scatter, dynamic=False)(
             convert(key, cache_device),
             convert(value, cache_device),
-            convert(torch.tensor(slots, dtype=torch.int64), cache_device),
+            _folded_slot_rows(slots, block_size, num_kv_heads, cache_device),
         )
 
     fallback_msgs = [str(w.message) for w in caught if issubclass(w.category, FallbackWarning)]
@@ -1667,8 +1706,8 @@ def test_kv_cache_update_traced_by_caller(default_vllm_config, configure_device:
         f"the traced KV scatter fell back to CPU: {fallback_msgs}"
     )
 
-    torch.testing.assert_close(k_actual.to("cpu"), k_expected, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(v_actual.to("cpu"), v_expected, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(k_actual.to("cpu"), _fold_pages(k_expected), atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(v_actual.to("cpu"), _fold_pages(v_expected), atol=1e-2, rtol=1e-2)
 
     if configure_device == "spyre":
         del k_actual, v_actual
@@ -1698,7 +1737,7 @@ def test_install_patches_layers_not_the_attention_class():
     decoder = _StubAttentionLayer(AttentionType.DECODER)
     encoder = _StubAttentionLayer(AttentionType.ENCODER_ONLY)
 
-    holder = attn_layer.install([decoder, encoder])
+    holder = attn_layer.install([decoder, encoder], num_kv_heads=8, block_size=64)
 
     assert Attention.forward is class_forward
     assert decoder.spyre_slots is holder
@@ -1841,11 +1880,16 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
     n_pages = num_blocks * num_seqs
     # Scaled up so the logits exceed the cap and tanh actually clamps.
     query = torch.randn(num_seqs, num_kv_heads * qpk * head_size, dtype=torch.float32) * 20.0
-    k_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32) * 20.0
-    v_pages = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=torch.float32)
-    # [num_blocks, stick-padded num_seqs]: row b holds each sequence's b-th page.
-    block_ids = torch.zeros(num_blocks, _stick_aligned_len(num_seqs), dtype=torch.int64)
-    block_ids[:, :num_seqs] = torch.arange(n_pages, dtype=torch.int64).reshape(num_blocks, num_seqs)
+    k_pages = torch.randn(n_pages * num_kv_heads, block_size, head_size, dtype=torch.float32) * 20.0
+    v_pages = torch.randn(n_pages * num_kv_heads, block_size, head_size, dtype=torch.float32)
+    # [num_blocks, stick-padded lanes]: row b, lane s * KV + h is that page's tile.
+    tile_ids = torch.zeros(num_blocks, _stick_aligned_len(lead), dtype=torch.int64)
+    for s in range(num_seqs):
+        for b in range(num_blocks):
+            page = b * num_seqs + s
+            tile_ids[b, s * num_kv_heads : (s + 1) * num_kv_heads] = (
+                page * num_kv_heads + torch.arange(num_kv_heads, dtype=torch.int64)
+            )
     mask_by_block = torch.zeros(num_blocks, lead, 1, block_size, dtype=torch.float32)
 
     def run(cap: float):
@@ -1854,7 +1898,7 @@ def test_batched_decode_soft_cap_changes_the_kernel() -> None:
             None,
             k_pages,
             v_pages,
-            block_ids,
+            tile_ids,
             mask_by_block,
             1.0,
             num_seqs,
