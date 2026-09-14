@@ -261,6 +261,136 @@ routes unsupported ops to CPU, which would otherwise be counted as a Spyre resul
 `late_compile` records whether Dynamo's graph counter moved during the measured
 windows, i.e. whether an Inductor compile landed inside a measurement.
 
+## Experiment: what the GQA broadcast clone costs
+
+Under GQA, `G = num_heads / num_kv_heads` query heads share one K/V page.
+`page_attn_kernel` expresses that by giving K/V a size-1 group axis and letting
+`torch.matmul` broadcast it:
+
+```python
+q = ...          # [KV, G, q, D]
+k = k_page_4d    # [KV, 1, D, block]   <- size-1 group slot
+scores = torch.matmul(q, k.transpose(-2, -1))
+```
+
+That broadcast is not free. The aten decomposition lowers it to `expand` +
+`reshape`; a reshape across a stride-0 axis is not a view, so aten inserts a
+`clone` — a G-fold copy of every K and V page. torch-spyre's
+`bmm_unflatten_pass` recovers an N-D matmul but hands it the **clone**, and
+`lower_bmm` realizes its operands. So the kernel reads G copies of each page.
+
+`page_attn_native_bcast_kernel` calls `torch.ops.spyre.batched_matmul` directly,
+keeping the size-1 axis intact all the way to the lowering. With torch-spyre#4277
+that lowering indexes the axis with a constant 0 instead of materialising it. The
+query keeps its `[KV, G, q, D]` shape — a *split* of the head axis, always a view
+— so nothing else is copied and the mask/ALiBi tiles broadcast unchanged.
+
+Per-page clone traffic from the post-pass graph (`gqa_clone_preflight.py`) at
+KV=8, D=128, block=128 — QK only; the V matmul mirrors it:
+
+| q | G=1 | G=2 | G=4 | G=8 |
+|---|---|---|---|---|
+| 1 | 0 | 512 KiB | 1024 KiB | 2048 KiB |
+| 512 | 0 | 512 KiB | 1024 KiB | 2048 KiB |
+
+Proportional to G, independent of query length, zero at G=1 — so G=1 is a null
+control, and prefill is affected just as much as decode.
+
+### Result
+
+Granite 3.3 8B geometry (32 query heads / 8 KV heads, G=4), `head_size=128`,
+`block_size=128`, one card, `layer` span, median of 5–10 windows. Every row passed
+the correctness gate with `fallback_clean`, `kernels_attributed ==
+kernels_expected` and no late compile, and `max_abs_diff` was identical between
+arms.
+
+**Chunked prefill, `query_len=512`:**
+
+| ctx | pages | broadcast | native bcast | delta | per page |
+|---|---|---|---|---|---|
+| 512 | 4 | 2686.7 µs | 2393.1 µs | **−10.9%** | 73.4 µs |
+| 2048 | 16 | 8882.9 µs | 7498.8 µs | **−15.6%** | 86.5 µs |
+| 8192 | 64 | 33452.2 µs | 29033.1 µs | **−13.2%** | 69.0 µs |
+
+**Per-sequence decode, `query_len=1`**, same arm:
+
+| ctx | pages | broadcast | native bcast | delta | per page |
+|---|---|---|---|---|---|
+| 512 | 4 | 527.4 µs | 367.7 µs | **−30.3%** | 39.9 µs |
+| 2048 | 16 | 1337.9 µs | 696.5 µs | **−47.9%** | 40.1 µs |
+| 8192 | 64 | 4577.4 µs | 2067.6 µs | **−54.8%** | 39.2 µs |
+
+The saving is a flat per-page cost in both regimes — the signature of eliminated
+per-page traffic, not of something that merely tracks context length. Decode's
+*relative* win is far larger because a `q=1` step does ~512× less useful work per
+page, so the same fixed cost dominates. A G=1 control measured −0.7%..+0.4%
+(noise), so this is not an artefact of the matmul's rank.
+
+Two things that did **not** behave as predicted:
+
+- `device_time_memory_us` does not drop; it rises slightly. The clone is emitted
+  as a compute-classified pointwise copy, not one of the `memcpy`/`restickify`
+  ops `MEMORY_OP_MARKERS` matches, so the memory-share column does not track it.
+  Total device time is the signal.
+- The per-page saving is ~1.8× larger at prefill (69–87 µs) than at decode
+  (~40 µs) despite identical cloned bytes. Unexplained; presumably how the
+  realized clone interacts with tiling at the larger query extent.
+
+`batched_decode_kernel` is not in the experiment: it already packs G into the
+matmul row axis, so it has no clone to remove.
+
+Caveat: kernel-level device time for one emulated layer, not an end-to-end
+number. Use `vllm bench latency` for that.
+
+### Run it
+
+Pre-flight first — meta tensors, no device, seconds:
+
+```bash
+PYTHONPATH=. .venv/bin/python3 scripts/microbench/gqa_clone_preflight.py
+```
+
+Then each arm in its own process (`SPYRE_ATTN_NATIVE_BCAST` is latched on first
+read, and the card takes one process at a time):
+
+```bash
+for variant in online_softmax_compiled online_softmax_native_bcast; do
+  SPYRE_ATTN_PROFILING=1 .venv/bin/python3 scripts/microbench/spyre_attn_microbench.py \
+      --config scripts/microbench/configs/gqa_clone_prefill.json \
+      --variants $variant --output-dir ./microbench_results/gqa_clone/$variant
+done
+```
+
+`gqa_clone_decode.json` is the `query_len=1` counterpart. `--num-query-heads` /
+`--num-kv-heads` override the config, so a G sweep at fixed total heads (the G=1
+control) is a driver loop over `--num-kv-heads 32 16 8 4`.
+
+### Prerequisites
+
+Both are local-only and neither is committed:
+
+1. **torch-spyre#4277.** Unmerged, and our pin predates it. Only the two
+   `_inductor` files matter; they are pure Python and apply cleanly to the pinned
+   rev, so no rebuild is needed — extract those two file diffs from
+   `gh pr diff 4277 --repo torch-spyre/torch-spyre` and `patch -d
+   .venv/lib/python3.12/site-packages -p1`. Without it, `lower_bmm` only accepts
+   equal batch dims and indexes the size-1 axis incorrectly.
+2. **AIUPTI**, for device events at all — see *Prerequisite: AIUPTI* above.
+
+`uv sync --reinstall-package torch-spyre` undoes both.
+
+### The row-packed alternative, and why it is not the answer
+
+Folding G into the matmul's *row* axis (`[KV, G*q, D] @ [KV, D, block]`) also
+removes the broadcast and needs no torch-spyre change, and it matches the native
+broadcast arm exactly at decode. But it only works there. The query arrives
+token-major, so `G` is an inner axis and `q` an outer one; merging them means
+physically reordering elements. At `q=1` the merge is a no-op, but at `q>1` it
+clones the whole query block (4 MiB at G=4, q=512) plus the mask — measured as
+*worse* than the clone it removes. Dropped in favour of the native broadcast arm,
+which is clone-free at every query length; recoverable from history if a
+decode-only win without #4277 ever becomes interesting.
+
 ## Notes
 
 - `block_size` 128 is what you get in practice: vLLM CPU platform defaults to 128

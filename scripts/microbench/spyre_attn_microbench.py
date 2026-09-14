@@ -69,19 +69,35 @@ DTYPE = torch.float16
 VARIANT_REGISTRY: dict[str, dict] = {}
 
 
-def register_variant(name, impl_label, compiled=True, batched=False, available_fn=None):
+def register_variant(name, impl_label, compiled=True, batched=False, env=None, available_fn=None):
     VARIANT_REGISTRY[name] = {
         "impl_label": impl_label,
         "compiled": compiled,
         "batched": batched,
+        # Env vars this arm needs. Read once and latched into _attn_fn, so they
+        # cannot vary within a process; the runner enforces one arm per run.
+        "env": env or {},
         "available": available_fn or (lambda: True),
     }
 
+
+# Env keys any arm may set, so a run that does not use them clears them rather than
+# inheriting a value from the caller's shell.
+ARM_ENV_KEYS = ("SPYRE_ATTN_NATIVE_BCAST",)
 
 register_variant("online_softmax_compiled", "Implementation.SPYRE_ONLINE_SOFTMAX", True)
 register_variant("online_softmax_eager", "Implementation.SPYRE_ONLINE_SOFTMAX_EAGER", False)
 register_variant(
     "batched_decode_compiled", "Implementation.SPYRE_BATCHED_DECODE", True, batched=True
+)
+# GQA-clone experiment arm: hands the size-1 GQA group axis to spyre.batched_matmul
+# so the broadcast is never materialised. Needs torch-spyre#4277.
+# See scripts/microbench/README.md.
+register_variant(
+    "online_softmax_native_bcast",
+    "Implementation.SPYRE_ONLINE_SOFTMAX_NATIVE_BCAST",
+    True,
+    env={"SPYRE_ATTN_NATIVE_BCAST": "1"},
 )
 
 
@@ -958,6 +974,10 @@ def main():
     ap.add_argument("--max-model-len", type=int, default=None)
     ap.add_argument("--max-num-batched-tokens", type=int, default=None)
     ap.add_argument("--max-num-seqs", type=int, default=None)
+    # Overridable so a GQA sweep holding total heads fixed is one config plus a
+    # driver loop, rather than one near-duplicate config per group size.
+    ap.add_argument("--num-query-heads", type=int, default=None)
+    ap.add_argument("--num-kv-heads", type=int, default=None)
     ap.add_argument("--stop-on-failure", action="store_true")
     ap.add_argument("--no-output", action="store_true")
     ap.add_argument("--allow-empty-device-profile", action="store_true")
@@ -975,6 +995,8 @@ def main():
         ("max_model_len", args.max_model_len),
         ("max_num_batched_tokens", args.max_num_batched_tokens),
         ("max_num_seqs", args.max_num_seqs),
+        ("num_query_heads", args.num_query_heads),
+        ("num_kv_heads", args.num_kv_heads),
     ):
         if val is not None:
             cfg[key] = val
@@ -1003,6 +1025,16 @@ def main():
             "(SPYRE_BATCHED_DECODE is process-wide). Re-run with --variants one at a time."
         )
     os.environ["SPYRE_BATCHED_DECODE"] = "1" if next(iter(batched_modes)) else "0"
+    # Same story for the experiment arms' env: latched into _attn_fn on first read.
+    arm_envs = {tuple(sorted(VARIANT_REGISTRY[v]["env"].items())) for v in variants}
+    if len(arm_envs) > 1:
+        raise SystemExit(
+            "GQA-clone experiment arms need separate runs (their env vars are "
+            "process-wide). Re-run with --variants one at a time."
+        )
+    arm_env = dict(next(iter(arm_envs)))
+    for key in ARM_ENV_KEYS:
+        os.environ[key] = arm_env.get(key, "0")
     for key, env in (
         ("attn_kv_buckets", "SPYRE_ATTN_KV_BUCKETS"),
         ("attn_query_buckets", "SPYRE_ATTN_QUERY_BUCKETS"),

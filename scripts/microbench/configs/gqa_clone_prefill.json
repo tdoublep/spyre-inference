@@ -1,0 +1,46 @@
+{
+  "run_label": "gqa_clone_prefill",
+  "model": "granite-3.3-8b-instruct",
+  "num_query_heads": 32,
+  "num_kv_heads": 8,
+  "head_size": 128,
+  "block_size": 128,
+  "num_blocks": 64,
+  "max_model_len": 8192,
+  "max_num_batched_tokens": 512,
+  "max_num_seqs": 1,
+  "seed": 0,
+  "warmup": 1,
+  "iterations": 5,
+  "atol": 0.3,
+  "rtol": 0.2,
+  "variants": [
+    "online_softmax_compiled"
+  ],
+  "capture_batches": [
+    {
+      "name": "prefill_q512_ctx512",
+      "capture_type": "prefill",
+      "query_lens": [512],
+      "seq_lens": [512],
+      "extra_cols": {"seqlen": 512, "decode_share": 0.0}
+    },
+    {
+      "name": "prefill_q512_ctx2048",
+      "capture_type": "prefill",
+      "query_lens": [512],
+      "seq_lens": [2048],
+      "extra_cols": {"seqlen": 2048, "decode_share": 0.0}
+    },
+    {
+      "name": "prefill_q512_ctx8192",
+      "capture_type": "prefill",
+      "query_lens": [512],
+      "seq_lens": [8192],
+      "extra_cols": {"seqlen": 8192, "decode_share": 0.0}
+    }
+  ],
+  "block_sizes": [
+    128
+  ]
+}

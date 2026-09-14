@@ -45,6 +45,9 @@ from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK, stick_aligned_len
 from spyre_inference.v1.attention.ops.page_attn import alibi_tile_shape, page_attn_kernel
+from spyre_inference.v1.attention.ops.page_attn_native_bcast import (
+    page_attn_native_bcast_kernel,
+)
 from spyre_inference.v1.attention.ops.reshape_and_cache import reshape_and_cache_kernel
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     _MIN_BATCHED_SEQS,
@@ -171,6 +174,7 @@ def _build_query_row_tables(
 # Attention compiles separately from the model's fullgraph capture, which can't
 # hold the per-sequence Python loop around these.
 _page_attn_compiled = torch.compile(page_attn_kernel, dynamic=False)
+_page_attn_native_bcast_compiled = torch.compile(page_attn_native_bcast_kernel, dynamic=False)
 _batched_decode_compiled = torch.compile(batched_decode_kernel, dynamic=False)
 
 _warmup_complete = False
@@ -1039,7 +1043,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # back to CPU with an int64 one.
         self._reshape_fn = torch.compile(reshape_and_cache_kernel, dynamic=False)
 
-        self._attn_fn = _page_attn_compiled if self._compile_attn else page_attn_kernel
+        if envs.SPYRE_ATTN_NATIVE_BCAST:
+            self._attn_fn = (
+                _page_attn_native_bcast_compiled
+                if self._compile_attn
+                else page_attn_native_bcast_kernel
+            )
+        else:
+            self._attn_fn = _page_attn_compiled if self._compile_attn else page_attn_kernel
         # Always the compiled variant: the 2-D page index lowers to aten.index,
         # which fails eager, so _batched_decode_preconditions_met declines the
         # whole path when self._compile_attn is False.

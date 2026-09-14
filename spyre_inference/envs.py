@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_BATCHED_DECODE: bool = False
+    SPYRE_ATTN_NATIVE_BCAST: bool = False
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
@@ -72,6 +73,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pending performance characterisation at small batch sizes (num_seqs <= 4).
     # Re-enable to measure the path or to restore it after calibration.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "0"))),
+    # When "1", pass the GQA broadcast straight to spyre.batched_matmul instead of
+    # letting torch.matmul's decomposition materialise it. Requires torch-spyre#4277.
+    # Experiment arm; see scripts/microbench/README.md.
+    "SPYRE_ATTN_NATIVE_BCAST": lambda: bool(int(os.getenv("SPYRE_ATTN_NATIVE_BCAST", "0"))),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.
