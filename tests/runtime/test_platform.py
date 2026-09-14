@@ -577,3 +577,52 @@ def test_configure_threading_raises_when_undetectable(monkeypatch):
 
     with pytest.raises(RuntimeError, match="SPYRE_NUM_CPUS"):
         configure_threading(worker_count=1)
+
+
+@pytest.mark.parametrize(
+    "layout,expected_backend",
+    [
+        pytest.param("token_major", "SpyreAttentionBackend", id="default"),
+        pytest.param("head_major", "SpyreHeadMajorAttentionBackend", id="head_major"),
+    ],
+)
+def test_kv_cache_layout_selects_the_paged_backend(layout, expected_backend):
+    """SPYRE_KV_CACHE_LAYOUT picks which paged backend the platform registers.
+
+    Read at class-body time, so the module is reloaded rather than monkeypatched.
+    """
+    import importlib
+
+    import spyre_inference.platform as platform_mod
+    from spyre_inference import envs
+
+    prev = os.environ.get("SPYRE_KV_CACHE_LAYOUT")
+    os.environ["SPYRE_KV_CACHE_LAYOUT"] = layout
+    envs.clear_env_cache()
+    try:
+        reloaded = importlib.reload(platform_mod)
+        assert reloaded.TorchSpyrePlatform._backend_path.endswith(expected_backend)
+    finally:
+        if prev is None:
+            os.environ.pop("SPYRE_KV_CACHE_LAYOUT", None)
+        else:
+            os.environ["SPYRE_KV_CACHE_LAYOUT"] = prev
+        envs.clear_env_cache()
+        importlib.reload(platform_mod)
+
+
+def test_unknown_kv_cache_layout_is_rejected():
+    import importlib
+
+    import spyre_inference.platform as platform_mod
+    from spyre_inference import envs
+
+    os.environ["SPYRE_KV_CACHE_LAYOUT"] = "slot_major"
+    envs.clear_env_cache()
+    try:
+        with pytest.raises(ValueError, match="SPYRE_KV_CACHE_LAYOUT"):
+            importlib.reload(platform_mod)
+    finally:
+        os.environ.pop("SPYRE_KV_CACHE_LAYOUT", None)
+        envs.clear_env_cache()
+        importlib.reload(platform_mod)

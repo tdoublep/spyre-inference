@@ -25,6 +25,26 @@ def alibi_tile_shape(
     return (num_kv_heads, num_queries_per_kv, 1, block_size)
 
 
+def gather_page_token_major(pages, page_idx):
+    """One page of a token-major cache as [num_kv_heads, 1, block_size, head_size].
+
+    index_select, not ``pages[page_idx]``: subscripting lowers to aten.index, which
+    upcasts the int32 index to int64 and fails eager. The permute is what turns the
+    token-major page head-major for the matmuls; it runs on device.
+    """
+    return pages.index_select(0, page_idx).squeeze(0).permute(1, 0, 2).unsqueeze(1)
+
+
+def gather_page_head_major(pages, page_idx):
+    """The same tile out of a head-major cache, whose pages already land head-major.
+
+    One entry, hence one contiguous page: num_kv_heads scattered entries over a
+    flattened cache move the same bytes at a higher cost. squeeze/unsqueeze rather than
+    a permute, so this is strictly fewer ops than the token-major gather.
+    """
+    return pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+
+
 def page_attn_kernel(
     query,
     query_row_index,
@@ -41,6 +61,8 @@ def page_attn_kernel(
     logits_soft_cap=0.0,
     alibi_bias_tiles=None,
     out=None,
+    *,
+    gather_page=gather_page_token_major,
 ):
     """Online softmax attention over ``num_blocks`` KV pages.
 
@@ -51,8 +73,10 @@ def page_attn_kernel(
         query: [num_tokens, num_heads, head_size], the whole batch's query
         query_row_index: int32 device tensor whose first padded_query_len
             entries are this sequence's absolute query rows.
-        k_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
-        v_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
+        k_pages: the KV cache in whichever form ``gather_page`` reads, so
+            [num_blocks_total, block_size, num_kv_heads, head_size] token-major
+            or [num_blocks_total, num_kv_heads, block_size, head_size] head-major.
+        v_pages: as k_pages.
         page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
             tensor, row i holding the i-th active block's page index at
             column 0.
@@ -62,6 +86,10 @@ def page_attn_kernel(
             per-query-row constants — see the derivation at the bias-tile
             construction site in _online_softmax_attention.
         out: buffer to store into, or None to return the result instead.
+        gather_page: the backend's page gather, specialized on by Dynamo so each cache
+            layout gets its own compiled variant of this kernel. Keyword-only: it sits
+            among values callers pass positionally, and defaulting it keeps a
+            token-major call site from having to name it.
 
     Returns [padded_query_len, num_heads, head_size], or ``out`` when this
     kernel stored the result itself.
@@ -81,14 +109,9 @@ def page_attn_kernel(
     tile_output = None
 
     for i in range(num_blocks):
-        # index_select, not `k_pages[page_idx]`: subscripting lowers to
-        # aten.index, which upcasts the int32 index to int64 and fails eager.
         page_idx = page_index_table[i, 0:1]
-        k_page = k_pages.index_select(0, page_idx)
-        v_page = v_pages.index_select(0, page_idx)
-        # Token-major page to head-major for the matmuls; permutes on device.
-        k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
-        v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+        k_page_4d = gather_page(k_pages, page_idx)
+        v_page_4d = gather_page(v_pages, page_idx)
 
         mask_tile = mask_tiles[i]
 

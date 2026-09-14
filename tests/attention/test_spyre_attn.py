@@ -28,12 +28,23 @@ from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
     _MIN_BATCHED_SEQS,
     SpyreAttentionImpl,
+    SpyreAttentionMetadata,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     _build_query_row_tables,
     _mirror_mask_tiles,
 )
-from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
+from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
+    SpyreHeadMajorAttentionBackend,
+    SpyreHeadMajorAttentionImpl,
+    SpyreHeadMajorAttentionMetadata,
+)
+from spyre_inference.v1.attention.ops.batched_decode import (
+    batched_decode_head_major_kernel,
+    batched_decode_kernel,
+    head_major_decode_seq_bucket,
+)
+from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK, stick_aligned_len
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
 pytestmark = pytest.mark.attention
@@ -113,6 +124,31 @@ def _fused_qkv_kv_views(
     )
 
 
+def _to_backend_cache(token_major: torch.Tensor, backend, device: torch.device) -> torch.Tensor:
+    """Move a token-major ``[blocks, block_size, KV, D]`` host cache into ``backend``'s.
+
+    Mirrors ``TorchSpyreModelRunner.initialize_kv_cache_tensors``: the axis order comes
+    from ``get_kv_cache_allocation_shape``, and on device the layout is pinned, or the
+    axis the kernels index lands off device position 0. ``backend=None`` keeps the plain
+    transfer the token-major tests have always used.
+    """
+    if backend is None:
+        return token_major.to(device)
+    num_blocks, block_size, num_kv_heads, head_size = token_major.shape
+    shape = backend.get_kv_cache_allocation_shape(num_blocks, block_size, num_kv_heads, head_size)
+    if shape == (num_blocks, num_kv_heads, block_size, head_size):
+        host = token_major.permute(0, 2, 1, 3).contiguous()
+    else:
+        assert shape == tuple(token_major.shape), f"unhandled allocation shape {shape}"
+        host = token_major
+    if device.type != "spyre":
+        return host.to(device)
+    layout = backend.get_kv_cache_device_layout(
+        num_blocks, block_size, num_kv_heads, head_size, token_major.dtype
+    )
+    return host.to(device, device_layout=layout)
+
+
 def _build_metadata(
     num_query_heads: int,
     num_kv_heads: int,
@@ -123,8 +159,9 @@ def _build_metadata(
     block_table: torch.Tensor,
     slot_mapping: torch.Tensor,
     sliding_window: int | None = None,
+    backend=None,
 ):
-    """Use the real SpyreAttentionMetadataBuilder to construct metadata."""
+    """Use the real metadata builder of `backend` (default: token-major) to build."""
     from vllm.config import get_current_vllm_config
 
     # Reuse the VllmConfig set up by the `default_vllm_config` fixture and
@@ -153,7 +190,8 @@ def _build_metadata(
             dtype=torch.float16,
         )
 
-    builder = SpyreAttentionMetadataBuilder(
+    builder_cls = SpyreAttentionMetadataBuilder if backend is None else backend.get_builder_cls()
+    builder = builder_cls(
         kv_cache_spec=kv_cache_spec,
         layer_names=["layers.0.self_attn"],
         vllm_config=vllm_config,
@@ -364,6 +402,7 @@ def _run_spyre_attn_test(
     head_size: int = 128,
     expect_fused_store: bool | None = None,
     expect_query_widths: set[int] | None = None,
+    backend=None,
 ) -> None:
     """Shared test body: validate SpyreAttentionImpl against a reference implementation."""
     # The compiled attention kernel targets the Spyre device. On CPU it routes
@@ -440,8 +479,10 @@ def _run_spyre_attn_test(
         q_offset += query_len
     slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
 
-    k_pages = k_pages_cpu.to(cache_device)
-    v_pages = v_pages_cpu.to(cache_device)
+    # The reference keeps reading k_pages_cpu token-major; the device copy takes the
+    # backend's own axis order and device layout, as the runner allocates it.
+    k_pages = _to_backend_cache(k_pages_cpu, backend, cache_device)
+    v_pages = _to_backend_cache(v_pages_cpu, backend, cache_device)
 
     attn_metadata = _build_metadata(
         num_query_heads=num_query_heads,
@@ -453,9 +494,11 @@ def _run_spyre_attn_test(
         block_table=block_tables,
         slot_mapping=slot_mapping,
         sliding_window=sliding_window,
+        backend=backend,
     )
 
-    attn_impl = SpyreAttentionImpl(
+    impl_cls = SpyreAttentionImpl if backend is None else backend.get_impl_cls()
+    attn_impl = impl_cls(
         num_heads=num_query_heads,
         head_size=head_size,
         scale=scale,
@@ -485,12 +528,13 @@ def _run_spyre_attn_test(
     kv_cache = SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
     key_src, value_src = _fused_qkv_kv_views(query, key, value, cache_device)
     # The attention layer, not forward(), owns the KV write (see attn_layer.py).
+    attn_impl.kv_slot_views(kv_cache)
     attn_impl.do_kv_cache_update(
         None,
         key_src,
         value_src,
         kv_cache,
-        convert(attn_metadata.slot_mapping, cache_device),
+        attn_impl.slot_rows(attn_metadata.slot_mapping, kv_cache, cache_device),
     )
     # The impl expects q/k/v already on device, as in production (QKV runs
     # on-device); the CPU `query` still feeds the reference below.
@@ -1232,6 +1276,7 @@ def test_kv_cache_shape_matches_runner_allocation():
     # Avoid bind_kv_cache KeyError by giving the runner a fake forward context.
     fake_layer = Mock()
     fake_layer.kv_cache = None
+    fake_layer.attn_backend = SpyreAttentionBackend
     runner.compilation_config.static_forward_context["layers.0.self_attn"] = fake_layer
 
     # spyre_available() allocates on the device, which creates the RuntimeContext that
@@ -1648,7 +1693,7 @@ def test_kv_cache_update_traced_by_caller(default_vllm_config, configure_device:
     )
 
     kv_cache = SpyrePagedKVCache(k_pages=k_actual, v_pages=v_actual)
-    # Production primes the slot-major views at bind time, before any tracing.
+    # Production primes the cache views at bind time, before any tracing.
     attn_impl.kv_slot_views(kv_cache)
 
     def scatter(key, value, slot_mapping):
@@ -1684,7 +1729,7 @@ class _StubAttentionLayer:
 
     def __init__(self, attn_type: str):
         self.attn_type = attn_type
-        self.impl = Mock(spec=["do_kv_cache_update", "kv_slot_views"])
+        self.impl = Mock(spec=["do_kv_cache_update", "kv_slot_views", "slot_rows"])
         self.kv_sharing_target_layer_name = None
         self.query_quant = None
         self.kv_cache: list[torch.Tensor] = []
@@ -2594,3 +2639,323 @@ def test_sliding_window_is_left_unpadded(default_vllm_config):
         [(7, 300)], block_size=64, sliding_window=128, max_num_blocks=_num_blocks_buckets()[-1]
     )
     assert metadata.padded_num_blocks is None
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [
+        pytest.param("NONE", id="compilation_NONE"),
+        pytest.param("STOCK_TORCH_COMPILE", id="compilation_STOCK"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(1, 512)], id="decode(q=1,kv=512)"),
+        pytest.param([(32, 256)], id="prefill(q=32,kv=256)"),
+        pytest.param([(1, 256), (1, 512)], id="batch_decode(2seqs)"),
+        pytest.param([(1, 256), (32, 256)], id="mixed(decode+prefill)"),
+        pytest.param([(1, 300)], id="kv_padded_decode(q=1,kv=300)"),
+    ],
+)
+@pytest.mark.parametrize(
+    "num_query_heads,num_kv_heads",
+    [
+        pytest.param(32, 8, id="gqa"),
+        pytest.param(8, 8, id="mha"),
+        pytest.param(32, 1, id="mqa"),
+    ],
+)
+def test_spyre_attn_head_major(
+    default_vllm_config,
+    seq_lens,
+    num_query_heads,
+    num_kv_heads,
+    configure_compilation: str,
+    configure_device: str,
+):
+    """The head-major backend matches the reference over the per-sequence kernel."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=64,
+        sliding_window=None,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        backend=SpyreHeadMajorAttentionBackend,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("NONE", id="compilation_NONE")],
+    indirect=True,
+)
+@pytest.mark.parametrize(
+    "seq_lens",
+    [
+        pytest.param([(7, 300)], id="prefill(q=7,kv=300)"),
+        pytest.param([(1, 400)], id="decode(q=1,kv=400)"),
+    ],
+)
+def test_spyre_attn_head_major_sliding_window(
+    default_vllm_config,
+    seq_lens,
+    configure_compilation: str,
+    configure_device: str,
+):
+    """The window's active-block skip is layout-independent, so head-major keeps it."""
+    _run_spyre_attn_test(
+        seq_lens=seq_lens,
+        block_size=64,
+        sliding_window=128,
+        configure_compilation=configure_compilation,
+        configure_device=configure_device,
+        backend=SpyreHeadMajorAttentionBackend,
+    )
+
+
+@pytest.mark.parametrize(
+    "configure_device",
+    [
+        pytest.param("cpu", id="device_cpu"),
+        pytest.param("spyre", id="device_spyre"),
+    ],
+    indirect=True,
+)
+def test_head_major_kv_store_lands_in_the_folded_rows(default_vllm_config, configure_device: str):
+    """The per-head scatter writes each (page, kv head, token) row the layout implies."""
+    set_random_seed(0)
+    num_tokens, num_kv_heads, head_size, block_size, num_pages = 4, 8, 128, 64, 3
+    cache_device = torch.device(configure_device)
+    slots = [0, block_size + 5, 2 * block_size + 1, 7]
+
+    key = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
+    value = torch.randn(num_tokens, num_kv_heads, head_size, dtype=torch.float16)
+
+    # Expected built token-major then packed, so the test states the invariant in the
+    # layout-independent frame rather than restating the row arithmetic.
+    shape = (num_pages, block_size, num_kv_heads, head_size)
+    k_expected = torch.full(shape, -7.0, dtype=torch.float16)
+    v_expected = torch.full(shape, -7.0, dtype=torch.float16)
+    for t, slot in enumerate(slots):
+        k_expected[slot // block_size][slot % block_size] = key[t]
+        v_expected[slot // block_size][slot % block_size] = value[t]
+
+    base = torch.full(shape, -7.0, dtype=torch.float16)
+    k_actual = _to_backend_cache(base, SpyreHeadMajorAttentionBackend, cache_device)
+    v_actual = _to_backend_cache(base, SpyreHeadMajorAttentionBackend, cache_device)
+
+    attn_impl = SpyreHeadMajorAttentionImpl(
+        num_heads=num_kv_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
+        num_kv_heads=num_kv_heads,
+    )
+    kv_cache = SpyrePagedKVCache(k_pages=k_actual, v_pages=v_actual)
+    attn_impl.kv_slot_views(kv_cache)
+    rows = attn_impl.slot_rows(torch.tensor(slots, dtype=torch.int64), kv_cache, cache_device)
+    assert len(rows) == num_kv_heads, "head-major publishes one index tensor per KV head"
+
+    # K/V arrive as strided views of a fused QKV, which is what makes the clone in
+    # _store_sources necessary.
+    key_src, value_src = _fused_qkv_kv_views(key, key, value, cache_device)
+
+    def scatter(k, v, slot_rows):
+        attn_impl.do_kv_cache_update(None, k, v, kv_cache, slot_rows)
+
+    torch.compile(scatter, dynamic=False)(key_src, value_src, rows)
+
+    assert tuple(k_actual.shape) == SpyreHeadMajorAttentionBackend.get_kv_cache_allocation_shape(
+        num_pages, block_size, num_kv_heads, head_size
+    )
+    torch.testing.assert_close(
+        k_actual.to("cpu"), k_expected.permute(0, 2, 1, 3).contiguous(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        v_actual.to("cpu"), v_expected.permute(0, 2, 1, 3).contiguous(), atol=1e-2, rtol=1e-2
+    )
+
+    if configure_device == "spyre":
+        del k_actual, v_actual, kv_cache
+        import gc
+
+        gc.collect()
+
+
+def test_head_major_decode_tables_share_the_kernels_lane_order(default_vllm_config):
+    """tile_ids and the mask must agree on lane = seq * KV + kv head.
+
+    The kernel reshapes the query to that order and reads both tables by it, so a
+    disagreement would silently attend with another head's KV.
+    """
+    torch.set_default_device("cpu")
+    num_kv_heads, block_size, num_seqs = 4, 64, 2
+    block_table = torch.tensor([[3, 0], [5, 9]], dtype=torch.int32)
+
+    md = _build_metadata(
+        num_query_heads=num_kv_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=128,
+        block_size=block_size,
+        seq_lens=torch.tensor([block_size, 2 * block_size], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        block_table=block_table,
+        slot_mapping=torch.tensor([3 * block_size, 5 * block_size], dtype=torch.int64),
+        backend=SpyreHeadMajorAttentionBackend,
+    )
+
+    assert md.tile_ids_cpu is not None, "a 2-seq decode batch is inside the lane rule"
+    b_seqs, b_blocks = md.padded_num_seqs, md.padded_batch_blocks
+    assert b_seqs is not None and b_blocks is not None
+    lanes = b_seqs * num_kv_heads
+    # Stick-padded rows: a narrower inner dim emits a Mod(d0, ...) stick expression.
+    assert md.tile_ids_cpu.shape[1] % INT32_ELEMS_PER_STICK == 0
+    assert md.tile_ids_cpu.shape[1] >= lanes
+
+    # Lane (s, h) of block b holds that block's page for s, folded onto its kv head.
+    for s in range(num_seqs):
+        for b in range(min(len(md.attention_mask_tiles[s]), b_blocks)):
+            page = int(block_table[s, b])
+            for h in range(num_kv_heads):
+                assert int(md.tile_ids_cpu[b, s * num_kv_heads + h]) == page * num_kv_heads + h
+
+    # The mask is the same value for every head of a lane group, in that same order.
+    assert md.mask_by_block_cpu is not None
+    assert md.mask_by_block_cpu.shape == (b_blocks, lanes, 1, block_size)
+    per_head = md.mask_by_block_cpu.reshape(b_blocks, b_seqs, num_kv_heads, block_size)
+    for h in range(1, num_kv_heads):
+        torch.testing.assert_close(per_head[:, :, 0], per_head[:, :, h])
+    # Rows past the batch must be finite at block 0, or their softmax publishes NaN.
+    assert torch.isfinite(per_head[0, num_seqs:]).all()
+
+
+def test_head_major_batched_decode_matches_a_plain_softmax(default_vllm_config):
+    """The flat-lane decode kernel against a per-(seq, head) reference softmax.
+
+    Runs eager on CPU: this kernel gathers through index_select, so unlike the chunked
+    one it does not need the compiled path to be correct.
+    """
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+    num_seqs, num_kv_heads, num_queries_per_kv = 2, 4, 2
+    block_size, head_size, num_pages, num_blocks = 64, 128, 24, 2
+    num_heads = num_kv_heads * num_queries_per_kv
+    scale = head_size**-0.5
+
+    # Head-major tile cache: one row per (page, kv head).
+    k_tiles = torch.randn(num_pages * num_kv_heads, block_size, head_size, dtype=torch.float16)
+    v_tiles = torch.randn(num_pages * num_kv_heads, block_size, head_size, dtype=torch.float16)
+    query = torch.randn(num_seqs, num_heads, head_size, dtype=torch.float16)
+
+    pages = torch.tensor([[3, 7], [11, 2]], dtype=torch.int32)
+    heads = torch.arange(num_kv_heads, dtype=torch.int32)
+    tile_ids = torch.zeros(
+        num_blocks, stick_aligned_len(num_seqs * num_kv_heads), dtype=torch.int32
+    )
+    tile_ids[:, : num_seqs * num_kv_heads] = (pages.t()[:, :, None] * num_kv_heads + heads).reshape(
+        num_blocks, -1
+    )
+
+    got = batched_decode_head_major_kernel(
+        query,
+        torch.arange(num_seqs, dtype=torch.int32),
+        k_tiles,
+        v_tiles,
+        tile_ids,
+        torch.zeros(num_blocks, num_seqs * num_kv_heads, 1, block_size, dtype=torch.float16),
+        scale,
+        num_seqs,
+        num_blocks,
+        num_kv_heads,
+        num_queries_per_kv,
+        block_size,
+        head_size,
+    )
+
+    expected = torch.zeros(num_seqs, num_heads, head_size, dtype=torch.float32)
+    for s in range(num_seqs):
+        for h in range(num_kv_heads):
+            rows = [int(pages[s, b]) * num_kv_heads + h for b in range(num_blocks)]
+            k = torch.cat([k_tiles[r] for r in rows]).to(torch.float32)
+            v = torch.cat([v_tiles[r] for r in rows]).to(torch.float32)
+            for g in range(num_queries_per_kv):
+                q = query[s, h * num_queries_per_kv + g].to(torch.float32)
+                probs = torch.softmax((q @ k.t()) * scale, dim=-1)
+                expected[s, h * num_queries_per_kv + g] = probs @ v
+
+    assert got.shape == (num_seqs, num_heads, head_size)
+    torch.testing.assert_close(got.to(torch.float32), expected, atol=2e-2, rtol=2e-2)
+
+
+def test_head_major_backend_swaps_the_kernels_not_the_advertised_shape():
+    """The layouts share only the per-sequence kernel, through its gather argument.
+
+    Every other kernel call is the subclass's own override, so the base never dispatches
+    on the layout.
+    """
+    from spyre_inference.v1.attention.ops import page_attn
+
+    assert SpyreAttentionImpl._gather_page is page_attn.gather_page_token_major
+    assert SpyreHeadMajorAttentionImpl._gather_page is page_attn.gather_page_head_major
+    for name in (
+        "do_kv_cache_update",
+        "kv_slot_views",
+        "_run_batched_decode_dispatch",
+        "slot_rows",
+    ):
+        assert getattr(SpyreHeadMajorAttentionImpl, name) is not getattr(
+            SpyreAttentionImpl, name
+        ), f"{name} must be overridden so the head-major backend calls its own kernels"
+    # Same for the H2D mirror, which belongs to the metadata that owns the tables.
+    assert (
+        SpyreHeadMajorAttentionMetadata.mirror_decode_tables
+        is not SpyreAttentionMetadata.mirror_decode_tables
+    )
+    # The advertised shape stays the token-major logical frame in both, so
+    # page_size_bytes and upstream's block-dim discovery are unaffected.
+    logical = (16, 64, 8, 128)
+    assert SpyreHeadMajorAttentionBackend.get_kv_cache_shape(*logical) == logical
+    assert SpyreHeadMajorAttentionBackend.get_kv_cache_allocation_shape(*logical) == (
+        16,
+        8,
+        64,
+        128,
+    )
+
+
+@pytest.mark.parametrize(
+    "num_decode_seqs,num_kv_heads,expected",
+    [
+        # lanes = seqs * kv_heads, capped at the core count; one sequence is faster on
+        # the per-sequence kernel, and too many lanes returns wrong values.
+        pytest.param(1, 8, None, id="one_seq_stays_per_sequence"),
+        pytest.param(2, 8, 4, id="2of4_pads_to_the_lane_bucket"),
+        pytest.param(4, 8, 4, id="4of4_fills_the_lanes"),
+        pytest.param(5, 8, None, id="above_the_lane_cap_refuses"),
+        pytest.param(8, 4, 8, id="fewer_kv_heads_allow_more_seqs"),
+        pytest.param(2, 64, None, id="more_kv_heads_than_lanes_refuses"),
+    ],
+)
+def test_head_major_decode_seq_bucket_follows_the_lane_rule(
+    num_decode_seqs, num_kv_heads, expected
+):
+    assert head_major_decode_seq_bucket(num_decode_seqs, num_kv_heads) == expected

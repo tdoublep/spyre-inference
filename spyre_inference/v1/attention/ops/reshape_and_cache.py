@@ -18,3 +18,20 @@
 def reshape_and_cache_kernel(key, value, k_slots, v_slots, slot_mapping):
     k_slots.index_copy_(0, slot_mapping, key)
     v_slots.index_copy_(0, slot_mapping, value)
+
+
+def reshape_and_cache_head_major_kernel(key, value, k_slots, v_slots, slot_mapping):
+    """Scatter K/V into the head-major cache, one index_copy_ per KV head.
+
+    Unrolled rather than one copy over a flattened source: every spelling of that
+    reshape fails to lower at the decode width. The copies fuse into one kernel.
+
+    ``slot_mapping`` is one index tensor per KV head, each its own allocation: an index
+    tensor reaches the hardware as a tensor argument, so a row slice of a 2-D table
+    would have its offset dropped (torch-spyre#3770). ``key``/``value`` must be their
+    own allocations too -- see the clone in ``SpyreAttentionImpl.do_kv_cache_update``.
+    """
+    for h in range(len(slot_mapping)):
+        rows = slot_mapping[h]
+        k_slots.index_copy_(0, rows, key.select(1, h))
+        v_slots.index_copy_(0, rows, value.select(1, h))

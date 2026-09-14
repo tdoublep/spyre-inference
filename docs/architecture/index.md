@@ -201,6 +201,16 @@ path, the KV store, and the cache's device layout — live under
 `spyre_inference/v1/attention/ops/`; the backend module holds the metadata builder and
 the host-side orchestration that calls them.
 
+The layout of a KV page is a property of the attention backend, and
+`SPYRE_KV_CACHE_LAYOUT` selects which one runs. The default `token_major` backend stores a
+page `[block_size, num_kv_heads, head_size]`; `head_major`
+(`backends/spyre_head_major_attn.py`) stores it `[num_kv_heads, block_size, head_size]`, so
+a (block, kv head) pair is one contiguous tile. That drops the permute every token-major
+page gather pays and lets the batched decode kernel fold (sequences, kv heads) into a
+single bmm batch axis, at the cost of one KV scatter per head. The backend subclass owns
+the allocation shape, the device layout, the cache views, the slot row space and its own
+decode kernel and tables; the base classes are layout-neutral.
+
 Key constraints:
 
 - **KV length bucketing**: padded block count on power-of-two buckets from `block_size`

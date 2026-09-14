@@ -38,6 +38,8 @@ from vllm.platforms import PlatformEnum
 from vllm.platforms.cpu import CpuPlatform
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
 
+from spyre_inference import envs
+
 if TYPE_CHECKING:
     # NB: We can't eagerly import many things from vllm since vllm.config
     # will import this file. These would lead to circular imports
@@ -125,7 +127,21 @@ class TorchSpyrePlatform(CpuPlatform):
     _GATED_ACTS = ("silu", "swish", "gelu", "gelu_tanh", "gelu_pytorch_tanh")
 
     # Register the PyTorch Native Attention implementation as the CUSTOM backend.
-    _backend_path = "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend"
+    # SPYRE_KV_CACHE_LAYOUT picks which paged backend that is: the layouts differ in the
+    # shape of a KV page and so in every kernel that reads one.
+    _BACKEND_PATHS = {
+        "token_major": "spyre_inference.v1.attention.backends.spyre_attn.SpyreAttentionBackend",
+        "head_major": (
+            "spyre_inference.v1.attention.backends.spyre_head_major_attn."
+            "SpyreHeadMajorAttentionBackend"
+        ),
+    }
+    if envs.SPYRE_KV_CACHE_LAYOUT not in _BACKEND_PATHS:
+        raise ValueError(
+            f"SPYRE_KV_CACHE_LAYOUT={envs.SPYRE_KV_CACHE_LAYOUT!r} is not a known KV cache "
+            f"layout; expected one of {sorted(_BACKEND_PATHS)}."
+        )
+    _backend_path = _BACKEND_PATHS[envs.SPYRE_KV_CACHE_LAYOUT]
     register_backend(AttentionBackendEnum.CUSTOM, _backend_path)
 
     @classmethod

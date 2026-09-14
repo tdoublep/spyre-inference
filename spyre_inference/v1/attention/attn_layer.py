@@ -31,8 +31,6 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backend import AttentionType
 
-from spyre_inference.custom_ops.utils import convert
-
 logger = init_logger(__name__)
 
 # vLLM reserves block 0 as `BlockPool.null_block`, so no sequence is ever given its
@@ -41,12 +39,17 @@ _NULL_SLOT = 0
 
 
 class SlotMapping:
-    """This step's slot mapping on device, shared by every split layer."""
+    """This step's slot mapping on device, shared by every split layer.
+
+    Published in the row space of the impl's slot views, which the backend's cache layout
+    fixes — one tensor per KV head for a head-major cache. Every layer sharing a holder
+    shares a kv-cache spec, so one expansion serves them all.
+    """
 
     def __init__(self, layers: list[Attention]) -> None:
         self._layers = layers
         self._device: torch.device | None = None
-        self.slots: torch.Tensor | None = None
+        self.slots: torch.Tensor | list[torch.Tensor] | None = None
 
     def _resolve_device(self) -> torch.device | None:
         if self._device is None:
@@ -63,18 +66,17 @@ class SlotMapping:
 
     def publish(self, slot_mapping: torch.Tensor) -> None:
         """Mirror a step's host slot mapping to device for the traced write to read."""
-        device = self._resolve_device()
-        if device is None:
-            return
-        self.slots = convert(slot_mapping.clamp(min=_NULL_SLOT), device=device)
+        self._publish_host(slot_mapping.clamp(min=_NULL_SLOT))
 
     def publish_null(self, num_tokens: int) -> None:
+        self._publish_host(torch.full((num_tokens,), _NULL_SLOT, dtype=torch.int64))
+
+    def _publish_host(self, host: torch.Tensor) -> None:
         device = self._resolve_device()
         if device is None:
             return
-        self.slots = convert(
-            torch.full((num_tokens,), _NULL_SLOT, dtype=torch.int64), device=device
-        )
+        layer = self._layers[0]
+        self.slots = layer.impl.slot_rows(host, layer.kv_cache, device)  # ty: ignore[possibly-missing-attribute]
 
 
 _holders: weakref.WeakSet[SlotMapping] = weakref.WeakSet()

@@ -40,3 +40,23 @@ def slot_major_kv_layout(num_slots: int, num_kv_heads: int, head_size: int, dtyp
         stride_map=[num_kv_heads * sticks * eps, sticks * eps, eps, 1],
         device_dtype=get_device_dtype(dtype),
     )
+
+
+def head_major_kv_layout(num_rows: int, block_size: int, head_size: int, dtype: torch.dtype):
+    """Tile-outermost layout for the head-major cache; ``num_rows`` counts (page, kv head).
+
+    The indexed axis must sit at device position 0 or index_select costs the whole
+    tensor, so the cache is materialised with this layout rather than viewed out of
+    slot-major. The allocation is 4-D while the device layout keeps (page, kv head) as
+    one extent: merging device dims is the direction torch-spyre lowers, splitting
+    device dim 0 is not.
+    """
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+
+    eps = get_elem_in_stick(dtype)
+    sticks = (head_size + eps - 1) // eps
+    return SpyreTensorLayout(
+        device_size=[num_rows, block_size, sticks, eps],
+        stride_map=[block_size * head_size, head_size, eps, 1],
+        device_dtype=get_device_dtype(dtype),
+    )
