@@ -886,14 +886,16 @@ def derive_lattice(entries):
     for a whole ``block_sizes`` sweep, which ``envs`` caching on first read requires.
     """
     kv = sorted({s for e in entries for s in e["seq_lens"]})
-    max_batched = max(sum(e["query_lens"]) for e in entries)
-    # A ladder whose top is below its limit gets the limit appended by
-    # _resolve_buckets, with a warning; only max_batched is not already declared.
-    query = sorted({1, max_batched, *(q for e in entries for q in e["query_lens"] if q > 1)})
+    # max_num_batched_tokens is pinned, not derived: staging_rows is it plus one and
+    # those buffers are the kernel's query and output arguments, so a decode-only shape
+    # list would otherwise measure a narrower gather than production's. It joins the
+    # ladder because _resolve_buckets appends a limit its ladder tops out below.
+    # 1 is the decode rung, reached by a config that declares no wider query at all.
+    query = sorted({q for e in entries for q in e["query_lens"]} | {1, _MAX_BATCHED_TOKENS})
     num_seqs = sorted({len(e["query_lens"]) for e in entries})
     return {
         "max_model_len": kv[-1],
-        "max_num_batched_tokens": max_batched,
+        "max_num_batched_tokens": _MAX_BATCHED_TOKENS,
         "max_num_seqs": num_seqs[-1],
         "SPYRE_ATTN_KV_BUCKETS": ",".join(map(str, kv)),
         "SPYRE_ATTN_QUERY_BUCKETS": ",".join(map(str, query)),

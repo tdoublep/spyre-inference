@@ -87,10 +87,12 @@ kernel. Treat it as a bound, not as production's KV-write cost.
 A config declares `(query_lens, seq_lens)` and the kernel runs those lengths. The
 bucket lattice is not a second knob: `derive_lattice` builds it from the shape list
 so that every declared length is its own bucket and the real
-`SpyreAttentionMetadataBuilder`'s round-up is the identity. The engine limits
-(`max_model_len`, `max_num_batched_tokens`, `max_num_seqs`) are the tops of those
-ladders, so they are derived too. A config that still sets any of them, or the old
-`attn_*_buckets` keys, is rejected.
+`SpyreAttentionMetadataBuilder`'s round-up is the identity. `max_model_len` and
+`max_num_seqs` are the tops of those ladders, so they are derived too.
+`max_num_batched_tokens` is pinned to the platform's 512 cap instead: `staging_rows`
+is it plus one, and those buffers are the kernel's query and output arguments, so
+deriving it from a decode-only shape list would narrow the gather the kernel runs.
+A config that sets any of the three, or the old `attn_*_buckets` keys, is rejected.
 
 Padding has not gone away — it is now something you ask for. The kernel specialises
 on `(num_blocks, padded_query_len)`, so **to measure what a deployment's coarser
