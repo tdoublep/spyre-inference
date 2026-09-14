@@ -54,9 +54,16 @@ from torch.profiler import ProfilerActivity, profile  # noqa: E402
 SPANS = {
     "online_softmax": "spyre_attn::online_softmax",
     "forward": "spyre_attn::forward",
+    # Emitted by this harness, not by spyre_attn: production's KV write lives in
+    # attn_layer inside the block graph, where Inductor fuses it into the
+    # RMSNorm+QKV kernel and it has no span (or kernel) of its own. See README.
     "reshape_and_cache": "spyre_attn::reshape_and_cache",
+    "layer": "spyre_attn::layer",
 }
-MEMORY_OP_MARKERS = ("memcpy", "memset", "restickify", "stickif")
+# Spans that enclose others, so device time is credited by union rather than by
+# the innermost-span rule.
+OUTER_SPANS = (SPANS["forward"], SPANS["layer"])
+MEMORY_OP_MARKERS = ("memcpy", "memset", "restickify", "stickif", "copy_from_d2d")
 
 # Spyre requires float16 (platform.py raises otherwise).
 DTYPE = torch.float16
@@ -65,22 +72,41 @@ DTYPE = torch.float16
 VARIANT_REGISTRY: dict[str, dict] = {}
 
 
-def register_variant(name, impl_label, compiled=True, available_fn=None):
+def register_variant(name, impl_label, compiled=True, batched=False, available_fn=None):
     VARIANT_REGISTRY[name] = {
         "impl_label": impl_label,
         "compiled": compiled,
+        "batched": batched,
         "available": available_fn or (lambda: True),
     }
 
 
 register_variant("online_softmax_compiled", "Implementation.SPYRE_ONLINE_SOFTMAX", True)
 register_variant("online_softmax_eager", "Implementation.SPYRE_ONLINE_SOFTMAX_EAGER", False)
+register_variant(
+    "batched_decode_compiled", "Implementation.SPYRE_BATCHED_DECODE", True, batched=True
+)
 
 
 @contextlib.contextmanager
-def spyre_vllm_config(compiled: bool):
-    """Establish a Spyre vLLM config context for standalone (non-pytest) use."""
-    from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
+def spyre_vllm_config(compiled: bool, block_size: int, limits: dict):
+    """Establish a Spyre vLLM config context for standalone (non-pytest) use.
+
+    The engine limits are passed in rather than defaulted: the attention bucket
+    lattice is derived from them, so leaving them to whichever model
+    ``ModelConfig()`` happens to resolve makes the padding the kernel sees an
+    accident of that model rather than a property of the config being measured.
+    ``block_size`` must reach ``cache_config``, which the metadata builder
+    asserts against its own kv_cache_spec.
+    """
+    from vllm.config import (
+        CacheConfig,
+        DeviceConfig,
+        ModelConfig,
+        SchedulerConfig,
+        VllmConfig,
+        set_current_vllm_config,
+    )
     from vllm.config.compilation import CompilationConfig, CompilationMode
     from vllm.forward_context import set_forward_context
     from vllm.platforms import PlatformEnum, current_platform
@@ -92,11 +118,18 @@ def spyre_vllm_config(compiled: bool):
     mode = CompilationMode.STOCK_TORCH_COMPILE if compiled else CompilationMode.NONE
     config = VllmConfig(
         device_config=DeviceConfig(device="cpu"),
+        cache_config=CacheConfig(block_size=block_size),
+        scheduler_config=SchedulerConfig(
+            is_encoder_decoder=False,
+            max_model_len=limits["max_model_len"],
+            max_num_batched_tokens=limits["max_num_batched_tokens"],
+            max_num_seqs=limits["max_num_seqs"],
+        ),
         compilation_config=CompilationConfig(custom_ops=["all"], mode=mode),
-        model_config=ModelConfig(dtype=DTYPE),
+        model_config=ModelConfig(dtype=DTYPE, max_model_len=limits["max_model_len"]),
     )
     with set_current_vllm_config(config), set_forward_context(None, config):
-        yield
+        yield config
 
 
 def ref_attn(query, key_cache, value_cache, query_lens, kv_lens, block_tables, block_size, scale):
@@ -211,8 +244,14 @@ def build_inputs_from_requests(
     set_random_seed(seed)
 
     num_seqs = len(query_lens)
-    max_kv = max(seq_lens)
-    blocks_per_seq = (max_kv + block_size - 1) // block_size
+    # As wide as vLLM's, i.e. max_model_len, not as wide as this shape needs: the
+    # builder pads each sequence's block count up onto a recorded bucket, and the
+    # kernel gathers every padded page, so a table sized to the real count leaves
+    # the padding with no page id to read.
+    from vllm.config import get_current_vllm_config
+
+    max_model_len = get_current_vllm_config().model_config.max_model_len
+    blocks_per_seq = max((max_model_len + block_size - 1) // block_size, 1)
     if num_blocks < num_seqs * blocks_per_seq:
         return None  # cache too small to give every sequence its own pages
 
@@ -313,6 +352,9 @@ def build_inputs_from_requests(
         "query_dev": convert(query, cache_device),
         "key_dev": key_dev,
         "value_dev": value_dev,
+        # attn_layer clamps to the null block before mirroring; unpadded here, so
+        # there is nothing to clamp, but the dtype and device must still match.
+        "slots_dev": convert(slot_mapping, cache_device),
         "k_pages": k_pages,
         "v_pages": v_pages,
         "k_pages_cpu": k_pages_cpu,
@@ -397,11 +439,21 @@ def span_device_times(prof, span=SPANS["online_softmax"]):
         ((e.name, e.time_range) for e in events if e.name.startswith("spyre_attn::")),
         key=lambda item: item[1].end - item[1].start,  # innermost first
     )
-    outer = span == SPANS["forward"]
+    outer = span in OUTER_SPANS
     # Union of every window for this span; spans is innermost-first, so the
     # first match would pick the narrowest forward window and drop the rest.
     windows = [tr for n, tr in spans if n == span]
     total = mem = 0.0
+    n_compute = 0
+
+    def credit(e, dev):
+        nonlocal total, mem, n_compute
+        total += dev
+        if any(m in e.name.lower() for m in MEMORY_OP_MARKERS):
+            mem += dev
+        else:
+            n_compute += 1
+
     for e in events:
         dev = getattr(e, "self_device_time_total", 0.0) or 0.0
         if dev <= 0:
@@ -411,17 +463,13 @@ def span_device_times(prof, span=SPANS["online_softmax"]):
             # forward encloses the leaf spans, so credit every kernel starting
             # inside any forward window rather than to the innermost child.
             if any(w.start <= start <= w.end for w in windows):
-                total += dev
-                if any(m in e.name.lower() for m in MEMORY_OP_MARKERS):
-                    mem += dev
+                credit(e, dev)
             continue
         owner = next((n for n, tr in spans if tr.start <= start <= tr.end), None)
         if owner != span:
             continue
-        total += dev
-        if any(m in e.name.lower() for m in MEMORY_OP_MARKERS):
-            mem += dev
-    return total, mem
+        credit(e, dev)
+    return total, mem, n_compute
 
 
 def span_cpu_time_us(prof, span=SPANS["online_softmax"]):
@@ -431,7 +479,20 @@ def span_cpu_time_us(prof, span=SPANS["online_softmax"]):
     return float("nan")
 
 
-def make_forward(inputs, num_query_heads, num_kv_heads, head_size):
+def make_forward(inputs, num_query_heads, num_kv_heads, head_size, kv_write=False):
+    """One emulated attention layer, in the order ``attn_layer`` runs it.
+
+    Production's ``Attention.forward`` is replaced by
+    ``attn_layer._spyre_attention_forward``, which (a) scatters K/V into the
+    cache, (b) stages the query into the impl's constant-shaped buffer, (c) calls
+    the attention op on those buffers, (d) copies the result back. (a), (b) and
+    (d) are traced into the block graph, so only (c) is inside the
+    ``spyre_attn::forward`` span. Staging here rather than letting the impl do it
+    keeps that split — passing a non-staging query makes ``pre_staged`` False and
+    moves both copies inside the measured span, inflating it.
+    """
+    from torch_spyre.streams import synchronize
+
     from spyre_inference.v1.attention.backends.spyre_attn import (
         SpyreAttentionImpl,
         SpyrePagedKVCache,
@@ -443,26 +504,44 @@ def make_forward(inputs, num_query_heads, num_kv_heads, head_size):
         scale=inputs["scale"],
         num_kv_heads=num_kv_heads,
     )
+    device = inputs["cache_device"]
     # Allocate from the host query then transfer, as test and production do:
     # empty_like on an on-device tensor gives a layout the kernel's write does
     # not match, and the readback is then garbage.
-    output = torch.empty_like(inputs["query_cpu"]).to(inputs["cache_device"])
+    output = torch.empty_like(inputs["query_cpu"]).to(device)
     kv_cache = SpyrePagedKVCache(k_pages=inputs["k_pages"], v_pages=inputs["v_pages"])
+    q_staging, out_staging = impl.staging_buffers(device)
+    rows = inputs["total_query_tokens"]
+    slots_dev = inputs["slots_dev"]
 
     @torch.inference_mode()
     def run():
-        impl.forward(
-            layer=None,
-            query=inputs["query_dev"],
-            key=inputs["key_dev"],
-            value=inputs["value_dev"],
-            kv_cache=kv_cache,
-            attn_metadata=inputs["attn_metadata"],
-            output=output,
-        )
+        with torch.profiler.record_function(SPANS["layer"]):
+            if kv_write:
+                with torch.profiler.record_function(SPANS["reshape_and_cache"]):
+                    impl.do_kv_cache_update(
+                        None, inputs["key_dev"], inputs["value_dev"], kv_cache, slots_dev
+                    )
+            q_staging[:rows] = inputs["query_dev"]
+            impl.forward(
+                layer=None,
+                query=q_staging,
+                key=inputs["key_dev"],
+                value=inputs["value_dev"],
+                kv_cache=kv_cache,
+                attn_metadata=inputs["attn_metadata"],
+                output=out_staging,
+            )
+            output.copy_(out_staging[:rows])
+            # The device queue lags the CPU by roughly one kernel, so without this
+            # the last kernel of a multi-sequence loop starts a few us *after* the
+            # enclosing record_function closes and start-based attribution drops
+            # it. Syncing inside the span makes the layer total exact; the leaf
+            # spans stay marginal, which is what kernels_expected checks.
+            synchronize(device)
         return output
 
-    return run, output
+    return run, output, impl
 
 
 def measure(run, iterations, span=SPANS["online_softmax"]):
@@ -471,15 +550,98 @@ def measure(run, iterations, span=SPANS["online_softmax"]):
     The AIUPTI backend has a fixed trace-buffer pool and stops capturing once
     full (kineto_profiling.md §4.5), so one long window truncates the timeline.
     """
-    dev_us, mem_us, cpu_us = [], [], []
+    dev_us, mem_us, cpu_us, n_kernels = [], [], [], []
     for _ in range(iterations):
         with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
             run()
-        total, mem = span_device_times(prof, span)
+        total, mem, n_compute = span_device_times(prof, span)
         dev_us.append(total)
         mem_us.append(mem)
+        n_kernels.append(n_compute)
         cpu_us.append(span_cpu_time_us(prof, span))
-    return dev_us, mem_us, cpu_us
+    return dev_us, mem_us, cpu_us, n_kernels
+
+
+def unreachable_reason(query_lens, seq_lens, block_size) -> str:
+    """Why the engine could never schedule this shape, or "" if it could.
+
+    The backend asserts on an out-of-lattice shape deep inside ``build()``, which
+    surfaces as an opaque AssertionError mid-sweep. Checking up front turns that
+    into a row saying which limit the shape exceeded. Note the platform caps
+    ``max_num_batched_tokens`` at 512 for decoder models, so a query longer than
+    that is unreachable at *any* max_model_len -- production chunks its prefills.
+    """
+    from vllm.config import get_current_vllm_config
+
+    from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
+
+    vllm_config = get_current_vllm_config()
+    bucketer = SpyreAttnBucketer(vllm_config)
+    max_batched = vllm_config.scheduler_config.max_num_batched_tokens
+    if sum(query_lens) > max_batched:
+        return (
+            f"batch of {sum(query_lens)} tokens above max_num_batched_tokens={max_batched}; "
+            "the scheduler cannot pack this many into one step"
+        )
+    if len(query_lens) > vllm_config.scheduler_config.max_num_seqs:
+        return (
+            f"{len(query_lens)} sequences above "
+            f"max_num_seqs={vllm_config.scheduler_config.max_num_seqs}"
+        )
+    for query_len, seq_len in zip(query_lens, seq_lens):
+        if bucketer.find_query_bucket(query_len) is None:
+            return (
+                f"query_len={query_len} above the top query bucket "
+                f"{bucketer.query_buckets[-1]} (max_num_batched_tokens, capped at 512)"
+            )
+        blocks = (seq_len + block_size - 1) // block_size
+        if bucketer.find_blocks_bucket(blocks) is None:
+            return (
+                f"seq_len={seq_len} needs {blocks} blocks, above the top bucket "
+                f"{bucketer.num_blocks_buckets[-1]} (max_model_len)"
+            )
+    return ""
+
+
+def record_attn_path(row, impl, attn_metadata, batched_variant):
+    """Record which read path the impl took, and flag a declined batched gate."""
+    row["num_decode_seqs"] = attn_metadata.num_decode_seqs
+    row["padded_num_seqs"] = (
+        -1 if attn_metadata.padded_num_seqs is None else attn_metadata.padded_num_seqs
+    )
+    row["decode_uniformity"] = attn_metadata.decode_uniformity
+    row["blocks_per_chunk"] = (
+        -1 if attn_metadata.blocks_per_chunk is None else attn_metadata.blocks_per_chunk
+    )
+    batched = impl._batched_decode_preconditions_met(attn_metadata)
+    if not batched:
+        row["attn_path"] = "per_seq"
+        if batched_variant:
+            row["error"] = "batched decode gate declined; measured the per-seq loop instead"
+            print(f"    -> {row['error']}", flush=True)
+        return
+    all_decode = attn_metadata.num_decode_seqs == attn_metadata.num_seqs
+    row["attn_path"] = "batched" if all_decode else "batched+per_seq"
+
+
+def expected_kernels(row, span):
+    """Compute kernels the span should contain, to catch a short attribution.
+
+    The attention loop runs one kernel per sequence; the batched path replaces the
+    decode prefix's kernels with a single one. ``reshape_and_cache`` is one fused
+    index_copy. The copy-back and the sync add memory ops, which are excluded.
+    """
+    num_seqs, num_decode = row["num_reqs"], row["num_decode_seqs"]
+    if row["attn_path"].startswith("batched"):
+        attn = 1 + (num_seqs - num_decode)
+    else:
+        attn = num_seqs
+    write = 1 if row["kv_write"] else 0
+    if span == SPANS["reshape_and_cache"]:
+        return write
+    if span == SPANS["layer"]:
+        return attn + write
+    return attn  # forward / online_softmax
 
 
 def run_config(entry, variant, cfg, records, csv_path, block_size=None):
@@ -532,12 +694,31 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         "max_abs_diff": float("nan"),
         "num_outliers": -1,
         "fallback_clean": True,
+        # Which read path the impl actually took. A batched variant whose gate
+        # declined silently falls back to the per-seq loop, so without this a
+        # per-seq measurement reads as a batched one.
+        "attn_path": "",
+        "num_decode_seqs": -1,
+        "padded_num_seqs": -1,
+        "decode_uniformity": float("nan"),
+        "blocks_per_chunk": -1,
+        "kv_write": bool(cfg.get("kv_write", False)),
+        "late_compile": False,
+        "kernels_attributed": -1,
+        "kernels_expected": -1,
         "error": "",
     }
     row.update(entry.get("extra_cols", {}))
 
     inputs = None
     try:
+        unreachable = unreachable_reason(query_lens, seq_lens, block_size)
+        if unreachable:
+            row["error"] = unreachable
+            print(f"    -> skipped ({unreachable})", flush=True)
+            records.append(row)
+            return
+
         inputs = build_inputs_from_requests(
             query_lens,
             seq_lens,
@@ -551,18 +732,23 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
             kv_layout=cfg.get("kv_layout", "slot_major_devfill"),
         )
         if inputs is None:
-            needed = len(query_lens) * row["num_kv_blocks_iterated"]
+            from vllm.config import get_current_vllm_config
+
+            max_model_len = get_current_vllm_config().model_config.max_model_len
+            needed = len(query_lens) * ((max_model_len + block_size - 1) // block_size)
             row["error"] = f"insufficient blocks (need num_blocks >= {needed})"
             print(f"    -> skipped ({row['error']})", flush=True)
             records.append(row)
             return
 
-        run, output = make_forward(inputs, num_q, num_kv, head_size)
+        run, output, impl = make_forward(inputs, num_q, num_kv, head_size, kv_write=row["kv_write"])
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             run()  # first call: compile + populate metadata device mirrors
             row["fallback_clean"] = not any("fallback" in str(w.message).lower() for w in caught)
+
+        record_attn_path(row, impl, inputs["attn_metadata"], meta["batched"])
 
         # Correctness gate before timing, same semantics as
         # tests/attention/test_spyre_attn.py. The reference reads KV pages back
@@ -596,7 +782,23 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         for _ in range(cfg.get("warmup", 2)):
             run()
 
-        dev_us, mem_us, cpu_us = measure(run, cfg.get("iterations", 10), span)
+        # A compile landing inside a measured window puts Inductor time in the
+        # number. Warmup should have covered every variant; this proves it did.
+        from torch._dynamo.utils import counters
+
+        graphs_before = counters["stats"]["unique_graphs"]
+        dev_us, mem_us, cpu_us, n_kernels = measure(run, cfg.get("iterations", 10), span)
+        row["late_compile"] = counters["stats"]["unique_graphs"] != graphs_before
+        if row["late_compile"]:
+            print("    -> WARNING: a kernel compiled inside a measured window", flush=True)
+        row["kernels_attributed"] = int(np.median(n_kernels))
+        row["kernels_expected"] = expected_kernels(row, span)
+        if row["kernels_attributed"] != row["kernels_expected"]:
+            row["error"] = (
+                f"attributed {row['kernels_attributed']} compute kernels, expected "
+                f"{row['kernels_expected']}; the span under-counts (use --span layer)"
+            )
+            print(f"    -> {row['error']}", flush=True)
         if dev_us and max(dev_us) > 0:
             row["ms"] = float(np.median(dev_us)) / 1000.0
             row["min_ms"] = float(np.min(dev_us)) / 1000.0
@@ -697,6 +899,56 @@ def _infer_type(query_lens):
     return "mixed"
 
 
+def resolve_limits(cfg, entries):
+    """Engine limits for the config context, from the config or the shapes.
+
+    Defaults cover the entries so a sweep is measurable without pinning them by
+    hand; pin them in the config to model a specific deployment, since they set
+    the padding the kernel sees. The platform still caps max_num_batched_tokens
+    at 512.
+    """
+    return {
+        "max_model_len": cfg.get("max_model_len") or max(max(e["seq_lens"]) for e in entries),
+        "max_num_batched_tokens": cfg.get("max_num_batched_tokens")
+        or max(sum(e["query_lens"]) for e in entries),
+        "max_num_seqs": cfg.get("max_num_seqs") or max(len(e["query_lens"]) for e in entries),
+    }
+
+
+def run_startup_guard(cfg, entries, block_size, span, args):
+    """Abort unless the probe profile carries device events and the chosen span."""
+    probe = entries[0]
+    num_blocks = max(cfg["num_blocks"], (max(probe["seq_lens"]) + block_size - 1) // block_size)
+    probe_inputs = build_inputs_from_requests(
+        probe["query_lens"],
+        probe["seq_lens"],
+        cfg["num_query_heads"],
+        cfg["num_kv_heads"],
+        cfg["head_size"],
+        block_size,
+        num_blocks,
+        cfg["device"],
+        kv_layout=cfg.get("kv_layout", "slot_major_devfill"),
+    )
+    probe_run, _, _ = make_forward(
+        probe_inputs,
+        cfg["num_query_heads"],
+        cfg["num_kv_heads"],
+        cfg["head_size"],
+        kv_write=bool(cfg.get("kv_write", False)),
+    )
+    probe_run()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
+        probe_run()
+    assert_span_present(prof, span)
+    if not args.allow_empty_device_profile:
+        assert_device_profiler_active(prof)
+    total, _, _ = span_device_times(prof, span)
+    print(f"  [guard] profiler active; '{span}' device time = {total:.1f}us\n", flush=True)
+    del probe_inputs, probe_run
+    gc.collect()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", required=True)
@@ -721,6 +973,15 @@ def main():
         default=None,
         help="record_function scope to attribute device time to (default: online_softmax)",
     )
+    ap.add_argument(
+        "--kv-write",
+        action="store_true",
+        help="also scatter K/V into the cache each iteration, as attn_layer does, "
+        "so the reshape_and_cache and layer spans have something to measure",
+    )
+    ap.add_argument("--max-model-len", type=int, default=None)
+    ap.add_argument("--max-num-batched-tokens", type=int, default=None)
+    ap.add_argument("--max-num-seqs", type=int, default=None)
     ap.add_argument("--stop-on-failure", action="store_true")
     ap.add_argument("--no-output", action="store_true")
     ap.add_argument("--allow-empty-device-profile", action="store_true")
@@ -734,6 +995,10 @@ def main():
         ("device", args.device),
         ("span", args.span),
         ("kv_layout", args.kv_layout),
+        ("kv_write", args.kv_write or None),
+        ("max_model_len", args.max_model_len),
+        ("max_num_batched_tokens", args.max_num_batched_tokens),
+        ("max_num_seqs", args.max_num_seqs),
     ):
         if val is not None:
             cfg[key] = val
@@ -753,8 +1018,28 @@ def main():
             "compiled and eager variants need separate runs (the compilation mode "
             "is fixed for the process). Re-run with --variants one at a time."
         )
+    # SPYRE_BATCHED_DECODE is cached on first read and also decides the builder's
+    # reorder_batch_threshold, so it cannot vary within a process either.
+    batched_modes = {VARIANT_REGISTRY[v]["batched"] for v in variants}
+    if len(batched_modes) > 1:
+        raise SystemExit(
+            "batched and per-seq decode variants need separate runs "
+            "(SPYRE_BATCHED_DECODE is process-wide). Re-run with --variants one at a time."
+        )
+    os.environ["SPYRE_BATCHED_DECODE"] = "1" if next(iter(batched_modes)) else "0"
+    # Pin the bucket ladders the same way a deployment does, so a config can
+    # reproduce one exactly instead of inheriting the geometric defaults.
+    for key, env in (
+        ("attn_kv_buckets", "SPYRE_ATTN_KV_BUCKETS"),
+        ("attn_query_buckets", "SPYRE_ATTN_QUERY_BUCKETS"),
+        ("attn_num_seqs_buckets", "SPYRE_ATTN_NUM_SEQS_BUCKETS"),
+    ):
+        if cfg.get(key):
+            os.environ[env] = str(cfg[key])
 
     entries = entries_from_config(cfg)
+    limits = resolve_limits(cfg, entries)
+    sel_span = SPANS[cfg.get("span", "online_softmax")]
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     out_dir = Path(args.output_dir) / cfg.get("run_label", "run") / stamp
     if not args.no_output:
@@ -768,60 +1053,45 @@ def main():
         f"head_size={cfg['head_size']} "
         f"block_size={cfg.get('block_sizes') or cfg['block_size']} dtype={DTYPE}"
     )
-    print(f"  span       : {SPANS[cfg.get('span', 'online_softmax')]}")
+    print(f"  span       : {sel_span}")
+    print(f"  kv write   : {bool(cfg.get('kv_write', False))}")
     print(f"  variants   : {variants}")
     print(f"  shapes     : {len(entries)}")
     print(f"  iterations : {cfg.get('iterations', 10)} (warmup {cfg.get('warmup', 2)})")
     print(f"  output     : {out_dir if not args.no_output else 'none'}\n", flush=True)
 
     records = []
-    with spyre_vllm_config(compiled=next(iter(compiled_modes))):
-        import torch._dynamo
+    guarded = False
+    block_sizes = cfg.get("block_sizes") or [cfg["block_size"]]
+    # cache_config.block_size is fixed per vLLM config and the metadata builder
+    # asserts its kv_cache_spec against it, so a block-size sweep needs one
+    # config context per block size rather than one for the whole run.
+    for bsz in block_sizes:
+        with spyre_vllm_config(next(iter(compiled_modes)), bsz, limits) as vllm_config:
+            import torch._dynamo
 
-        # The kernel specializes per (num_blocks, aligned_max_query_len), so a
-        # sweep legitimately blows through the default recompile limit.
-        torch._dynamo.config.accumulated_recompile_limit = 4096
-        torch._dynamo.config.recompile_limit = 4096
+            # The kernel specializes per (num_blocks, aligned_max_query_len), so a
+            # sweep legitimately blows through the default recompile limit.
+            torch._dynamo.config.accumulated_recompile_limit = 4096
+            torch._dynamo.config.recompile_limit = 4096
 
-        from spyre_inference.v1.attention.backends import spyre_attn as sa
+            from spyre_inference.v1.attention.backends import spyre_attn as sa
 
-        if not sa._ATTN_PROFILING:
-            raise SystemExit("SPYRE_ATTN_PROFILING was not honoured; span will be absent.")
+            if not sa._ATTN_PROFILING:
+                raise SystemExit("SPYRE_ATTN_PROFILING was not honoured; span will be absent.")
+            print(
+                f"  limits     : max_model_len={vllm_config.model_config.max_model_len} "
+                f"max_num_batched_tokens="
+                f"{vllm_config.scheduler_config.max_num_batched_tokens} "
+                f"max_num_seqs={vllm_config.scheduler_config.max_num_seqs}",
+                flush=True,
+            )
 
-        # Startup guard: probe on the smallest shape.
-        probe = entries[0]
-        probe_inputs = build_inputs_from_requests(
-            probe["query_lens"],
-            probe["seq_lens"],
-            cfg["num_query_heads"],
-            cfg["num_kv_heads"],
-            cfg["head_size"],
-            cfg["block_size"],
-            max(
-                cfg["num_blocks"],
-                (max(probe["seq_lens"]) + cfg["block_size"] - 1) // cfg["block_size"],
-            ),
-            cfg["device"],
-            kv_layout=cfg.get("kv_layout", "slot_major_devfill"),
-        )
-        probe_run, _ = make_forward(
-            probe_inputs, cfg["num_query_heads"], cfg["num_kv_heads"], cfg["head_size"]
-        )
-        probe_run()
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
-            probe_run()
-        sel_span = SPANS[cfg.get("span", "online_softmax")]
-        assert_span_present(prof, sel_span)
-        if not args.allow_empty_device_profile:
-            assert_device_profiler_active(prof)
-        total, _ = span_device_times(prof, sel_span)
-        print(f"  [guard] profiler active; '{sel_span}' device time = {total:.1f}us\n", flush=True)
-        del probe_inputs, probe_run
-        gc.collect()
+            if not guarded:
+                run_startup_guard(cfg, entries, bsz, sel_span, args)
+                guarded = True
 
-        block_sizes = cfg.get("block_sizes") or [cfg["block_size"]]
-        for variant in variants:
-            for bsz in block_sizes:
+            for variant in variants:
                 for entry in entries:
                     run_config(entry, variant, cfg, records, csv_path, block_size=bsz)
 
