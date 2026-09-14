@@ -18,10 +18,10 @@ to one scope; see below.
 
 `granite33_8b_e2e_ref.json` reproduces the shapes of one specific end-to-end run,
 as a reference point for checking the harness against it. It declares the shapes
-that run's kernels actually got, not the request lengths it was given: its
-`SPYRE_ATTN_KV_BUCKETS=2048` pin made every step a 16-page kernel, so all four
-prefill chunks were one shape. The `real_seq_lens` / `real_query_lens` columns keep
-the mapping back to the trace. The run it mirrors:
+that run's kernels actually got, not the request lengths it was given: the
+`SPYRE_ATTN_KV_BUCKETS=2048` pin made every step a 16-page kernel, so its four
+prefill chunks — kv 512/1024/1536/1984, query 512/512/512/448 — were all the one
+`q=512, kv=2048` shape, and appear here as a single capture. The run it mirrors:
 
 ```bash
 LAYOUT_SOLVER=greedy SPYRE_NUM_CPUS=8 SPYRE_ATTN_KV_BUCKETS=2048 \

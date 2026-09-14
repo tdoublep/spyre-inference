@@ -23,11 +23,7 @@
       ],
       "seq_lens": [
         2048
-      ],
-      "extra_cols": {
-        "real_seq_lens": "512,1024,1536,1984",
-        "real_query_lens": "512,512,512,448"
-      }
+      ]
     },
     {
       "name": "decode_1seq",
@@ -77,10 +73,7 @@
       "seq_lens": [
         2048,
         2048
-      ],
-      "extra_cols": {
-        "real_seq_lens": "2048,1024"
-      }
+      ]
     }
   ],
   "block_sizes": [
