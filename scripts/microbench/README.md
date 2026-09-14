@@ -10,29 +10,48 @@ CUDA-graph equivalent for excluding host overhead, so device time attributed to 
 
 ```bash
 SPYRE_ATTN_PROFILING=1 .venv/bin/python3 scripts/microbench/spyre_attn_microbench.py \
-    --config scripts/microbench/configs/granite33_8b_e2e_ref.json --span layer
+    --config scripts/microbench/configs/granite33_8b_e2e_ref.json
 ```
 
-`granite33_8b_e2e_ref.json` reproduces the shapes of one specific `vllm bench
-latency` invocation (granite-3.3-8b, input-len 1984, output-len 64, batch 4,
-`SPYRE_ATTN_KV_BUCKETS=2048`). It is a reference point for checking the harness
-against an end-to-end run, not a description of how every deployment is
-configured.
+Reports device time for the whole emulated attention layer. `--span` narrows that
+to one scope; see below.
+
+`granite33_8b_e2e_ref.json` reproduces the shapes of one specific end-to-end run,
+as a reference point for checking the harness against it. It is not a description
+of how every deployment is configured — in particular the KV bucket pin is that
+run's, not a default. The run it mirrors:
+
+```bash
+LAYOUT_SOLVER=greedy SPYRE_NUM_CPUS=8 SPYRE_ATTN_KV_BUCKETS=2048 \
+uv run --no-sync vllm bench latency \
+    --model ibm-granite/granite-3.3-8b-instruct \
+    --input-len 1984 --output-len 64 --batch-size 4 \
+    --num-iters-warmup 2 --num-iters 1 --max-model-len 2048 \
+    --profile --profiler-config.profiler=torch \
+    --profiler-config.torch_profiler_dir=<dir> \
+    --profiler-config.torch_profiler_use_gzip=false \
+    --profiler-config.torch_profiler_record_shapes=true
+```
+
+Add `SPYRE_ATTN_PROFILING=1` to label the `spyre_attn::*` spans in that trace, and
+`SPYRE_BATCHED_DECODE=1` to make it take the batched decode path.
 
 ### Which scope to measure
 
 ```bash
---span layer              # KV write + attention, the whole emulated layer
+--span layer              # default: KV write + attention, the whole emulated layer
 --span forward            # SpyreAttentionImpl.forward
---span online_softmax     # _online_softmax_attention (default)
---span reshape_and_cache   # the KV write alone; needs --kv-write
+--span online_softmax     # _online_softmax_attention
+--span reshape_and_cache  # the KV write alone; needs --kv-write
 ```
 
 `layer` and `reshape_and_cache` are emitted by this harness. `forward` and
 `online_softmax` come from `spyre_attn` itself.
 
-**Prefer `--span layer`.** It is the only span that closes after a device
-synchronisation, so it provably contains every kernel's start; see Attribution.
+`layer` is the default because it is the only span that closes after a device
+synchronisation, so it provably contains every kernel's start. The leaf spans can
+drop a kernel and under-report; see Attribution. Use them to apportion cost within
+a layer, once `layer` has told you the total.
 
 ## What the harness emulates
 
@@ -101,6 +120,11 @@ The batched decode kernel needs the `batched_decode_compiled` variant, which set
 variant in one run). It also needs `num_decode_seqs >= 4`, a compiled build, and a
 resolvable sequence/blocks bucket pair.
 
+The batch axis is bucketed onto powers of two from 4 up to `max_num_seqs`, so
+setting `max_num_seqs` sets the top of the ladder and the largest batch worth
+capturing: `granite33_8b_batched_decode.json` uses 32 and sweeps 4/8/16/32.
+`num_blocks` then has to hold every sequence's pages at that batch size.
+
 When the gate declines, the impl silently falls back to the per-seq loop. The
 `attn_path` column records which path actually ran, and a declined gate sets
 `error`, so a per-seq measurement cannot be read as a batched one.
@@ -130,7 +154,10 @@ Both lower onto the same `(query_lens, seq_lens)` path.
 ]
 ```
 
-`query_lens_rle` / `seq_lens_rle` accept `[[value, count], ...]` for wide batches.
+`query_lens_rle` / `seq_lens_rle` are the same two fields run-length encoded, for
+batches too wide to spell out: each `[value, count]` pair expands to `count`
+repeats of `value`, so `"seq_lens_rle": [[2048, 32]]` is 32 sequences of 2048.
+Give one form or the other, not both.
 
 **Cartesian grid** — `batch_size × sequence_length × decode_share × prompt_pattern`:
 
@@ -212,7 +239,7 @@ time, which is why a batch of *n* sequences could read as the cost of *n-1*.
 Two mitigations:
 
 - The `layer` span closes after a device synchronisation, so every kernel has
-  started by then. Its total is exact; the leaf spans are not. Prefer it.
+  started by then. Its total is exact; the leaf spans are not. Hence the default.
 - `kernels_attributed` vs `kernels_expected` is checked on every row, and a
   mismatch sets `error`. A short attribution is visible rather than silent.
 

@@ -16,7 +16,7 @@
 """Micro-benchmark for the Spyre attention kernel via the torch profiler. See README.
 
     SPYRE_ATTN_PROFILING=1 .venv/bin/python3 scripts/microbench/spyre_attn_microbench.py \
-        --config scripts/microbench/configs/granite33_8b_bs64.json
+        --config scripts/microbench/configs/granite33_8b_e2e_ref.json
 """
 
 import argparse
@@ -418,7 +418,7 @@ def assert_span_present(prof, span):
         )
 
 
-def span_device_times(prof, span=SPANS["online_softmax"]):
+def span_device_times(prof, span=SPANS["layer"]):
     """Device time (us) attributed to `span`, and its memory-op subtotal.
 
     Kineto does not propagate device time to record_function parents and AIUPTI
@@ -464,7 +464,7 @@ def span_device_times(prof, span=SPANS["online_softmax"]):
     return total, mem, n_compute
 
 
-def span_cpu_time_us(prof, span=SPANS["online_softmax"]):
+def span_cpu_time_us(prof, span=SPANS["layer"]):
     for e in prof.events():
         if e.name == span:
             return e.time_range.elapsed_us()
@@ -529,7 +529,7 @@ def make_forward(inputs, num_query_heads, num_kv_heads, head_size, kv_write=Fals
     return run, output, impl
 
 
-def measure(run, iterations, span=SPANS["online_softmax"]):
+def measure(run, iterations, span=SPANS["layer"]):
     """Profile each forward in its own short window.
 
     The AIUPTI backend has a fixed trace-buffer pool and stops capturing once
@@ -637,7 +637,7 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
     max_kv = max(seq_lens)
     num_blocks = max(cfg["num_blocks"], (max_kv + block_size - 1) // block_size)
 
-    span = SPANS[cfg.get("span", "online_softmax")]
+    span = SPANS[cfg.get("span", "layer")]
     print(
         f"  {variant:26} bs={block_size:<4} {name:24} nreqs={len(query_lens)} "
         f"q={sum(query_lens)} kv={max_kv}",
@@ -945,7 +945,9 @@ def main():
         "--span",
         choices=sorted(SPANS),
         default=None,
-        help="record_function scope to attribute device time to (default: online_softmax)",
+        help="record_function scope to attribute device time to. Default 'layer' is the "
+        "whole emulated attention layer, and the only span that closes after a device "
+        "sync, so it is the only one whose total cannot silently drop a kernel.",
     )
     ap.add_argument(
         "--kv-write",
@@ -1011,7 +1013,7 @@ def main():
 
     entries = entries_from_config(cfg)
     limits = resolve_limits(cfg, entries)
-    sel_span = SPANS[cfg.get("span", "online_softmax")]
+    sel_span = SPANS[cfg.get("span", "layer")]
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     out_dir = Path(args.output_dir) / cfg.get("run_label", "run") / stamp
     if not args.no_output:

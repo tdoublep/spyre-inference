@@ -22,14 +22,14 @@
     {
       "name": "batched_decode_4seq",
       "capture_type": "decode",
-      "query_lens_rle": [[1, 4]],
-      "seq_lens_rle": [[2048, 4]]
+      "query_lens": [1, 1, 1, 1],
+      "seq_lens": [2048, 2048, 2048, 2048]
     },
     {
       "name": "batched_decode_8seq",
       "capture_type": "decode",
-      "query_lens_rle": [[1, 8]],
-      "seq_lens_rle": [[2048, 8]]
+      "query_lens": [1, 1, 1, 1, 1, 1, 1, 1],
+      "seq_lens": [2048, 2048, 2048, 2048, 2048, 2048, 2048, 2048]
     },
     {
       "name": "batched_decode_16seq",
