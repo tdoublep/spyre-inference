@@ -852,13 +852,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 if not isinstance(impl, SpyreAttentionImpl):
                     continue
                 builder = builders.get(layer_name)
-                if builder is None:
-                    logger.warning(
-                        "Layer %s has no Spyre attention metadata builder; its kernels "
-                        "will compile on first use instead.",
-                        layer_name,
-                    )
-                    continue
+                # A KV-cache layer on this impl is always in an attention group whose
+                # backend builds SpyreAttentionMetadataBuilder, so a miss is a wiring or
+                # ordering bug (recording before initialize_attn_backend), not a config.
+                assert builder is not None, (
+                    f"Layer {layer_name} has a Spyre attention impl and a KV cache but no "
+                    "Spyre metadata builder; initialize_attn_backend() must run first."
+                )
                 logger.info("Recording attention graphs for layer %s...", layer_name)
                 total += impl.record_graphs(layer, kv_cache, builder)
         logger.info(

@@ -1238,6 +1238,14 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         finally:
             torch._dynamo.config.accumulated_recompile_limit = prev_limit  # ty: ignore[invalid-assignment]
 
+        if recorded == 0 and variants:
+            # Recording nothing is a broken pass, not a degenerate bucket set: the
+            # fallback is a full Inductor compile on every shape mid-serving.
+            logger.warning_once(
+                "Recorded none of the %d attention variants; every shape will compile "
+                "on first use. The per-variant warnings above carry the reason.",
+                len(variants),
+            )
         logger.info(
             "Recorded %d/%d attention variants in %.2fs.",
             recorded,

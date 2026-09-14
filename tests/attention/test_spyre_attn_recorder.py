@@ -432,6 +432,21 @@ class TestRecordGraphs:
 
         assert recorded == calls["n"] - 1 == len(_recordable(bucketer)) - 1
 
+    def test_recording_nothing_warns(self, impl, kv_cache, builder, monkeypatch, caplog):
+        """A pass that records nothing degrades to first-use compiles; say so loudly."""
+        builder._attn_bucketer = make_bucketer()
+
+        def always_fails(*args, **kwargs):
+            raise RuntimeError("synthetic lowering failure")
+
+        monkeypatch.setattr(impl, "_record_one", always_fails)
+        _print_warning_once.cache_clear()
+
+        with caplog.at_level(logging.WARNING):
+            assert _record(impl, kv_cache, builder) == 0
+
+        assert "every shape will compile on first use" in caplog.text
+
 
 class TestRecompileLimit:
     def test_limit_is_raised_during_recording_and_restored(self, impl, kv_cache, builder):
