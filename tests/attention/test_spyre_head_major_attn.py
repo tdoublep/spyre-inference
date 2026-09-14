@@ -416,7 +416,9 @@ def test_head_major_scatter(
 
     get_current_vllm_config().cache_config.block_size = block_size
     impl = SpyreHeadMajorAttentionImpl(
-        num_heads=num_kv_heads, head_size=head_size, scale=head_size**-0.5,
+        num_heads=num_kv_heads,
+        head_size=head_size,
+        scale=head_size**-0.5,
         num_kv_heads=num_kv_heads,
     )
 

@@ -90,7 +90,8 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         self._attn_fn = _page_attn_compiled if self._compile_attn else page_attn_head_major_kernel
         self._decode_fn = _batched_decode_compiled
 
-        logger.debug_once("Using SpyreHeadMajorAttentionBackend with a head-major paged KV cache")
+        # info, not debug: this backend is opt-in, so a run should say which layout it got.
+        logger.info_once("Using SpyreHeadMajorAttentionBackend with a head-major paged KV cache")
 
     @classmethod
     def allocate_pages(
