@@ -12,18 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre ``Attention.forward``: the KV write is traced, the attention core stays opaque.
+"""Spyre ``Attention.forward``: the KV write is traced, and decode-only attention with it.
 
 ``install()``, called from the attention metadata builder, binds the forward below onto
 each eligible layer instance; every other ``Attention`` keeps upstream's forward and its
-``unified_kv_cache_update`` op. The core must stay opaque: its per-sequence Python loop
-cannot be captured with ``fullgraph=True``.
+``unified_kv_cache_update`` op.
+
+The general core stays opaque: its per-sequence Python loop cannot be captured with
+``fullgraph=True``. A decode-only batch on the batched decode kernel has no such loop, so
+when the step's ``BatchedDecodePlan`` is armed the kernel is traced inline instead.
 """
 
 import types
 import weakref
 from collections.abc import Iterable
-from typing import cast
+from typing import NamedTuple, cast
 
 import torch
 from vllm.logger import init_logger
@@ -31,7 +34,9 @@ from vllm.model_executor.layers.attention.attention import Attention
 from vllm.utils.torch_utils import _encode_layer_name
 from vllm.v1.attention.backend import AttentionType
 
+from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.attention.batched_decode_plan import BatchedDecodePlan
 
 logger = init_logger(__name__)
 
@@ -60,6 +65,11 @@ class SlotMapping:
             for layer in self._layers:
                 layer.impl.kv_slot_views(layer.kv_cache)  # ty: ignore[possibly-missing-attribute]
         return self._device
+
+    @property
+    def device(self) -> torch.device | None:
+        """The KV cache's device, or None before ``bind_kv_cache``."""
+        return self._resolve_device()
 
     def publish(self, slot_mapping: torch.Tensor) -> None:
         """Mirror a step's host slot mapping to device for the traced write to read."""
@@ -90,6 +100,23 @@ def publish_null_slots(num_tokens: int) -> None:
         holder.publish_null(num_tokens)
 
 
+def _fit_rows(attn: torch.Tensor, rows: int) -> torch.Tensor:
+    """Reshape the kernel's ``[padded_num_seqs, ...]`` result to the block's row count.
+
+    The two counts round the same sequence count up on different ladders (the attention
+    bucketer's vs ``compile_sizes``), so either can be the larger. Rows past the batch
+    are padding the sampler never reads; zero is as good a filler as any. Both branches
+    resolve at trace time, so neither reaches the graph.
+    """
+    num_seqs = attn.shape[0]
+    if num_seqs == rows:
+        return attn
+    if num_seqs > rows:
+        return attn[:rows]
+    pad = torch.zeros((rows - num_seqs, *attn.shape[1:]), dtype=attn.dtype, device=attn.device)
+    return torch.cat([attn, pad], dim=0)
+
+
 def _spyre_attention_forward(
     self: Attention,
     query: torch.Tensor,
@@ -102,11 +129,9 @@ def _spyre_attention_forward(
         output_dtype = query.dtype
     if output_shape is None:
         output_shape = torch.Size((query.shape[0], self.num_heads * self.head_size_v))
-    output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
     hidden_size = output_shape[-1]
 
     query = query.view(-1, self.num_heads, self.head_size)
-    output = output.view(-1, self.num_heads, self.head_size_v)
     if key is not None:
         key = key.view(-1, self.num_kv_heads, self.head_size)
     if value is not None:
@@ -115,8 +140,9 @@ def _spyre_attention_forward(
     dep = None
     slots = cast(SlotMapping, self.spyre_slots).slots
     if slots is not None and key is not None and value is not None:
-        # `dep` makes "scatter before read" a real data dependency, which is otherwise
-        # invisible because the op reaches its cache through the forward context.
+        # The opaque call reaches its cache through the forward context, so `dep` is what
+        # makes "scatter before read" a data dependency. The fused path below needs no
+        # such prop: it reads the pages in the same graph that wrote them.
         dep = self.impl.do_kv_cache_update(self, key, value, self.kv_cache, slots)
 
     # Staged here, not in the impl: the copies are then traced into the block
@@ -124,6 +150,28 @@ def _spyre_attention_forward(
     staging = getattr(self.impl, "staging_buffers", None)
     buffers = staging(query.device) if staging is not None else None
     rows = query.shape[0]
+
+    plan = cast(BatchedDecodePlan, self.spyre_decode_plan)
+    if (
+        plan.armed
+        and self.spyre_fuse_decode
+        and buffers is not None
+        and output_dtype == query.dtype
+    ):
+        # Staging the query is load-bearing here, not shape hygiene: rotary embedding
+        # leaves its result a rank-4 buffer ([rows, heads, 2, head_size / 2]) and
+        # torch-spyre cannot project a layout from the gather's rank-3 output onto an
+        # argument of higher rank. The staging buffer is rank 3, so the gather reads
+        # rank 3. The output needs no such buffer -- in-graph the kernel's result is
+        # just a value, which is the copy and the program boundary this path saves.
+        q_staging, _ = buffers
+        q_staging[:rows] = query
+        attn = self.impl.fused_batched_decode(plan, q_staging, self.kv_cache)
+        return _fit_rows(attn, rows).reshape(-1, hidden_size)
+
+    output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
+    output = output.view(-1, self.num_heads, self.head_size_v)
+
     if buffers is None:
         q_in, out_buf = query, output
     else:
@@ -155,14 +203,41 @@ def _can_split(layer: Attention) -> bool:
     )
 
 
-def install(layers: Iterable[Attention]) -> SlotMapping:
-    """Opt eligible layers into the traced KV write; returns their shared slot holder."""
+def _can_fuse_decode(layer: Attention) -> bool:
+    """Whether a decode-only step can trace this layer's attention into the block graph.
+
+    ``head_size_v`` must equal ``head_size``: the fused path returns the kernel's result
+    as the layer's output, and a narrower value axis reshapes to the wrong row count
+    instead of failing.
+    """
+    return (
+        getattr(layer.impl, "supports_fused_decode", False) and layer.head_size == layer.head_size_v
+    )
+
+
+class StepHolders(NamedTuple):
+    """The per-step state the patched forward reads from inside the block graph."""
+
+    slots: SlotMapping
+    decode_plan: BatchedDecodePlan
+
+
+def install(layers: Iterable[Attention]) -> StepHolders:
+    """Opt eligible layers into the traced KV write; returns their shared per-step state."""
     split = [layer for layer in layers if _can_split(layer)]
     slot_mapping = SlotMapping(split)
     _holders.add(slot_mapping)
+    decode_plan = BatchedDecodePlan(
+        enabled=envs.SPYRE_BATCHED_DECODE and envs.SPYRE_FUSED_DECODE_ATTN
+    )
 
+    fusable = 0
     for layer in split:
         layer.spyre_slots = slot_mapping  # ty: ignore[invalid-assignment]
+        layer.spyre_decode_plan = decode_plan  # ty: ignore[invalid-assignment]
+        can_fuse = _can_fuse_decode(layer)
+        layer.spyre_fuse_decode = can_fuse  # ty: ignore[invalid-assignment]
+        fusable += can_fuse
         layer.forward = types.MethodType(  # ty: ignore[invalid-assignment]
             _spyre_attention_forward, layer
         )
@@ -172,4 +247,6 @@ def install(layers: Iterable[Attention]) -> SlotMapping:
             "Scattering the KV cache inside the outer graph for %d attention layers.",
             len(split),
         )
-    return slot_mapping
+    if decode_plan.enabled and fusable:
+        logger.info("Tracing decode-only attention into the outer graph for %d of them.", fusable)
+    return StepHolders(slots=slot_mapping, decode_plan=decode_plan)

@@ -91,7 +91,11 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     allocate_staging_buffers,
     mark_warmup_complete,
 )
-from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
+from spyre_inference.v1.attention.batched_decode_plan import BatchedDecodePlan, dummy_arm
+from spyre_inference.v1.attention.spyre_attn_bucketer import (
+    _MIN_BATCHED_SEQS,
+    SpyreAttnBucketer,
+)
 from spyre_inference.v1.pool import (
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
@@ -816,7 +820,87 @@ class TorchSpyreModelRunner(GPUModelRunner):
             time.time() - t0,
             len(bucket_sizes),
         )
+        # Before _record_attention_graphs, which ends warmup by arming the late-compile
+        # warning; these dummy runs are still warmup.
+        self._record_fused_decode_graphs()
         self._record_attention_graphs(bucket_sizes)
+
+    @torch.inference_mode()
+    def _record_fused_decode_graphs(self) -> None:
+        """Trace the block graph once per fused decode-attention shape a run can reach.
+
+        The fused kernel's shape parameters are guards on the *block* graph, not on a
+        kernel of its own, so a shape first seen while serving costs an Inductor compile
+        per block. ``_dummy_run`` reaches the fused path without any attention metadata,
+        because the patched forward reads the armed plan rather than the metadata.
+        """
+        plans = self._decode_plans_to_record()
+        if not plans:
+            return
+        bucketer = self._resolve_builder_attn_bucketer()
+        if bucketer is None or self.spyre_shape_bucketer is None:
+            return
+
+        # Every (rows, num_seqs) pair a real decode batch can produce. Both round the
+        # same sequence count up, but on different ladders (``compile_sizes`` and the
+        # attention bucketer's), so neither implies the other.
+        shapes: set[tuple[int, int, int]] = set()
+        for n in range(_MIN_BATCHED_SEQS, self.max_num_reqs + 1):
+            rows = self.spyre_shape_bucketer.find_bucket(n)
+            num_seqs = bucketer.find_sequence_bucket(n)
+            if rows is None or num_seqs is None:
+                continue
+            for num_blocks in bucketer.num_blocks_buckets:
+                shapes.add((rows, num_seqs, num_blocks))
+        if not shapes:
+            return
+
+        logger.info("Recording %d fused decode attention block graphs...", len(shapes))
+        t0 = time.time()
+        with _set_spyre_compilation_settings(self.vllm_config):
+            for rows, num_seqs, num_blocks in sorted(shapes, reverse=True):
+                for plan, num_kv_heads in plans:
+                    dummy_arm(
+                        plan,
+                        num_seqs,
+                        num_blocks,
+                        num_kv_heads,
+                        bucketer.block_size,
+                        self._spyre_device,
+                    )
+                try:
+                    self._dummy_run(rows)
+                except Exception:
+                    logger.warning(
+                        "Fused decode graph (rows=%d, num_seqs=%d, num_blocks=%d) failed to "
+                        "record; it will compile on first use instead.",
+                        rows,
+                        num_seqs,
+                        num_blocks,
+                        exc_info=True,
+                    )
+        for plan, _ in plans:
+            plan.disarm()
+        logger.info(
+            "Fused decode attention recording complete: %d block graphs in %.3fs.",
+            len(shapes),
+            time.time() - t0,
+        )
+
+    def _decode_plans_to_record(self) -> list[tuple[BatchedDecodePlan, int]]:
+        """Each builder's fused-decode plan with the KV head count its mask needs.
+
+        One plan per builder, since ``attn_layer.install`` is called per builder over its
+        own layers; a dummy run traces them all at once, so all of them are armed.
+        """
+        out: list[tuple[BatchedDecodePlan, int]] = []
+        for group in self._attn_group_iterator():
+            for builder in group.metadata_builders:
+                plan = getattr(builder, "_decode_plan", None)
+                if plan is None or not getattr(builder, "_fuse_decode", False):
+                    continue
+                out.append((plan, builder.num_kv_heads))
+        return out
 
     @torch.inference_mode()
     def _record_attention_graphs(self, token_counts: list[int]) -> None:

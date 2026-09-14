@@ -1700,17 +1700,18 @@ def test_install_patches_layers_not_the_attention_class():
     decoder = _StubAttentionLayer(AttentionType.DECODER)
     encoder = _StubAttentionLayer(AttentionType.ENCODER_ONLY)
 
-    holder = attn_layer.install([decoder, encoder])
+    holders = attn_layer.install([decoder, encoder])
 
     assert Attention.forward is class_forward
-    assert decoder.spyre_slots is holder
+    assert decoder.spyre_slots is holders.slots
+    assert decoder.spyre_decode_plan is holders.decode_plan
     assert decoder.forward.__func__ is attn_layer._spyre_attention_forward
     assert not hasattr(encoder, "spyre_slots")
     assert not hasattr(encoder, "forward")
 
     # No cache bound, so there is no device to mirror onto and nothing to publish.
-    holder.publish_null(8)
-    assert holder.slots is None
+    holders.slots.publish_null(8)
+    assert holders.slots.slots is None
 
 
 @pytest.mark.parametrize(
@@ -2594,3 +2595,190 @@ def test_sliding_window_is_left_unpadded(default_vllm_config):
         [(7, 300)], block_size=64, sliding_window=128, max_num_blocks=_num_blocks_buckets()[-1]
     )
     assert metadata.padded_num_blocks is None
+
+
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+@pytest.mark.parametrize(
+    "configure_compilation",
+    [pytest.param("STOCK_TORCH_COMPILE", id="compile_stock")],
+    indirect=True,
+)
+def test_fused_decode_sees_this_step_kv_write(
+    default_vllm_config,
+    enable_batched_decode,
+    configure_device: str,
+    configure_compilation: str,
+) -> None:
+    """The in-graph scatter must be ordered before the in-graph page gather.
+
+    Nothing sequences the two but the storage the scatter's slot-major destination
+    shares with ``k_pages``, which only AOT autograd's synthetic-base handling makes
+    visible to Inductor. Were that to stop holding, the fused path would attend to the
+    previous step's KV, so this step's key and value are scaled up: a dropped scatter
+    then moves the softmax a long way rather than a rounding step.
+    """
+    from spyre_inference.v1.attention.batched_decode_plan import BatchedDecodePlan
+
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    num_seqs, block_size = _MIN_BATCHED_SEQS, 64
+    num_kv_heads, num_query_heads, head_size = 2, 4, 64
+    kv_len = block_size  # one block per sequence, so no block is padding
+    dtype = torch.float16
+    device = torch.device(configure_device)
+    scale = head_size**-0.5
+
+    n_pages = num_seqs + 1
+    k_pages_cpu = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=dtype)
+    v_pages_cpu = torch.randn(n_pages, block_size, num_kv_heads, head_size, dtype=dtype)
+    # Page 0 is vLLM's null block, so sequence s takes page s + 1.
+    block_table = torch.arange(1, num_seqs + 1, dtype=torch.int32).reshape(num_seqs, 1)
+    seq_lens = torch.full((num_seqs,), kv_len, dtype=torch.int32)
+    query_start_loc = torch.arange(num_seqs + 1, dtype=torch.int32)
+    slot_mapping = block_table[:, 0].to(torch.int64) * block_size + (kv_len - 1)
+
+    query = torch.randn(num_seqs, num_query_heads, head_size, dtype=dtype)
+    key = torch.randn(num_seqs, num_kv_heads, head_size, dtype=dtype) * 8.0
+    value = torch.randn(num_seqs, num_kv_heads, head_size, dtype=dtype) * 8.0
+
+    md = _build_metadata(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        block_size=block_size,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        block_table=block_table,
+        slot_mapping=slot_mapping,
+    )
+    assert md.padded_num_seqs is not None, "batched decode declined this decode-only batch"
+    assert md.blocks_per_chunk is not None
+
+    plan = BatchedDecodePlan(enabled=True)
+    plan.arm(
+        num_seqs=md.padded_num_seqs,
+        blocks_per_chunk=md.blocks_per_chunk,
+        block_size=block_size,
+        rep_row_ids_cpu=md.rep_row_ids_cpu,
+        chunk_page_ids_cpu=md.chunk_page_ids_cpu,
+        mask_by_chunk_cpu=md.mask_by_chunk_cpu,
+        device=device,
+    )
+    # The non-fused reference dispatches off the metadata, so point it at the same mirror.
+    md.rep_row_ids_dev = plan.rep_row_ids
+    md.chunk_page_ids_dev = plan.chunk_page_ids
+    md.mask_by_chunk_dev = plan.mask_by_chunk
+
+    q_dev = convert(query, device)
+    slots_dev = convert(slot_mapping, device)
+
+    def _fresh():
+        impl = SpyreAttentionImpl(
+            num_heads=num_query_heads,
+            head_size=head_size,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            kv_cache_dtype="auto",
+        )
+        cache = SpyrePagedKVCache(
+            k_pages=convert(k_pages_cpu.clone(), device),
+            v_pages=convert(v_pages_cpu.clone(), device),
+        )
+        # Slot-major views cannot be built inside a graph; see kv_slot_views.
+        impl.kv_slot_views(cache)
+        return impl, cache
+
+    def _reference(impl, cache) -> torch.Tensor:
+        out = convert(
+            torch.full((num_seqs, num_query_heads, head_size), float("nan"), dtype=dtype), device
+        )
+        impl._run_batched_decode_dispatch(q_dev, cache.k_pages, cache.v_pages, md, out)
+        return out.to("cpu").float()
+
+    # Scatter and attention in one graph: the path under test.
+    impl_a, cache_a = _fresh()
+    k_a, v_a = _fused_qkv_kv_views(query, key, value, device)
+
+    @torch.compile(backend="inductor", fullgraph=True, dynamic=False)
+    def _write_then_attend(impl, cache, q, k, v, slots):
+        impl.do_kv_cache_update(None, k, v, cache, slots)
+        return impl.fused_batched_decode(plan, q, cache)
+
+    fused = _write_then_attend(impl_a, cache_a, q_dev, k_a, v_a, slots_dev).to("cpu").float()
+
+    # Scatter in its own program, then attend: today's ordering.
+    impl_b, cache_b = _fresh()
+    k_b, v_b = _fused_qkv_kv_views(query, key, value, device)
+    impl_b.do_kv_cache_update(None, k_b, v_b, cache_b, slots_dev)
+    expected = _reference(impl_b, cache_b)
+
+    # Never scattered, i.e. what dropping the write would produce.
+    impl_c, cache_c = _fresh()
+    unwritten = _reference(impl_c, cache_c)
+
+    assert not torch.allclose(expected, unwritten, atol=1e-2), (
+        "this step's KV does not move the result, so the comparison below cannot detect "
+        "a dropped scatter; raise the key/value scale"
+    )
+    torch.testing.assert_close(fused, expected, atol=2e-2, rtol=2e-2)
+
+    del cache_a, cache_b, cache_c
+    import gc
+
+    gc.collect()
+
+
+def _plan_arm_kwargs(page_ids: torch.Tensor, block_size: int, blocks_per_chunk: int) -> dict:
+    entries = page_ids.shape[0]
+    return dict(
+        num_seqs=entries // blocks_per_chunk,
+        blocks_per_chunk=blocks_per_chunk,
+        block_size=block_size,
+        rep_row_ids_cpu=torch.zeros(entries, dtype=torch.int32),
+        chunk_page_ids_cpu=[page_ids],
+        mask_by_chunk_cpu=torch.zeros(1, entries * 2, 1, block_size, dtype=torch.float16),
+        device=torch.device("cpu"),
+    )
+
+
+def test_batched_decode_plan_expands_pages_to_slots() -> None:
+    """The fused kernel addresses the cache slot-major, so page ids become slot ids.
+
+    Getting this mapping wrong reads a whole block from the wrong place, which
+    ``test_fused_decode_sees_this_step_kv_write`` would also catch -- but only on a card.
+    """
+    from spyre_inference.v1.attention.batched_decode_plan import BatchedDecodePlan
+
+    torch.set_default_device("cpu")
+    block_size = 64
+    page_ids = torch.tensor([[3], [0], [7], [2], [5], [1], [4], [6]], dtype=torch.int32)
+
+    plan = BatchedDecodePlan(enabled=True)
+    plan.arm(**_plan_arm_kwargs(page_ids, block_size, blocks_per_chunk=2))
+
+    assert plan.armed
+    slots = plan.chunk_slot_ids[0]
+    assert slots.shape == (page_ids.shape[0], block_size)
+    assert slots.dtype == torch.int32
+    torch.testing.assert_close(
+        slots, page_ids * block_size + torch.arange(block_size, dtype=torch.int32)
+    )
+    # The page-major ids stay available for the non-fused dispatch.
+    torch.testing.assert_close(plan.chunk_page_ids[0], page_ids)
+
+    plan.disarm()
+    assert not plan.armed
+
+
+def test_batched_decode_plan_disabled_never_arms() -> None:
+    """With the env flag off, publishing a step must not send the graph down the fused path."""
+    from spyre_inference.v1.attention.batched_decode_plan import BatchedDecodePlan
+
+    torch.set_default_device("cpu")
+    plan = BatchedDecodePlan(enabled=False)
+    plan.arm(**_plan_arm_kwargs(torch.zeros(8, 1, dtype=torch.int32), 64, blocks_per_chunk=2))
+    assert not plan.armed
+    assert plan.chunk_slot_ids == []

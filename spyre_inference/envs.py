@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_BATCHED_DECODE: bool = False
+    SPYRE_FUSED_DECODE_ATTN: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
@@ -72,6 +73,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pending performance characterisation at small batch sizes (num_seqs <= 4).
     # Re-enable to measure the path or to restore it after calibration.
     "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "0"))),
+    # When "1" (default), decode-only batches that reach the batched decode kernel trace
+    # it into the transformer block's graph instead of dispatching through the opaque
+    # attention op, saving a device-program boundary per block per step. Only has an
+    # effect where SPYRE_BATCHED_DECODE already applies. "0" restores the opaque call.
+    "SPYRE_FUSED_DECODE_ATTN": lambda: bool(int(os.getenv("SPYRE_FUSED_DECODE_ATTN", "1"))),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.

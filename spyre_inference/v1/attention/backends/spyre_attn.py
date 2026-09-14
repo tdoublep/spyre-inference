@@ -42,6 +42,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention import attn_layer
+from spyre_inference.v1.attention.batched_decode_plan import BatchedDecodePlan, chunk_geometry
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.ops.layout import INT32_ELEMS_PER_STICK, stick_aligned_len
 from spyre_inference.v1.attention.ops.page_attn import alibi_tile_shape, page_attn_kernel
@@ -89,8 +90,6 @@ def _record_block(name: str):
     with torch.profiler.record_function(name):
         yield
 
-
-_SPYRE_CORE_COUNT = 32
 
 # mean/max decode block count: low means the batch pads short sequences up to a
 # much longer one. Calibrated from the crossover sweep; 0.0 disables.
@@ -387,8 +386,14 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self._zero_tiles: dict[int, torch.Tensor] = {}
 
         static_ctx = vllm_config.compilation_config.static_forward_context
-        self._slot_mapping = attn_layer.install(
+        self._slot_mapping, self._decode_plan = attn_layer.install(
             static_ctx[name] for name in layer_names if name in static_ctx
+        )
+        # The fused path is a graph, so it needs a compiled run and a batch with no
+        # prefill suffix for the traced kernel to cover every row.
+        self._fuse_decode = (
+            self._decode_plan.enabled
+            and vllm_config.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
         )
 
         # Owned here, not by the recorder, so a bucket build() can emit is
@@ -800,14 +805,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 # bucket round-up (which padding the denser ladder addresses instead).
                 decode_uniformity = (sum(decode_blocks) / num_decode_seqs) / max(decode_blocks)
                 padded_num_seqs = b_seqs
-                # Entries target the cores: fewer under-fills them, more than one
-                # stick's worth hits a backend axis-merge limit.
-                blocks_per_chunk = max(1, min(_SPYRE_CORE_COUNT // b_seqs, b_blocks))
-                # blocks_per_chunk need not divide b_blocks, so pad the block axis
-                # up to a whole chunk. Padding columns gather page 0 under an
-                # all--inf mask and contribute zero; chunk 0 still holds every real
-                # row's block 0, so the running max stays finite.
-                num_chunks = (b_blocks + blocks_per_chunk - 1) // blocks_per_chunk
+                # Chunk 0 still holds every real row's block 0, so the running max
+                # stays finite despite the padded columns.
+                blocks_per_chunk, num_chunks = chunk_geometry(b_seqs, b_blocks)
                 padded_batch_blocks = num_chunks * blocks_per_chunk
                 assert padded_batch_blocks >= b_blocks
                 entries = b_seqs * blocks_per_chunk
@@ -880,6 +880,39 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                     .contiguous()
                 )
 
+        # A batch with a prefill suffix keeps the opaque call: the traced kernel covers
+        # only the decode rows, and the suffix still needs the per-sequence loop.
+        rep_row_ids_dev = None
+        chunk_page_ids_dev = None
+        mask_by_chunk_dev = None
+        device = self._slot_mapping.device
+        if (
+            self._fuse_decode
+            and padded_num_seqs is not None
+            and num_decode_seqs == num_seqs
+            and device is not None
+        ):
+            assert rep_row_ids_cpu is not None
+            assert chunk_page_ids_cpu is not None
+            assert mask_by_chunk_cpu is not None
+            assert blocks_per_chunk is not None
+            self._decode_plan.arm(
+                num_seqs=padded_num_seqs,
+                blocks_per_chunk=blocks_per_chunk,
+                block_size=block_size,
+                rep_row_ids_cpu=rep_row_ids_cpu,
+                chunk_page_ids_cpu=chunk_page_ids_cpu,
+                mask_by_chunk_cpu=mask_by_chunk_cpu,
+                device=device,
+            )
+            # Handed to the metadata too, so a layer that declines to fuse (ALiBi) reads
+            # the same mirror rather than paying a second transfer of the same tensors.
+            rep_row_ids_dev = self._decode_plan.rep_row_ids
+            chunk_page_ids_dev = self._decode_plan.chunk_page_ids
+            mask_by_chunk_dev = self._decode_plan.mask_by_chunk
+        else:
+            self._decode_plan.disarm()
+
         return SpyreAttentionMetadata(
             num_actual_tokens=common_attn_metadata.num_actual_tokens,
             num_seqs=common_attn_metadata.num_reqs,
@@ -907,6 +940,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
             rep_row_ids_cpu=rep_row_ids_cpu,
             chunk_page_ids_cpu=chunk_page_ids_cpu,
             mask_by_chunk_cpu=mask_by_chunk_cpu,
+            rep_row_ids_dev=rep_row_ids_dev,
+            chunk_page_ids_dev=chunk_page_ids_dev,
+            mask_by_chunk_dev=mask_by_chunk_dev,
         )
 
 
@@ -1046,6 +1082,12 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._decode_fn = _batched_decode_compiled
 
         self._kv_slots: SpyrePagedKVCache | None = None
+
+        # Read while tracing, so it must not depend on the step. ALiBi is excluded
+        # because the batched kernel does not implement it.
+        self.supports_fused_decode: bool = (
+            self._compile_attn and self.alibi_slopes is None and attn_type == AttentionType.DECODER
+        )
 
         # Constant for the run, so the kernel's arguments never carry the model
         # graph's token count. The +1 keeps every gather a strict subset: selecting
@@ -1363,6 +1405,46 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         # Only k_slots is returned, but Inductor fuses both index_copy_ calls into one
         # kernel, so ordering the read after it covers the V write too.
         return k_slots
+
+    def fused_batched_decode(
+        self,
+        plan: BatchedDecodePlan,
+        query: torch.Tensor,
+        kv_cache: SpyrePagedKVCache,
+    ) -> torch.Tensor:
+        """Batched decode as part of the caller's graph, returning ``[num_seqs, H, D]``.
+
+        Called from ``attn_layer`` inside the block's ``torch.compile`` region, so the
+        kernel is traced rather than dispatched: uncompiled on purpose, since wrapping it
+        in its own ``torch.compile`` is exactly the boundary this path removes.
+
+        Reads the cache through the same slot-major views ``do_kv_cache_update`` writes,
+        which is what orders this step's scatter before the gather. Handing it the
+        page-shaped tensor instead would make the two aliasing graph inputs, and the
+        synthetic base AOT autograd builds for those does not survive torch-spyre's
+        layout propagation. ``test_fused_decode_sees_this_step_kv_write`` pins the order.
+        """
+        assert plan.rep_row_ids is not None
+        assert plan.mask_by_chunk is not None
+        k_slots, v_slots = self.kv_slot_views(kv_cache)
+        return batched_decode_kernel(
+            query,
+            plan.rep_row_ids,
+            k_slots,
+            v_slots,
+            plan.chunk_slot_ids,
+            plan.mask_by_chunk,
+            self.scale,
+            plan.num_seqs,
+            plan.blocks_per_chunk,
+            self.num_kv_heads,
+            self.num_queries_per_kv,
+            plan.block_size,
+            self.head_size,
+            self.logits_soft_cap,
+            None,
+            slot_major=True,
+        )
 
     def _run_batched_decode_dispatch(
         self,

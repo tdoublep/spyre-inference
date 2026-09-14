@@ -33,6 +33,7 @@ def batched_decode_kernel(
     head_size,
     logits_soft_cap=0.0,
     out=None,
+    slot_major=False,
 ):
     """Batched decode kernel; gathers K/V and the query in-graph.
 
@@ -47,6 +48,12 @@ def batched_decode_kernel(
     [num_chunks, entries * KV, 1, block_size], pre-broadcast across KV heads by
     the builder. rep_row_ids: [entries] int32, each query row repeated
     blocks_per_chunk times. ``out`` None returns the result instead of storing it.
+
+    ``slot_major`` instead takes the cache slot-major -- [num_pages * block_size, KV, D],
+    the shape ``reshape_and_cache`` writes -- and per-chunk [entries, block_size] slot
+    ids. Same gather, addressed one slot at a time rather than one page at a time. The
+    fused path needs it: sharing the scatter's tensor is what orders the write before
+    this read, and the page-shaped alias of it does not survive layout propagation.
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
@@ -59,14 +66,19 @@ def batched_decode_kernel(
     tile_output = None
 
     for c, page_idx in enumerate(chunk_page_ids):
-        # Advanced indexing on a [entries, 1] index, not index_select on a 1-D
-        # one: behind a 1-D index the entry axis splits in whole 32-entry sticks,
-        # so a narrow gather gets one core. It costs the eager path, which
+        # Advanced indexing on a 2-D index, not index_select on a 1-D one: behind a
+        # 1-D index the entry axis splits in whole 32-entry sticks, so a narrow
+        # gather gets one core. It costs the eager path, which
         # _batched_decode_preconditions_met gives up.
         # Token-major cache page to head-major; a view, so do not add
         # .contiguous() -- merging these axes is what materializes the page.
-        k_page = k_pages[page_idx].squeeze(1).permute(0, 2, 1, 3)
-        v_page = v_pages[page_idx].squeeze(1).permute(0, 2, 1, 3)
+        if slot_major:
+            # [entries, block_size] slot ids already select the block's tokens.
+            k_page = k_pages[page_idx].permute(0, 2, 1, 3)
+            v_page = v_pages[page_idx].permute(0, 2, 1, 3)
+        else:
+            k_page = k_pages[page_idx].squeeze(1).permute(0, 2, 1, 3)
+            v_page = v_pages[page_idx].squeeze(1).permute(0, 2, 1, 3)
         # Builder already broadcast across KV heads; split them back out.
         mask_tile = mask_by_chunk[c].reshape(entries, num_kv_heads, 1, block_size)
 
