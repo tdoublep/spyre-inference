@@ -6,10 +6,6 @@
   "head_size": 128,
   "block_size": 128,
   "num_blocks": 65,
-  "max_model_len": 2048,
-  "max_num_batched_tokens": 512,
-  "max_num_seqs": 4,
-  "attn_kv_buckets": "2048",
   "seed": 0,
   "warmup": 2,
   "iterations": 10,
@@ -20,52 +16,71 @@
   ],
   "capture_batches": [
     {
-      "name": "prefill_chunk0",
+      "name": "prefill_chunk",
       "capture_type": "prefill",
-      "query_lens": [512],
-      "seq_lens": [512]
-    },
-    {
-      "name": "prefill_chunk1",
-      "capture_type": "prefill",
-      "query_lens": [512],
-      "seq_lens": [1024]
-    },
-    {
-      "name": "prefill_chunk2",
-      "capture_type": "prefill",
-      "query_lens": [512],
-      "seq_lens": [1536]
-    },
-    {
-      "name": "prefill_chunk3",
-      "capture_type": "prefill",
-      "query_lens": [448],
-      "seq_lens": [1984]
+      "query_lens": [
+        512
+      ],
+      "seq_lens": [
+        2048
+      ],
+      "extra_cols": {
+        "real_seq_lens": "512,1024,1536,1984",
+        "real_query_lens": "512,512,512,448"
+      }
     },
     {
       "name": "decode_1seq",
       "capture_type": "decode",
-      "query_lens": [1],
-      "seq_lens": [2048]
+      "query_lens": [
+        1
+      ],
+      "seq_lens": [
+        2048
+      ]
     },
     {
       "name": "decode_2seq",
       "capture_type": "decode",
-      "query_lens": [1, 1],
-      "seq_lens": [2048, 2048]
+      "query_lens": [
+        1,
+        1
+      ],
+      "seq_lens": [
+        2048,
+        2048
+      ]
     },
     {
       "name": "decode_4seq",
       "capture_type": "decode",
-      "query_lens": [1, 1, 1, 1],
-      "seq_lens": [2048, 2048, 2048, 2048]
+      "query_lens": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "seq_lens": [
+        2048,
+        2048,
+        2048,
+        2048
+      ]
     },
     {
       "name": "mixed_1decode_1chunk",
       "capture_type": "mixed",
-      "query_lens": [1, 511],
-      "seq_lens": [2048, 1024]
+      "query_lens": [
+        1,
+        511
+      ],
+      "seq_lens": [
+        2048,
+        2048
+      ],
+      "extra_cols": {
+        "real_seq_lens": "2048,1024"
+      }
     }
   ],
   "block_sizes": [
