@@ -1298,7 +1298,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             padded_query_len=attn_metadata.aligned_query_lens[0],
         )
         # Several requested buckets realize onto one kernel: a sliding window leaves
-        # the block count unpadded.
+        # the block count unpadded. Without a window build() rounds onto the bucketer's
+        # own buckets, so a mismatch means the two have drifted and dispatch can ask
+        # for a kernel warmup never recorded.
+        if realized != bucket and builder.sliding_window is None:
+            logger.warning(
+                "Attention variant %s realized as %s without a sliding window; the "
+                "bucketer and build() have diverged and some shapes will compile on "
+                "first use.",
+                bucket,
+                realized,
+            )
         if realized in recorded:
             return None
 

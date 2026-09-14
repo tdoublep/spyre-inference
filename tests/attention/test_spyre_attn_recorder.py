@@ -222,6 +222,28 @@ class TestRecordGraphs:
             )
         assert compiles() == snapshot
 
+    def test_collapsing_without_a_sliding_window_warns(
+        self, impl, kv_cache, builder, caplog, monkeypatch
+    ):
+        """Without a window every bucket must realize onto itself; drift is a bug."""
+        builder._attn_bucketer = make_bucketer()
+        monkeypatch.setattr(builder, "_pad_num_blocks", lambda n: min(n * 2, NUM_PAGES) if n else 0)
+
+        with caplog.at_level(logging.WARNING):
+            _record(impl, kv_cache, builder)
+
+        assert "bucketer and build() have diverged" in caplog.text
+
+    def test_collapsing_with_a_sliding_window_is_quiet(
+        self, impl, kv_cache, sliding_window_builder, caplog
+    ):
+        sliding_window_builder._attn_bucketer = make_bucketer()
+
+        with caplog.at_level(logging.WARNING):
+            _record(impl, kv_cache, sliding_window_builder)
+
+        assert "diverged" not in caplog.text
+
     def test_skips_variants_exceeding_the_page_allocation(self, impl, kv_cache, builder):
         """Buckets sized from max_model_len can outrun a small KV cache."""
         bucketer = builder._attn_bucketer = make_bucketer(max_model_len=4096)
