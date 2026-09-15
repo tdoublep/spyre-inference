@@ -236,7 +236,10 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
 
         # The folded kernel carries num_heads output units; lifting the cap for it
         # measured no difference, so it is left as is.
-        attn_fn = self._decode_attn_fn if padded_query_len == 1 else self._attn_fn
+        if padded_query_len == 1:
+            attn_fn, head_tables = self._decode_attn_fn, ()
+        else:
+            attn_fn, head_tables = self._attn_fn, (self._head_index_tables,)
 
         with _capped_cores(self.num_kv_heads * padded_query_len):
             return _call_kernel(
@@ -247,7 +250,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 k_folded,
                 v_folded,
                 index_table,
-                self._head_index_tables,
+                *head_tables,
                 mask_tiles,
                 self.scale,
                 num_blocks,
