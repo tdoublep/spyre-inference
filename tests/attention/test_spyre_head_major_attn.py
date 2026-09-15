@@ -833,6 +833,7 @@ def test_decode_fold_matches_unrolled():
             None,
         )
         unrolled = page_attn_head_major_kernel(*args)
-        folded = page_attn_head_major_decode_kernel(*args)
+        # The folded kernel needs no head gather, so it takes no head index tables.
+        folded = page_attn_head_major_decode_kernel(*args[:5], *args[6:])
         assert folded.shape == unrolled.shape
         torch.testing.assert_close(folded, unrolled, atol=1e-5, rtol=1e-5)

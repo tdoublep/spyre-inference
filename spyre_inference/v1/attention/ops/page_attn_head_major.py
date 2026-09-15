@@ -132,7 +132,6 @@ def page_attn_head_major_decode_kernel(
     k_pages,
     v_pages,
     kv_index_tables,
-    head_index_tables,
     mask_tiles,
     scale,
     num_blocks,
@@ -148,7 +147,8 @@ def page_attn_head_major_decode_kernel(
 
     Heads are kv-major, so the fold is a reshape: the page keeps a single batch dim, where
     the batched GQA form gives it a group axis Inductor clones it out to
-    (torch-spyre#4123). ``head_index_tables`` is unused for that reason.
+    (torch-spyre#4123). The fold needs no head gather, so this takes no head index tables:
+    passing them costs argument marshalling per call for tensors the graph never reads.
     """
     assert padded_query_len == 1, "decode kernel is specialized for a single query row"
     num_queries_per_kv = num_heads // num_kv_heads
