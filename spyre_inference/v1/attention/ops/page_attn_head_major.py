@@ -12,12 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Per-sequence paged attention over the KV cache."""
+"""Per-sequence paged attention over a head-major KV cache.
+
+A copy of ``page_attn.py``; the gathered page's shape is the only difference.
+"""
 
 import torch
 
 
-def page_attn_kernel(
+def page_attn_head_major_kernel(
     query,
     query_row_index,
     k_pages,
@@ -43,8 +46,8 @@ def page_attn_kernel(
         query: [num_tokens, num_heads, head_size], the whole batch's query
         query_row_index: int32 device tensor whose first padded_query_len
             entries are this sequence's absolute query rows.
-        k_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
-        v_pages: [num_blocks_total, block_size, num_kv_heads, head_size]
+        k_pages: [num_blocks_total, num_kv_heads, block_size, head_size]
+        v_pages: [num_blocks_total, num_kv_heads, block_size, head_size]
         page_index_table: [num_blocks, INT32_ELEMS_PER_STICK] int32 device
             tensor, row i holding the i-th active block's page index at
             column 0.
@@ -78,9 +81,9 @@ def page_attn_kernel(
         page_idx = page_index_table[i, 0:1]
         k_page = k_pages.index_select(0, page_idx)
         v_page = v_pages.index_select(0, page_idx)
-        # Token-major page to head-major for the matmuls; permutes on device.
-        k_page_4d = k_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
-        v_page_4d = v_page.squeeze(0).permute(1, 0, 2).unsqueeze(1)
+        # Already head-major: drop the gather axis and add the query-group axis.
+        k_page_4d = k_page.squeeze(0).unsqueeze(1)
+        v_page_4d = v_page.squeeze(0).unsqueeze(1)
 
         mask_tile = mask_tiles[i]
 
