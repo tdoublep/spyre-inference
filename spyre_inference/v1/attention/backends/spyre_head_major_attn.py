@@ -103,9 +103,10 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         """Head h of the token at ``block * block_size + offset`` lives at row
         ``(block * num_kv_heads + h) * block_size + offset``.
 
-        One offset-0 tensor per head, not rows of one ``[KV, T]`` tensor: a view's
-        storage offset is dropped on the way to the device (torch-spyre#3770), so sliced
-        rows store head 0's and then fault the device once T passes a stick.
+        One offset-0 tensor per head, not rows of one ``[KV, T]`` tensor: a view's storage
+        offset is dropped on the way to the device (torch-spyre#3770). That corruption is
+        shape-dependent — correct while a row fits one int32 stick, every head past it
+        silently wrong — so a short-token test passes while long prefill corrupts.
         """
         block = torch.div(slot_mapping, self.block_size, rounding_mode="floor")
         base = block * self.num_kv_heads * self.block_size + slot_mapping % self.block_size

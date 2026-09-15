@@ -38,6 +38,9 @@ from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
     SpyreHeadMajorAttentionBackend,
     SpyreHeadMajorAttentionImpl,
 )
+from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
+    reshape_and_cache_head_major_kernel,
+)
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 from tests.attention.test_spyre_attn import (
     _alibi_slopes,
@@ -434,6 +437,52 @@ def test_head_major_scatter(
     if configure_device == "spyre":
         del k_actual, v_actual, kv_cache
         gc.collect()
+
+
+@pytest.mark.parametrize("num_kv_heads", [1, 4, 8])
+@pytest.mark.parametrize(
+    "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
+)
+def test_head_major_store_fuses_to_one_kernel(default_vllm_config, num_kv_heads, configure_device):
+    """The per-head stores must lower to a single kernel, whatever the head count.
+
+    ``attn_layer`` orders the attention read after the store by taking the returned K
+    view as its dependency, but the store writes 2 * num_kv_heads times and returns only
+    ``k_rows``: a partial fusion would leave the V writes and the later heads unordered,
+    which is a read-before-write race rather than a slowdown.
+    """
+    import torch._inductor.metrics as inductor_metrics
+
+    set_random_seed(0)
+    block_size, head_size, num_blocks, num_tokens = 64, 128, 32, 8
+    cache_device = torch.device(configure_device)
+
+    k_pages, v_pages = _fresh_pages(num_blocks, num_kv_heads, block_size, head_size, cache_device)
+    key = convert(torch.randn(num_tokens, num_kv_heads, head_size, dtype=DTYPE), cache_device)
+    value = convert(torch.randn(num_tokens, num_kv_heads, head_size, dtype=DTYPE), cache_device)
+    slots = torch.arange(num_tokens, dtype=torch.int64)
+    base = torch.div(slots, block_size, rounding_mode="floor") * num_kv_heads * block_size
+    rows = [
+        convert(base + slots % block_size + h * block_size, cache_device)
+        for h in range(num_kv_heads)
+    ]
+
+    # Its own compile, so the count covers this store alone rather than an artifact a
+    # previous test already built.
+    torch._dynamo.reset()
+    store = torch.compile(reshape_and_cache_head_major_kernel, dynamic=False)
+    inductor_metrics.reset()
+    store(key, value, k_pages.view(-1, head_size), v_pages.view(-1, head_size), rows)
+
+    assert inductor_metrics.generated_kernel_count == 1, (
+        f"the head-major store lowered to {inductor_metrics.generated_kernel_count} kernels "
+        f"at num_kv_heads={num_kv_heads}; only a fully fused store keeps the returned K "
+        "view a dependency for every write"
+    )
+
+    del k_pages, v_pages
+    gc.collect()
+    torch._dynamo.reset()
 
 
 _SHAPES = [

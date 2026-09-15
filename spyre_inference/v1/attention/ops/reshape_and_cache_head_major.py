@@ -24,8 +24,9 @@ def reshape_and_cache_head_major_kernel(key, value, k_rows, v_rows, row_index):
     """
     # `key` is a strided view of the fused QKV projection, and the per-head slice of one
     # stores wrong values on device, so the source has to be materialized. Not
-    # contiguous()/clone(): at one token the view is *flagged* contiguous at a nonzero
-    # storage offset, so both are elided. An elementwise pass is a real device op.
+    # contiguous(): at one token the view already reports contiguous, so it is a no-op.
+    # clone() does copy to offset zero, but did not fix it here either, for reasons not
+    # established; an elementwise pass is a real device op and does.
     key = key * 1.0
     value = value * 1.0
     for h, idx in enumerate(row_index):
