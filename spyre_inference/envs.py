@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_KV_BUCKETS: str | None = None
     SPYRE_ATTN_QUERY_BUCKETS: str | None = None
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
+    SPYRE_ATTN_PREFILL_VARIANT: str = ""
     SPYRE_ATTN_KV_LAYOUT: str = "token_major"
     SPYRE_BATCHED_DECODE: bool = False
     SPYRE_KERNEL_CACHE: bool = False
@@ -69,6 +70,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Comma-separated num_seqs buckets for the batched decode kernel, unset uses the
     # default buckets of powers of two from 4 up to max_num_seqs.
     "SPYRE_ATTN_NUM_SEQS_BUCKETS": lambda: os.getenv("SPYRE_ATTN_NUM_SEQS_BUCKETS"),
+    # Experimental prefill attention formulation, "+"-separated tokens: "chunk<N>"
+    # for N KV pages per online-softmax step, "fold" to scale the query once instead
+    # of every score tile. Empty keeps the shipped per-page kernel.
+    "SPYRE_ATTN_PREFILL_VARIANT": lambda: os.getenv("SPYRE_ATTN_PREFILL_VARIANT", ""),
     # Which KV cache layout the decoder attention backend uses, within a page:
     #  - "token_major": [num_blocks, block_size, num_kv_heads, head_size] (default)
     #  - "head_major":  [num_blocks, num_kv_heads, block_size, head_size], which drops

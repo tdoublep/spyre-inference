@@ -49,6 +49,7 @@ from spyre_inference.v1.attention.ops.layout import (
     stick_aligned_len,
 )
 from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
+from spyre_inference.v1.attention.ops.prefill_opt import experimental_attn_fn
 from spyre_inference.v1.attention.ops.reshape_and_cache import reshape_and_cache_kernel
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     _MIN_BATCHED_SEQS,
@@ -1112,6 +1113,11 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._reshape_fn = torch.compile(reshape_and_cache_kernel, dynamic=False)
 
         self._attn_fn = _page_attn_compiled if self._compile_attn else page_attn_kernel
+        # Experimental prefill formulation, when SPYRE_ATTN_PREFILL_VARIANT asks for
+        # one. Same signature as the shipped kernel, so nothing else changes.
+        _experimental = experimental_attn_fn(False, self._compile_attn)
+        if _experimental is not None:
+            self._attn_fn = _experimental
         # Always the compiled variant: the 2-D page index lowers to aten.index,
         # which fails eager, so _batched_decode_preconditions_met declines the
         # whole path when self._compile_attn is False.

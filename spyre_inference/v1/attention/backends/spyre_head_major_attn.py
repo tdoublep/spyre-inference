@@ -40,6 +40,7 @@ from spyre_inference.v1.attention.ops.batched_decode_head_major import (
 )
 from spyre_inference.v1.attention.ops.layout import head_major_kv_layout
 from spyre_inference.v1.attention.ops.page_attn_head_major import page_attn_head_major_kernel
+from spyre_inference.v1.attention.ops.prefill_opt import experimental_attn_fn
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
     reshape_and_cache_head_major_kernel,
 )
@@ -80,6 +81,11 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
 
         self._reshape_fn = torch.compile(reshape_and_cache_head_major_kernel, dynamic=False)
         self._attn_fn = _page_attn_compiled if self._compile_attn else page_attn_head_major_kernel
+        # Experimental prefill formulation, when SPYRE_ATTN_PREFILL_VARIANT asks for
+        # one. Same signature as the shipped kernel, so nothing else changes.
+        _experimental = experimental_attn_fn(True, self._compile_attn)
+        if _experimental is not None:
+            self._attn_fn = _experimental
         self._decode_fn = _batched_decode_compiled
 
         logger.info_once("Using SpyreHeadMajorAttentionBackend with a head-major paged KV cache")

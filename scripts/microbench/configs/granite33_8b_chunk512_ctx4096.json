@@ -1,0 +1,31 @@
+{
+  "run_label": "granite33_8b_chunk512_ctx4096",
+  "model": "granite-3.3-8b-instruct",
+  "num_query_heads": 32,
+  "num_kv_heads": 8,
+  "head_size": 128,
+  "block_size": 128,
+  "num_blocks": 64,
+  "seed": 0,
+  "warmup": 2,
+  "iterations": 10,
+  "atol": 0.3,
+  "rtol": 0.2,
+  "variants": [
+    "online_softmax_compiled"
+  ],
+  "capture_batches": [
+    {
+      "name": "prefill_chunk512_ctx4096",
+      "capture_type": "prefill",
+      "query_lens": [512],
+      "seq_lens": [4096],
+      "extra_cols": {
+        "seqlen": 4096,
+        "decode_share": 0.0,
+        "chunked_prefill": true
+      }
+    }
+  ],
+  "block_sizes": [128]
+}

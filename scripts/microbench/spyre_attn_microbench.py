@@ -259,8 +259,15 @@ def build_inputs_from_requests(
     query = torch.randn(total_q, num_query_heads, head_size, dtype=DTYPE)
     key = torch.randn(total_q, num_kv_heads, head_size, dtype=DTYPE)
     value = torch.randn(total_q, num_kv_heads, head_size, dtype=DTYPE)
-    k_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=DTYPE)
-    v_pages_cpu = torch.zeros(num_blocks, block_size, num_kv_heads, head_size, dtype=DTYPE)
+    head_major = kv_layout == "head_major"
+    # The head-major backend advertises the kv-head axis ahead of the token axis.
+    cache_shape = (
+        (num_blocks, num_kv_heads, block_size, head_size)
+        if head_major
+        else (num_blocks, block_size, num_kv_heads, head_size)
+    )
+    k_pages_cpu = torch.zeros(cache_shape, dtype=DTYPE)
+    v_pages_cpu = torch.zeros(cache_shape, dtype=DTYPE)
 
     # Sample without replacement: an aliased page would let one sequence
     # overwrite another's KV and shrink the set of pages actually gathered.
@@ -279,16 +286,25 @@ def build_inputs_from_requests(
             hv = torch.randn(hist, num_kv_heads, head_size, dtype=DTYPE)
             for t in range(hist):
                 blk = block_tables[s, t // block_size].item()
-                k_pages_cpu[blk][t % block_size] = hk[t]
-                v_pages_cpu[blk][t % block_size] = hv[t]
+                off = t % block_size
+                if head_major:
+                    k_pages_cpu[blk, :, off] = hk[t]
+                    v_pages_cpu[blk, :, off] = hv[t]
+                else:
+                    k_pages_cpu[blk][off] = hk[t]
+                    v_pages_cpu[blk][off] = hv[t]
                 hist_slots.append(blk * block_size + t % block_size)
             hist_k.append(hk)
             hist_v.append(hv)
         for t in range(hist, kvl):
             blk = block_tables[s, t // block_size].item()
             off = t % block_size
-            k_pages_cpu[blk][off] = key[q_off + t - hist]
-            v_pages_cpu[blk][off] = value[q_off + t - hist]
+            if head_major:
+                k_pages_cpu[blk, :, off] = key[q_off + t - hist]
+                v_pages_cpu[blk, :, off] = value[q_off + t - hist]
+            else:
+                k_pages_cpu[blk][off] = key[q_off + t - hist]
+                v_pages_cpu[blk][off] = value[q_off + t - hist]
             slot_mapping.append(blk * block_size + off)
         q_off += ql
     slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64)
@@ -315,6 +331,14 @@ def build_inputs_from_requests(
         # device-side history write.
         if cache_device.type != "spyre" or kv_layout == "plain":
             return cache.to(cache_device)
+        if head_major:
+            from spyre_inference.v1.attention.ops.layout import head_major_kv_layout
+
+            nb, h, bsz, d = cache.shape
+            return cache.to(
+                cache_device,
+                device_layout=head_major_kv_layout(nb * h * bsz, d, cache.dtype),
+            )
         nb, bsz, h, d = cache.shape
         if kv_layout == "page_major":
             from torch_spyre._C import SpyreTensorLayout
@@ -363,6 +387,7 @@ def build_inputs_from_requests(
         "query_lens": list(query_lens),
         "seq_lens": list(seq_lens),
         "total_query_tokens": total_q,
+        "head_major": head_major,
     }
 
 
@@ -489,7 +514,15 @@ def make_forward(inputs, num_query_heads, num_kv_heads, head_size, kv_write=Fals
         SpyrePagedKVCache,
     )
 
-    impl = SpyreAttentionImpl(
+    impl_cls = SpyreAttentionImpl
+    if inputs.get("head_major"):
+        from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
+            SpyreHeadMajorAttentionImpl,
+        )
+
+        impl_cls = SpyreHeadMajorAttentionImpl
+
+    impl = impl_cls(
         num_heads=num_query_heads,
         head_size=head_size,
         scale=inputs["scale"],
@@ -736,10 +769,14 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         atol, rtol = cfg.get("atol", 0.3), cfg.get("rtol", 0.2)
         max_outliers = cfg.get("max_outliers", 5)
         got = output.to("cpu").float()
+        k_read, v_read = inputs["k_pages"].to("cpu"), inputs["v_pages"].to("cpu")
+        if inputs.get("head_major"):
+            # ref_attn indexes a page as [block_size, kv_heads, head_size].
+            k_read, v_read = k_read.transpose(1, 2), v_read.transpose(1, 2)
         ref = ref_attn(
             inputs["query_cpu"],
-            inputs["k_pages"].to("cpu"),
-            inputs["v_pages"].to("cpu"),
+            k_read,
+            v_read,
             inputs["query_lens"],
             inputs["seq_lens"],
             inputs["block_tables"],
@@ -947,13 +984,15 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument(
         "--kv-layout",
-        choices=["plain", "slot_major", "slot_major_devfill", "page_major"],
+        choices=["plain", "slot_major", "slot_major_devfill", "page_major", "head_major"],
         default=None,
         help="KV page device layout. 'slot_major_devfill' (default) matches the "
         "worker: zeroed slot-major alloc, history written on device. 'plain' is "
         "correct for a host-populated cache. 'slot_major' pins the worker layout "
         "on a host-populated cache and is numerically wrong. 'page_major' is an "
-        "index_select layout/SDSC probe.",
+        "index_select layout/SDSC probe. 'head_major' is the "
+        "[blocks, kv_heads, block_size, head_size] cache of "
+        "SpyreHeadMajorAttentionBackend, and switches the impl with it.",
     )
     ap.add_argument(
         "--span",
