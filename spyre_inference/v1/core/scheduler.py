@@ -30,7 +30,13 @@ class TorchSpyreScheduler(Scheduler):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.max_num_partial_prefills = envs.SPYRE_MAX_NUM_PARTIAL_PREFILLS
+        # Pooling runners never decode, so there is no leftover chunk to avoid and
+        # serialising their prefills only gives up batching.
+        self.max_num_partial_prefills = (
+            0
+            if self.vllm_config.model_config.runner_type == "pooling"
+            else envs.SPYRE_MAX_NUM_PARTIAL_PREFILLS
+        )
 
     def schedule(self, *args, **kwargs) -> SchedulerOutput:
         if self.max_num_partial_prefills <= 0:

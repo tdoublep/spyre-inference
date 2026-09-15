@@ -79,7 +79,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_KERNEL_CACHE": lambda: os.getenv("SPYRE_KERNEL_CACHE", "0") == "1",
     # Maximum number of sequences allowed to prefill in the same batch. "1" (default)
     # serialises prefills, so a batch spends the whole token budget on one prompt
-    # instead of topping itself up with a short chunk of the next. "0" removes the cap.
+    # instead of topping itself up with a short chunk of the next. Any non-positive
+    # value removes the cap, as does a pooling runner, which never decodes.
     "SPYRE_MAX_NUM_PARTIAL_PREFILLS": lambda: int(os.getenv("SPYRE_MAX_NUM_PARTIAL_PREFILLS", "1")),
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
