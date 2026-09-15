@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LAYOUT: str = "token_major"
     SPYRE_ATTN_MAX_CORES: int = 0
-    SPYRE_BATCHED_DECODE: bool = False
+    SPYRE_BATCHED_DECODE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
@@ -78,10 +78,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Core cap for the attention compile only, leaving the rest of the model on all 32.
     # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
-    # When "1", enables the batched multi-sequence decode kernel. Off by default
-    # pending performance characterisation at small batch sizes (num_seqs <= 4).
-    # Re-enable to measure the path or to restore it after calibration.
-    "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "0"))),
+    # When "1" (default), enables the batched multi-sequence decode kernel for
+    # batches of at least _MIN_BATCHED_SEQS sequences; smaller batches take the
+    # per-seq loop either way. "0" forces the loop for all batch sizes. Not
+    # available on the head-major KV layout, which has no batched kernel.
+    "SPYRE_BATCHED_DECODE": lambda: bool(int(os.getenv("SPYRE_BATCHED_DECODE", "1"))),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.
