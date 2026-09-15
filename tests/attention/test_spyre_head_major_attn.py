@@ -444,13 +444,8 @@ def test_head_major_scatter(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
 def test_head_major_store_fuses_to_one_kernel(default_vllm_config, num_kv_heads, configure_device):
-    """The per-head stores must lower to a single kernel, whatever the head count.
-
-    ``attn_layer`` orders the attention read after the store by taking the returned K
-    view as its dependency, but the store writes 2 * num_kv_heads times and returns only
-    ``k_rows``: a partial fusion would leave the V writes and the later heads unordered,
-    which is a read-before-write race rather than a slowdown.
-    """
+    """A partial fusion would leave the V writes and later heads outside the returned K
+    view ``attn_layer`` orders the read against: a race, not a slowdown."""
     import torch._inductor.metrics as inductor_metrics
 
     set_random_seed(0)
