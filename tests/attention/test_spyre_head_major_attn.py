@@ -42,13 +42,9 @@ from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
     reshape_and_cache_head_major_kernel,
 )
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
-from tests.attention.test_spyre_attn import (
-    _alibi_slopes,
-    _build_metadata,
-    _fused_qkv_kv_views,
-    assert_close_outliers,
-    ref_attn,
-)
+
+# The token-major suite's helpers are imported inside each user, not here: the upstream
+# job's rootdir spans two trees, so `tests` is not importable at collection time.
 
 pytestmark = pytest.mark.attention
 
@@ -146,6 +142,14 @@ def _run_head_major_attn_test(
     """
     if configure_compilation == "STOCK_TORCH_COMPILE" and configure_device == "cpu":
         pytest.skip("Compiled attention targets Spyre; Inductor CPU codegen is unsupported here.")
+
+    from tests.attention.test_spyre_attn import (
+        _alibi_slopes,
+        _build_metadata,
+        _fused_qkv_kv_views,
+        assert_close_outliers,
+        ref_attn,
+    )
 
     num_blocks = 256
     torch.set_default_device("cpu")
@@ -386,6 +390,8 @@ def test_head_major_scatter(
 
     from torch_spyre.ops.fallbacks import FallbackWarning
     from vllm.config import get_current_vllm_config
+
+    from tests.attention.test_spyre_attn import _fused_qkv_kv_views
 
     set_random_seed(0)
     num_tokens = len(block_indices)
@@ -669,6 +675,8 @@ def test_head_major_matches_token_major(
 ):
     """Both backends over the same logical KV must agree far more tightly than
     either agrees with the fp16 CPU reference: the layout is the only difference."""
+    from tests.attention.test_spyre_attn import _build_metadata, _fused_qkv_kv_views
+
     torch.set_default_device("cpu")
     set_random_seed(0)
 
