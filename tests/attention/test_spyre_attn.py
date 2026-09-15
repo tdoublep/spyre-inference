@@ -34,6 +34,10 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _mirror_mask_tiles,
 )
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
+from spyre_inference.v1.attention.ops.page_attn import (
+    page_attn_decode_kernel,
+    page_attn_kernel,
+)
 from spyre_inference.v1.attention.spyre_attn_bucketer import SpyreAttnBucketer
 
 pytestmark = pytest.mark.attention
@@ -470,14 +474,19 @@ def _run_spyre_attn_test(
     fused_calls: list[bool] = []
     dispatched_widths: set[int] = set()
     if expect_fused_store is not None or expect_query_widths is not None:
-        _real_attn_fn = attn_impl._attn_fn
 
-        def _spy_attn_fn(*a, **kw):
-            fused_calls.append(a[-1] is not None)
-            dispatched_widths.add(a[8])  # padded_query_len
-            return _real_attn_fn(*a, **kw)
+        def _spy(real):
+            def _spy_attn_fn(*a, **kw):
+                fused_calls.append(a[-1] is not None)
+                dispatched_widths.add(a[8])  # padded_query_len
+                return real(*a, **kw)
 
-        attn_impl._attn_fn = _spy_attn_fn
+            return _spy_attn_fn
+
+        # Both: decode dispatches its own kernel, so wrapping only _attn_fn would
+        # leave every query_len=1 call unobserved.
+        attn_impl._attn_fn = _spy(attn_impl._attn_fn)
+        attn_impl._decode_attn_fn = _spy(attn_impl._decode_attn_fn)
 
     # NaN, not empty_like: every row is expected to be written, so a store that
     # lands nowhere fails below instead of passing on whatever the allocator gave.
@@ -2594,3 +2603,78 @@ def test_sliding_window_is_left_unpadded(default_vllm_config):
         [(7, 300)], block_size=64, sliding_window=128, max_num_blocks=_num_blocks_buckets()[-1]
     )
     assert metadata.padded_num_blocks is None
+
+
+def _decode_fold_args(kv, qpk, d, block, blocks, soft_cap=0.0):
+    heads = kv * qpk
+    pages = blocks + 2
+    query = torch.randn(3, heads, d)
+    k = torch.randn(pages, block, kv, d)
+    v = torch.randn(pages, block, kv, d)
+    table = torch.zeros(blocks, 8, dtype=torch.int32)
+    table[:, 0] = torch.randperm(pages)[:blocks].to(torch.int32)
+    rows = torch.tensor([2, 2, 2], dtype=torch.int32)
+    masks = [torch.zeros(1, block) for _ in range(blocks)]
+    masks[-1][0, block // 2 :] = torch.finfo(torch.float32).min
+    return (
+        query,
+        rows,
+        k,
+        v,
+        table,
+        masks,
+        d**-0.5,
+        blocks,
+        1,
+        heads,
+        kv,
+        d,
+        soft_cap,
+        None,
+        None,
+    )
+
+
+@pytest.mark.parametrize(
+    "kv,qpk",
+    [
+        pytest.param(8, 4, id="gqa(kv=8,qpk=4)"),
+        pytest.param(8, 1, id="mha(kv=8,qpk=1)"),
+        pytest.param(1, 16, id="mqa(kv=1,qpk=16)"),
+    ],
+)
+@pytest.mark.parametrize(
+    "soft_cap",
+    [
+        pytest.param(0.0, id="plain"),
+        pytest.param(30.0, id="soft_cap"),
+    ],
+)
+def test_decode_fold_matches_unfolded(kv: int, qpk: int, soft_cap: float) -> None:
+    """The folded decode kernel is the 4-D one rebatched, so it must agree exactly."""
+    set_random_seed(0)
+    torch.set_default_device("cpu")
+    args = _decode_fold_args(kv, qpk, 128, 64, 5, soft_cap=soft_cap)
+    unfolded = page_attn_kernel(*args)
+    folded = page_attn_decode_kernel(*args)
+    assert folded.shape == unfolded.shape
+    torch.testing.assert_close(folded, unfolded, atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "fold,shares_kernel",
+    [
+        pytest.param("1", False, id="fold_on"),
+        pytest.param("0", True, id="fold_off"),
+    ],
+)
+def test_decode_fold_dispatch(default_vllm_config, monkeypatch, fold, shares_kernel) -> None:
+    """Decode picks the folded kernel; SPYRE_ATTN_DECODE_FOLD=0 restores the shared one.
+
+    One env value per test: ``envs`` caches on first read and the autouse cache-clearing
+    fixture in ``tests/conftest.py`` runs per test, so both values in one body would read
+    whichever was set first.
+    """
+    monkeypatch.setenv("SPYRE_ATTN_DECODE_FOLD", fold)
+    impl = SpyreAttentionImpl(num_heads=32, head_size=128, scale=128**-0.5, num_kv_heads=8)
+    assert (impl._decode_attn_fn is impl._attn_fn) is shares_kernel

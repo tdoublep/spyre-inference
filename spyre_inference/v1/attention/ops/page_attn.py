@@ -130,3 +130,83 @@ def page_attn_kernel(
         out.index_copy_(0, query_row_index[:padded_query_len], attn[:padded_query_len])
         return out
     return attn
+
+
+def page_attn_decode_kernel(
+    query,
+    query_row_index,
+    k_pages,
+    v_pages,
+    page_index_table,
+    mask_tiles,
+    scale,
+    num_blocks,
+    padded_query_len,
+    num_heads,
+    num_kv_heads,
+    head_size,
+    logits_soft_cap=0.0,
+    alibi_bias_tiles=None,
+    out=None,
+):
+    """Decode (Q=1) attention with the query groups folded into the row axis.
+
+    The 4-D GQA form of ``page_attn_kernel`` leaves each page a size-1 group axis for
+    the matmuls to broadcast over, and Inductor materializes that broadcast as a clone
+    per group (torch-spyre#4123). At one query row the group axis folds into the
+    matmul's row axis instead, so the page keeps a single batch dim and is read where
+    it lies. Same arguments and result as ``page_attn_kernel``, except that ALiBi keeps
+    that kernel: its bias tile carries the group axis this one folds away.
+    """
+    assert padded_query_len == 1, "decode kernel is specialized for a single query row"
+    assert alibi_bias_tiles is None, "ALiBi layers dispatch to page_attn_kernel"
+    num_queries_per_kv = num_heads // num_kv_heads
+
+    row = query_row_index[:1]
+    # Heads are kv-major, so the group fold is a reshape.
+    q = query.index_select(0, row).reshape(num_kv_heads, num_queries_per_kv, head_size)
+
+    tile_max = None
+    tile_sum = None
+    tile_output = None
+
+    for i in range(num_blocks):
+        page_idx = page_index_table[i, 0:1]
+        k_page = k_pages.index_select(0, page_idx).squeeze(0)
+        v_page = v_pages.index_select(0, page_idx).squeeze(0)
+        # Token-major page to the matmuls' operands; permutes on device.
+        k_page_t = k_page.permute(1, 2, 0)
+        v_page_3d = v_page.permute(1, 0, 2)
+
+        scores = torch.matmul(q, k_page_t) * scale
+        if logits_soft_cap > 0.0:
+            scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
+        # At one query row the mask is head-independent, so its [1, block_size] tile
+        # broadcasts across the folded group axis.
+        scores = scores + mask_tiles[i]
+        scores_max = torch.amax(scores, dim=-1, keepdim=True)
+
+        if i == 0:
+            tile_max = scores_max
+            tile_probs = torch.exp(scores - tile_max)
+            tile_output = torch.matmul(tile_probs, v_page_3d)
+            tile_sum = tile_probs.sum(dim=-1, keepdim=True)
+        else:
+            assert tile_max is not None
+            assert tile_sum is not None
+            assert tile_output is not None
+            new_max = torch.maximum(tile_max, scores_max)
+            rescale = torch.exp(tile_max - new_max)
+            tile_output = tile_output * rescale
+            tile_sum = tile_sum * rescale
+            tile_probs = torch.exp(scores - new_max)
+            tile_output = tile_output + torch.matmul(tile_probs, v_page_3d)
+            tile_sum = tile_sum + tile_probs.sum(dim=-1, keepdim=True)
+            tile_max = new_max
+
+    assert tile_output is not None and tile_sum is not None
+    attn = (tile_output / tile_sum).reshape(1, num_heads, head_size)
+    if out is not None:
+        out.index_copy_(0, row, attn)
+        return out
+    return attn

@@ -48,7 +48,10 @@ from spyre_inference.v1.attention.ops.layout import (
     slot_major_kv_layout,
     stick_aligned_len,
 )
-from spyre_inference.v1.attention.ops.page_attn import page_attn_kernel
+from spyre_inference.v1.attention.ops.page_attn import (
+    page_attn_decode_kernel,
+    page_attn_kernel,
+)
 from spyre_inference.v1.attention.ops.reshape_and_cache import reshape_and_cache_kernel
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     _MIN_BATCHED_SEQS,
@@ -175,6 +178,7 @@ def _build_query_row_tables(
 # Attention compiles separately from the model's fullgraph capture, which can't
 # hold the per-sequence Python loop around these.
 _page_attn_compiled = torch.compile(page_attn_kernel, dynamic=False)
+_page_attn_decode_compiled = torch.compile(page_attn_decode_kernel, dynamic=False)
 _batched_decode_compiled = torch.compile(batched_decode_kernel, dynamic=False)
 
 _warmup_complete = False
@@ -1112,6 +1116,13 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         self._reshape_fn = torch.compile(reshape_and_cache_kernel, dynamic=False)
 
         self._attn_fn = _page_attn_compiled if self._compile_attn else page_attn_kernel
+        self._decode_attn_fn = self._attn_fn
+        # ALiBi keeps the shared kernel: its bias tile carries the group axis the fold
+        # removes, and folding it fails to compile (torch-spyre "Incompatible host_size").
+        if envs.SPYRE_ATTN_DECODE_FOLD and self.alibi_slopes is None:
+            self._decode_attn_fn = (
+                _page_attn_decode_compiled if self._compile_attn else page_attn_decode_kernel
+            )
         # Always the compiled variant: the 2-D page index lowers to aten.index,
         # which fails eager, so _batched_decode_preconditions_met declines the
         # whole path when self._compile_attn is False.
@@ -1760,9 +1771,10 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             row_table = attn_metadata.query_row_tables[seq_idx]
 
             # Run attention on target device
+            padded_query_len = aligned_query_lens[seq_idx]
             result = _call_kernel(
                 "page attention",
-                self._attn_fn,
+                self._decode_attn_fn if padded_query_len == 1 else self._attn_fn,
                 q_staging,
                 row_table,
                 k_pages,
@@ -1771,7 +1783,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 mask_tiles,
                 self.scale,
                 len(active_bs),
-                aligned_query_lens[seq_idx],
+                padded_query_len,
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_size,

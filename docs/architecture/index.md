@@ -193,8 +193,19 @@ the write can scatter through a slot-major view of it:
 | 1. q → CPU | CPU | Bring `q` to CPU when its layout cannot be assembled on device; `k`/`v` stay put |
 | 2. Reshape & cache | Spyre | Scatter new K/V into the cache through a slot-major view: a token's destination is one index, so it is a single `index_copy_` per tensor |
 | 3. Per-sequence varlen loop | CPU | Iterate sequences via `query_start_loc`, pad `query_len` to its bucket |
-| 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, padded_query_len)` kernel: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V` |
+| 4. Online softmax over pages | Spyre | Compiled per `(num_blocks, padded_query_len)` kernel: `Q @ Kᵀ · scale` → optional soft-cap → `+ tile_mask` → online softmax → `@ V`. At `padded_query_len == 1` a separate kernel folds the query groups into the row axis (see below) |
 | 5. Write-back | CPU → Spyre | Stage each sequence's result into a CPU buffer, then one bulk copy into the Spyre output (per-token `spyre.overwrite` scatter doesn't scale) |
+
+Decode takes its own kernel. The general form gives the score matmul batch axes
+`(num_kv_heads, num_queries_per_kv)` while a page carries only `num_kv_heads`, so the
+page is broadcast over the group axis and Inductor materializes that as one clone per
+group (torch-spyre#4123). At a single query row the group axis folds into the matmul's
+row axis instead — `q` becomes `[num_kv_heads, num_queries_per_kv, head_size]` against a
+3-D `[num_kv_heads, block_size, head_size]` page — so the page keeps one batch dim and is
+read where it lies. The mask tile is head-independent at one query row, so it broadcasts
+across the folded axis unchanged. `SPYRE_ATTN_DECODE_FOLD=0` restores the shared kernel.
+The batched decode kernel is already in this form, since its per-sequence axis gives the
+page a matching batch dim.
 
 The compiled kernels themselves — the per-sequence page attention, the batched decode
 path, the KV store, and the cache's device layout — live under

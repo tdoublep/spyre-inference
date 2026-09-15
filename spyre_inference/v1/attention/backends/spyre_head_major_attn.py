@@ -80,6 +80,8 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
 
         self._reshape_fn = torch.compile(reshape_and_cache_head_major_kernel, dynamic=False)
         self._attn_fn = _page_attn_compiled if self._compile_attn else page_attn_head_major_kernel
+        # The decode fold is layout-specific; this layout has no folded kernel yet.
+        self._decode_attn_fn = self._attn_fn
         self._decode_fn = _batched_decode_compiled
 
         logger.info_once("Using SpyreHeadMajorAttentionBackend with a head-major paged KV cache")
