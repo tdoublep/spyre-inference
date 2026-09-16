@@ -90,6 +90,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     allocate_staging_buffers,
+    is_warmup_complete,
     mark_warmup_complete,
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
@@ -250,6 +251,32 @@ def _compile_granularity() -> str:
             f"Expected one of {SPYRE_COMPILE_GRANULARITIES}."
         )
     return granularity
+
+
+def skip_nondiff_dynamo_guards(vllm_config: VllmConfig) -> None:
+    """Stop re-checking the Dynamo guards that cannot change which variant runs.
+
+    Under ``dynamic=False`` every shape is its own cache entry, so unlike upstream
+    vLLM -- which drops guards outright, but only outside STOCK_TORCH_COMPILE -- we
+    cannot drop them all: they are what picks the entry. This keeps the
+    differentiating ones and drops the rest, which is sound only once warmup has
+    recorded every variant a run can reach.
+    """
+    if not envs.SPYRE_SKIP_GUARD_EVAL:
+        return
+    if (
+        vllm_config.model_config.enforce_eager
+        or vllm_config.compilation_config.mode is CompilationMode.NONE
+    ):
+        return
+    if not is_warmup_complete():
+        logger.warning(
+            "Not skipping Dynamo guard evaluation: warmup did not claim full variant "
+            "coverage, so a request may still need a shape no guard would catch."
+        )
+        return
+    torch.compiler.set_stance(skip_guard_eval_unsafe=True)
+    logger.info("Dynamo guard evaluation reduced to the differentiating guards.")
 
 
 def _block_sharing_defeated_by() -> str | None:

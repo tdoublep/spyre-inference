@@ -40,6 +40,7 @@ if TYPE_CHECKING:
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_NUM_CPUS: int = 0
+    SPYRE_SKIP_GUARD_EVAL: bool = False
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
 
 _cache: dict[str, Any] = {}
@@ -96,6 +97,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CPU budget used to size thread pools. "0" (default) auto-detects the budget
     # (cgroup CPU quota, then physical core count).
     "SPYRE_NUM_CPUS": lambda: int(os.getenv("SPYRE_NUM_CPUS", "0")),
+    # When "1", stop evaluating the Dynamo guards that cannot pick between compiled
+    # variants, once warmup has recorded every variant a run can reach; the guards that
+    # do pick are kept, so dispatch is unchanged. "0" (default) keeps every guard: the
+    # saving measured within run-to-run noise on a decode-bound request, because the
+    # attention kernel's guards are all tensor matches, which are the ones that pick.
+    # Worth re-measuring if its argument list shrinks (torch-spyre#3770).
+    "SPYRE_SKIP_GUARD_EVAL": lambda: bool(int(os.getenv("SPYRE_SKIP_GUARD_EVAL", "0"))),
     # When "1" (default), clamp the CPU threading env vars (OMP_NUM_THREADS and
     # friends) to the detected budget to avoid thread oversubscription in
     # CPU-limited containers. Set to "0" to leave them untouched and only warn.

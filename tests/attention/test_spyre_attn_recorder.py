@@ -732,3 +732,117 @@ class TestRecordBatchedDecode:
                     len(metadata.chunk_page_ids_cpu),
                 )
                 assert key in keys, f"num_seqs={num_seqs} kv_len={kv_len} realized {key}"
+
+
+class TestSkipGuardEval:
+    """``skip_nondiff_dynamo_guards`` must not change which recorded graph a shape reaches.
+
+    Dropping the guards that pick between variants would silently return another
+    variant's result, so every recorded variant is replayed with the stance on and
+    compared against the same call with every guard live.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _per_seq_only(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+        envs.clear_env_cache()
+        yield
+        # The stance is process-global; leaking it would silently change how every
+        # later test in this process dispatches.
+        torch.compiler.set_stance("default")
+        envs.clear_env_cache()
+
+    @pytest.fixture()
+    def seeded_cache(self):
+        """Non-zero pages: against a zero cache every variant returns the same thing
+        and a mis-picked graph would pass."""
+        shape = (NUM_PAGES, BLOCK_SIZE, NUM_KV_HEADS, HEAD_SIZE)
+        gen = torch.Generator().manual_seed(0)
+        return SpyrePagedKVCache(
+            k_pages=torch.randn(shape, dtype=torch.float16, generator=gen),
+            v_pages=torch.randn(shape, dtype=torch.float16, generator=gen),
+        )
+
+    @staticmethod
+    def _run(impl, bucket, kv_cache, builder):
+        attn_metadata = builder.build_for_variant(bucket)
+        q_staging, out_staging = impl._staging_buffers(kv_cache[0].device)
+        q_staging.normal_(generator=torch.Generator().manual_seed(bucket.num_blocks))
+        out_staging.zero_()
+        impl.forward(
+            MagicMock(), q_staging, q_staging, q_staging, kv_cache, attn_metadata, out_staging
+        )
+        return out_staging.clone()
+
+    def test_every_recorded_variant_still_reaches_its_own_graph(
+        self, impl, seeded_cache, builder
+    ):
+        bucketer = builder._attn_bucketer = make_bucketer()
+        variants = _recordable(bucketer)
+        assert len(variants) > 1, "one variant cannot show a mis-picked graph"
+
+        for bucket in variants:
+            self._run(impl, bucket, seeded_cache, builder)
+        reference = {b: self._run(impl, b, seeded_cache, builder) for b in variants}
+
+        torch.compiler.set_stance(skip_guard_eval_unsafe=True)
+        try:
+            # Reversed: a variant reached after the entries above it in the cache chain
+            # is the one a pruned guard would send to the wrong graph.
+            got = {b: self._run(impl, b, seeded_cache, builder) for b in reversed(variants)}
+        finally:
+            torch.compiler.set_stance("default")
+
+        for bucket in variants:
+            assert torch.equal(got[bucket], reference[bucket]), (
+                f"{bucket} reached a different graph with guard evaluation reduced"
+            )
+
+    @staticmethod
+    def _compiled_config():
+        config = MagicMock()
+        config.model_config.enforce_eager = False
+        config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+        return config
+
+    def test_skipping_is_declined_before_warmup_claims_coverage(self, monkeypatch, caplog):
+        from spyre_inference.v1.worker import spyre_model_runner
+
+        monkeypatch.setenv("SPYRE_SKIP_GUARD_EVAL", "1")
+        envs.clear_env_cache()
+        monkeypatch.setattr(spyre_model_runner, "is_warmup_complete", lambda: False)
+        with caplog.at_level(logging.WARNING):
+            spyre_model_runner.skip_nondiff_dynamo_guards(self._compiled_config())
+        assert not torch._dynamo.eval_frame._stance.skip_guard_eval_unsafe
+        assert "full variant coverage" in caplog.text
+
+    def test_flag_off_keeps_every_guard(self, monkeypatch):
+        from spyre_inference.v1.worker import spyre_model_runner
+
+        monkeypatch.setenv("SPYRE_SKIP_GUARD_EVAL", "0")
+        envs.clear_env_cache()
+        monkeypatch.setattr(spyre_model_runner, "is_warmup_complete", lambda: True)
+        spyre_model_runner.skip_nondiff_dynamo_guards(self._compiled_config())
+        assert not torch._dynamo.eval_frame._stance.skip_guard_eval_unsafe
+
+    def test_flag_on_enables_it(self, monkeypatch):
+        from spyre_inference.v1.worker import spyre_model_runner
+
+        monkeypatch.setenv("SPYRE_SKIP_GUARD_EVAL", "1")
+        envs.clear_env_cache()
+        monkeypatch.setattr(spyre_model_runner, "is_warmup_complete", lambda: True)
+        spyre_model_runner.skip_nondiff_dynamo_guards(self._compiled_config())
+        assert torch._dynamo.eval_frame._stance.skip_guard_eval_unsafe
+
+    def test_eager_is_a_no_op(self, monkeypatch):
+        from spyre_inference.v1.worker import spyre_model_runner
+
+        monkeypatch.setenv("SPYRE_SKIP_GUARD_EVAL", "1")
+        envs.clear_env_cache()
+        config = self._compiled_config()
+        config.model_config.enforce_eager = True
+        # is_warmup_complete() is False under eager, so reaching the coverage check
+        # would warn; the eager check must decline first, quietly.
+        monkeypatch.setattr(spyre_model_runner, "is_warmup_complete", lambda: False)
+        spyre_model_runner.skip_nondiff_dynamo_guards(config)
+        assert not torch._dynamo.eval_frame._stance.skip_guard_eval_unsafe
