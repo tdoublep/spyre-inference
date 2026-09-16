@@ -17,11 +17,12 @@
 Storing a page as ``[num_kv_heads, block_size, head_size]`` drops the permute the
 token-major kernels do before the matmuls, and pays for it in the KV write, whose
 per-token destinations are one head apart rather than contiguous. The cache is decomposed
-so a gathered page stays LX-resident; see ``page_attn_head_major``.
+so a gathered page stays LX-resident; see ``page_attn_head_major`` and, for the
+multi-sequence decode form, ``batched_decode_head_major``.
 
-Everything above the cache's memory is shared with ``spyre_attn``; the four places that
-touch it — advertised shape, allocation, kernel, store index — are duplicated rather
-than parameterised. This layout carries neither ALiBi nor batched decode.
+Everything above the cache's memory is shared with ``spyre_attn``; the places that touch
+it — advertised shape, allocation, kernels, index tables — are duplicated rather than
+parameterised. This layout does not carry ALiBi.
 """
 
 import contextlib
@@ -41,6 +42,9 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
     _call_kernel,
 )
+from spyre_inference.v1.attention.ops.batched_decode_head_major import (
+    batched_decode_head_major_kernel,
+)
 from spyre_inference.v1.attention.ops.layout import head_major_kv_layout
 from spyre_inference.v1.attention.ops.page_attn_head_major import (
     page_attn_head_major_decode_kernel,
@@ -56,6 +60,7 @@ logger = init_logger(__name__)
 # scope, and a shared artifact would guard on the page shape either way.
 _page_attn_compiled = torch.compile(page_attn_head_major_kernel, dynamic=False)
 _page_attn_decode_compiled = torch.compile(page_attn_head_major_decode_kernel, dynamic=False)
+_batched_decode_compiled = torch.compile(batched_decode_head_major_kernel, dynamic=False)
 
 _SPYRE_CORES = 32
 _LX_ATTN_CORES = 8
@@ -125,6 +130,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         # this leaves the rest of the model eager.
         self._attn_fn = _page_attn_compiled
         self._decode_attn_fn = _page_attn_decode_compiled
+        self._decode_fn = _batched_decode_compiled
         if self.alibi_slopes is not None:
             raise NotImplementedError(
                 "ALiBi is not supported on the head-major KV layout; use the default "
@@ -176,11 +182,6 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
         return self._kv_slots
 
-    def _batched_decode_supported(self) -> bool:
-        # No head-major batched decode kernel: it would gather whole pages from the
-        # unfolded cache, which this layout's decomposition does not serve.
-        return False
-
     def _folded_pages(self, k_pages: torch.Tensor, v_pages: torch.Tensor) -> SpyrePagedKVCache:
         """The cache as [pages * kv_head, block_size, head_size]; free under this layout."""
         if self._folded is None:
@@ -207,6 +208,58 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             ]
             for pages in tables_cpu
         ]
+
+    def build_chunk_index_tables(
+        self, attn_metadata: SpyreAttentionMetadata, device: torch.device
+    ) -> list[torch.Tensor]:
+        """Per chunk, an ``[entries * num_kv_heads, 1]`` table of that chunk's
+        ``page * num_kv_heads + kv`` rows, entry-major and kv-minor.
+
+        That order is the one the builder already broadcast ``mask_by_chunk`` in, so the
+        mask needs no reshaping of its own.
+        """
+        tables_cpu = attn_metadata.chunk_page_ids_cpu
+        assert tables_cpu is not None, "chunk_page_ids_cpu must come from the builder"
+        heads = torch.arange(self.num_kv_heads, dtype=torch.int32)
+        return [
+            convert((table * self.num_kv_heads + heads).reshape(-1, 1), device=device)
+            for table in tables_cpu
+        ]
+
+    def _run_batched_decode(
+        self,
+        query_dev: torch.Tensor,
+        rep_row_ids: torch.Tensor,
+        k_pages: torch.Tensor,
+        v_pages: torch.Tensor,
+        chunk_index_tables: list[torch.Tensor],
+        mask_by_chunk: torch.Tensor,
+        b_seqs: int,
+        blocks_per_chunk: int,
+        block_size: int,
+        out: torch.Tensor | None,
+    ) -> torch.Tensor:
+        k_folded, v_folded = self._folded_pages(k_pages, v_pages)
+        with _capped_cores(b_seqs * blocks_per_chunk * self.num_kv_heads):
+            return _call_kernel(
+                "batched decode attention",
+                self._decode_fn,
+                query_dev,
+                rep_row_ids,
+                k_folded,
+                v_folded,
+                chunk_index_tables,
+                mask_by_chunk,
+                self.scale,
+                b_seqs,
+                blocks_per_chunk,
+                self.num_kv_heads,
+                self.num_queries_per_kv,
+                block_size,
+                self.head_size,
+                self.logits_soft_cap,
+                out,
+            )
 
     def _run_page_attn(
         self,
