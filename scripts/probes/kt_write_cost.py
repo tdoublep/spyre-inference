@@ -98,6 +98,31 @@ def store_swapped(key, k_pages, block_ids, num_blocks, block_size, kv, head_size
     return k_pages.index_copy_(0, block_ids, pages)
 
 
+def store_swapped_late_mul(key, k_pages, block_ids, num_blocks, block_size, kv, head_size):
+    """As above, but the materializing pass runs after the permute, not before.
+
+    The head-major store already relies on an elementwise pass to force a real copy; doing
+    it on the permuted shape is the version that could land in the destination's layout.
+    """
+    pages = (
+        key.reshape(num_blocks, block_size, kv, head_size).permute(0, 2, 3, 1) * 1.0
+    ).reshape(num_blocks, kv, head_size, block_size)
+    return k_pages.index_copy_(0, block_ids, pages)
+
+
+def store_swapped_rowwise(key, k_rows, row_index, block_size, head_size):
+    """Per kv head, write the head's [head_size, block_size] tile as whole rows.
+
+    ``row_index`` is one [nblk * head_size] index per kv head into the
+    [pages * kv * head_size, block_size] view, so every copied row is contiguous in the
+    destination and only the source needs transposing.
+    """
+    for h, idx in enumerate(row_index):
+        tile = (key[:, h].transpose(0, 1) * 1.0).reshape(-1, block_size)
+        k_rows.index_copy_(0, idx, tile)
+    return k_rows
+
+
 def device_us(prof):
     return sum((getattr(e, "self_device_time_total", 0.0) or 0.0) for e in prof.key_averages())
 
@@ -127,19 +152,36 @@ try:
     )
 except Exception as e:  # noqa: BLE001
     print(f"token-major   FAILED: {type(e).__name__}: {str(e)[:200]}")
-try:
-    results["swapped"] = measure(
-        "swapped",
-        torch.compile(store_swapped, dynamic=False),
-        (key, k_swapped, block_ids, NBLK, B, KV, D),
+ref = key.cpu().reshape(NBLK, B, KV, D).permute(0, 2, 3, 1)
+# Rows of the [pages*kv*head_size, block_size] view: (block, h, d) -> d varies fastest.
+rows_t = [
+    (
+        (torch.arange(NBLK).reshape(NBLK, 1) * KV + h) * D + torch.arange(D).reshape(1, D)
     )
-    # Correctness: the swapped store must land the same values, transposed.
-    ref = key.cpu().reshape(NBLK, B, KV, D).permute(0, 2, 3, 1)
-    got = k_swapped.cpu()[:NBLK]
-    print(f"swapped store max abs diff vs source: {(got - ref).abs().max().item():.3e}")
-except Exception as e:  # noqa: BLE001
-    print(f"swapped       FAILED: {type(e).__name__}: {str(e)[:300]}")
+    .reshape(-1)
+    .to(torch.int64)
+    .to("spyre")
+    for h in range(KV)
+]
+for label, fn, args in (
+    ("swapped", store_swapped, (key, k_swapped, block_ids, NBLK, B, KV, D)),
+    ("swapped-late", store_swapped_late_mul, (key, k_swapped, block_ids, NBLK, B, KV, D)),
+    (
+        "swapped-rows",
+        store_swapped_rowwise,
+        (key, k_swapped.view(NUM_PAGES * KV * D, B), rows_t, B, D),
+    ),
+):
+    try:
+        k_swapped.zero_()
+        results[label] = measure(label, torch.compile(fn, dynamic=False), args)
+        got = k_swapped.cpu()[:NBLK]
+        print(f"  {label} max abs diff vs source: {(got - ref).abs().max().item():.3e}")
+    except Exception as e:  # noqa: BLE001
+        print(f"{label:14s} FAILED: {type(e).__name__}: {str(e)[:220]}")
 
-if "token-major" in results and "swapped" in results:
-    d = results["swapped"] - results["token-major"]
-    print(f"\nWRITE-DELTA {d:+.1f}us per layer ({100.0 * d / results['token-major']:+.1f}%)")
+base = results.get("token-major")
+for name in ("swapped", "swapped-late", "swapped-rows"):
+    if base and name in results:
+        d = results[name] - base
+        print(f"WRITE-DELTA {name}: {base:.1f} -> {results[name]:.1f}us ({d:+.1f}us per layer)")
