@@ -126,7 +126,12 @@ def convert(tensor, device=None, dtype=None, row_major=False):
     target_dtype = dtype if dtype is not None else tensor.dtype
     if tensor.device.type == target_device.type and tensor.dtype == target_dtype:
         return tensor
-    return torch.ops.vllm.spyre_convert(tensor, device, dtype, row_major)
+    return torch.ops.vllm.spyre_convert(
+        tensor,
+        device,  # ty: ignore[invalid-argument-type]
+        dtype,  # ty: ignore[invalid-argument-type]
+        row_major,  # ty: ignore[invalid-argument-type]
+    )
 
 
 @lru_cache(maxsize=1)
