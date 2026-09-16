@@ -865,9 +865,8 @@ def test_head_major_batched_decode_matches_fp32_reference(
 ) -> None:
     """The folded page gather feeds the same reduction the token-major kernel gets.
 
-    Card-free and in fp32, as its token-major twin: it pins the read and the
-    entry-major, kv-minor row order the builder's mask is already broadcast in, rather
-    than the fp16 tolerances the integration tests have to use.
+    Card-free and fp32, as its token-major twin: it pins the read and the entry-major,
+    kv-minor row order the mask is broadcast in, not the fp16 tolerances.
     """
     from tests.attention.test_spyre_attn import _decode_reference_fp32
 
@@ -1009,8 +1008,8 @@ def test_head_major_chunk_index_tables(default_vllm_config, configure_compilatio
 def batched_decode_calls(monkeypatch):
     """Pin ``SPYRE_BATCHED_DECODE`` on and count the batched dispatches.
 
-    Without the count a fall back to the per-seq loop still matches the reference, so
-    the tests below would pass while testing nothing.
+    A fall back to the per-seq loop still matches the reference, so without the count the
+    tests below would pass while testing nothing.
     """
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "1")
     calls: list[bool] = []
@@ -1054,8 +1053,8 @@ def test_head_major_batched_decode_correctness(
 ):
     """The batched decode kernel over folded pages, against the CPU reference.
 
-    Not bit-exact with the per-seq kernel and cannot be, for the reason the token-major
-    twin gives: the chunked reduction sums in a different order under one shared max.
+    Not bit-exact with the per-seq kernel and cannot be: the chunked reduction sums in a
+    different order under one shared max.
     """
     _run_head_major_attn_test(
         seq_lens=seq_lens,
@@ -1081,8 +1080,8 @@ def test_head_major_warmup_records_a_batched_decode_variant(
 ):
     """Warmup can trace this layout's batched kernel, so serving does not compile it.
 
-    One bucket, not the whole enumeration: the point is that the recorder reaches the
-    folded gather through builder-produced metadata, which is per-variant work.
+    One bucket, not the whole enumeration: what matters is that the recorder reaches the
+    folded gather through builder-produced metadata.
     """
     import sys
     from unittest.mock import MagicMock

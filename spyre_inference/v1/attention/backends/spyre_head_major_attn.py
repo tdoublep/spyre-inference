@@ -212,12 +212,8 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     def build_chunk_index_tables(
         self, attn_metadata: SpyreAttentionMetadata, device: torch.device
     ) -> list[torch.Tensor]:
-        """Per chunk, an ``[entries * num_kv_heads, 1]`` table of that chunk's
-        ``page * num_kv_heads + kv`` rows, entry-major and kv-minor.
-
-        That order is the one the builder already broadcast ``mask_by_chunk`` in, so the
-        mask needs no reshaping of its own.
-        """
+        """Per chunk, ``page * num_kv_heads + kv`` rows, entry-major and kv-minor -- the
+        order the builder already broadcast ``mask_by_chunk`` in."""
         tables_cpu = attn_metadata.chunk_page_ids_cpu
         assert tables_cpu is not None, "chunk_page_ids_cpu must come from the builder"
         heads = torch.arange(self.num_kv_heads, dtype=torch.int32)

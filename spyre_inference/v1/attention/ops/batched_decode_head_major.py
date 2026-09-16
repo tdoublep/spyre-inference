@@ -14,11 +14,9 @@
 
 """Batched multi-sequence decode over a head-major KV cache.
 
-The reduction is the token-major kernel's, chunk for chunk; only the page read differs.
-Gathering ``(page, kv_head)`` rows out of the cache folded to
-``[pages * kv, block_size, head_size]`` lands the page already head-major, so the
-permute the token-major kernel does per chunk disappears, and the gather's split stays on
-an axis ``probs @ V`` carries (see ``page_attn_head_major``).
+The reduction is ``batched_decode``'s, chunk for chunk; only the page read differs.
+Gathering ``(page, kv_head)`` rows out of the folded cache lands the page already
+head-major and keeps the gather's split on an axis ``probs @ V`` carries.
 """
 
 import torch
@@ -41,16 +39,13 @@ def batched_decode_head_major_kernel(
     logits_soft_cap=0.0,
     out=None,
 ):
-    """Batched decode over ``blocks_per_chunk`` blocks per sequence per chunk.
+    """Shapes as in ``batched_decode_kernel``, except:
 
-    Shapes as in ``batched_decode_kernel``, except:
-
-    k/v_pages: [num_pages_total * num_kv_heads, block_size, head_size], the cache folded
-    on (page, kv_head). chunk_row_ids: one [entries * num_kv_heads, 1] int32 tensor per
-    chunk, holding those entries' ``page * num_kv_heads + kv`` rows in entry-major,
-    kv-minor order -- which is the order ``mask_by_chunk`` is already broadcast in. One
-    tensor per chunk, not slices of one table: an index reaches the hardware as a tensor
-    argument, so a slice's nonzero storage offset is dropped (torch-spyre#3770).
+    k/v_pages: [num_pages_total * num_kv_heads, block_size, head_size]. chunk_row_ids: one
+    [entries * num_kv_heads, 1] int32 tensor per chunk of ``page * num_kv_heads + kv``
+    rows, entry-major and kv-minor, the order ``mask_by_chunk`` is broadcast in. One
+    tensor per chunk, not slices of one: a slice's storage offset is dropped
+    (torch-spyre#3770).
     """
     num_heads = num_kv_heads * num_queries_per_kv
     entries = num_seqs * blocks_per_chunk
@@ -63,10 +58,8 @@ def batched_decode_head_major_kernel(
     tile_output = None
 
     for c, rows in enumerate(chunk_row_ids):
-        # Subscripting, not index_select, for the reason page_attn_head_major gives: a
-        # 1-D index puts the entry axis on the index's own stick axis, splittable only in
-        # whole 32-entry sticks. It costs the eager path, which
-        # _batched_decode_preconditions_met gives up.
+        # Subscripting, not index_select: behind a 1-D index the entry axis splits only in
+        # whole 32-entry sticks. Costs the eager path, which the preconditions decline.
         k_page = k_pages[rows].reshape(entries, num_kv_heads, block_size, head_size)
         v_page = v_pages[rows].reshape(entries, num_kv_heads, block_size, head_size)
         # Builder already broadcast across KV heads; split them back out.
@@ -78,16 +71,14 @@ def batched_decode_head_major_kernel(
             # capping after it would un-mask the padded lanes.
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
         scores = scores + mask_tile
-        # Leading-axis split only: merging a permuted axis pair is what
-        # torch-spyre rejects.
+        # Leading-axis split only: torch-spyre rejects merging a permuted axis pair.
         sc = scores.reshape(
             num_seqs, blocks_per_chunk, num_kv_heads, num_queries_per_kv, block_size
         )
         chunk_max = torch.amax(torch.amax(sc, dim=-1, keepdim=True), dim=1, keepdim=True)
 
-        # The running max drives exp(), not the chunk's own: a chunk wholly past
-        # a sequence's length is -inf throughout and exp(-inf - -inf) is NaN.
-        # Every row has a valid block 0, so the chunk-0 max is finite.
+        # The running max drives exp(), not the chunk's own: a chunk wholly past a
+        # sequence's length is -inf throughout and exp(-inf - -inf) is NaN.
         if c == 0:
             new_max = chunk_max
         else:
@@ -121,8 +112,8 @@ def batched_decode_head_major_kernel(
     assert tile_output is not None and tile_sum is not None
     attn = (tile_output / tile_sum).reshape(num_seqs, num_heads, head_size)
     if out is not None:
-        # The destination prefix starts at offset 0, so torch-spyre#3770 does not
-        # apply; rows past the batch are don't-care and kept finite by the builder.
+        # Offset 0, so torch-spyre#3770 does not apply; rows past the batch are
+        # don't-care and kept finite by the builder.
         out[:num_seqs].copy_(attn)
         return out
     return attn

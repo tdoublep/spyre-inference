@@ -317,8 +317,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     rep_row_ids_cpu: torch.Tensor | None = None  # [entries] int32
     rep_row_ids_dev: torch.Tensor | None = None
     chunk_page_ids_cpu: list[torch.Tensor] | None = None  # num_chunks x [entries, 1] int32
-    # Device tables built from chunk_page_ids_cpu by build_chunk_index_tables, whose shape
-    # is the kernel's business (as with kernel_index_tables above).
+    # Built by build_chunk_index_tables, so the shape is the kernel's (as above).
     chunk_page_ids_dev: list[torch.Tensor] | None = None
     mask_by_chunk_cpu: torch.Tensor | None = None  # [num_chunks, entries * KV, 1, block] fp16
     mask_by_chunk_dev: torch.Tensor | None = None
