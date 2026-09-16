@@ -61,6 +61,42 @@ logger = init_logger(__name__)
 _page_attn_decode_compiled = torch.compile(page_attn_head_major_decode_kernel, dynamic=False)
 _page_attn_prefill_compiled = torch.compile(page_attn_head_major_prefill_kernel, dynamic=False)
 
+# Experimental prefill kernels, selected by SPYRE_ATTN_PREFILL_VARIANT for A/B measurement.
+def _select_prefill_kernel():
+    import functools
+    import os
+
+    from spyre_inference.v1.attention.ops import page_attn_head_major_prefill_variants as _v
+
+    name = os.environ.get("SPYRE_ATTN_PREFILL_VARIANT", "batched")
+    if name == "batched":
+        return _page_attn_prefill_compiled, False
+    base, _, flag = name.partition("+")
+    folded = base in ("foldkv", "batchedkv", "foldt")
+    fn = {
+        "fold": _v.page_attn_head_major_prefill_fold_kernel,
+        "hoist": _v.page_attn_head_major_prefill_hoist_kernel,
+        "slab": _v.page_attn_head_major_prefill_slab_kernel,
+        "mmpair": _v.page_attn_head_major_prefill_mmpair_kernel,
+        "qkonly": _v.page_attn_head_major_prefill_qkonly_kernel,
+        "nopv": _v.page_attn_head_major_prefill_nopv_kernel,
+        "foldkv": _v.page_attn_head_major_prefill_foldkv_kernel,
+        "batchedkv": _v.page_attn_head_major_prefill_batchedkv_kernel,
+        "batchedt": _v.page_attn_head_major_prefill_batchedt_kernel,
+        "foldt": _v.page_attn_head_major_prefill_foldt_kernel,
+        "slabb": _v.page_attn_head_major_prefill_slabb_kernel,
+        "qknotr": _v.page_attn_head_major_prefill_qknotr_kernel,
+    }[base]
+    if flag == "prescale":
+        fn = functools.partial(fn, prescale=True)
+    elif flag:
+        raise ValueError(f"unknown prefill variant flag {flag!r}")
+    logger.info("head-major prefill kernel: %s (folded cache: %s)", name, folded)
+    return torch.compile(fn, dynamic=False), folded
+
+
+_page_attn_prefill_selected, _prefill_wants_folded = _select_prefill_kernel()
+
 _SPYRE_CORES = 32
 _LX_ATTN_CORES = 8
 
@@ -242,15 +278,18 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         # Beyond one query token the page transfer LX residency saves is amortised over every
         # query row, and the unrolling it costs is not.
         if padded_query_len > 1:
+            pages = (
+                (k_folded, v_folded, kv_row_table)
+                if _prefill_wants_folded
+                else (k_pages, v_pages, page_table)
+            )
             with _capped_cores(self.num_kv_heads * padded_query_len):
                 return _call_kernel(
                     "page attention (prefill)",
-                    _page_attn_prefill_compiled,
+                    _page_attn_prefill_selected,
                     query,
                     row_table,
-                    k_pages,
-                    v_pages,
-                    page_table,
+                    *pages,
                     mask_tiles,
                     self.scale,
                     num_blocks,
