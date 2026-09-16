@@ -209,19 +209,6 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             for pages in tables_cpu
         ]
 
-    def build_chunk_index_tables(
-        self, attn_metadata: SpyreAttentionMetadata, device: torch.device
-    ) -> list[torch.Tensor]:
-        """Per chunk, ``page * num_kv_heads + kv`` rows, entry-major and kv-minor -- the
-        order the builder already broadcast ``mask_by_chunk`` in."""
-        tables_cpu = attn_metadata.chunk_page_ids_cpu
-        assert tables_cpu is not None, "chunk_page_ids_cpu must come from the builder"
-        heads = torch.arange(self.num_kv_heads, dtype=torch.int32)
-        return [
-            convert((table * self.num_kv_heads + heads).reshape(-1, 1), device=device)
-            for table in tables_cpu
-        ]
-
     def _run_batched_decode(
         self,
         query_dev: torch.Tensor,
@@ -235,15 +222,14 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         block_size: int,
         out: torch.Tensor | None,
     ) -> torch.Tensor:
-        k_folded, v_folded = self._folded_pages(k_pages, v_pages)
         with _capped_cores(b_seqs * blocks_per_chunk * self.num_kv_heads):
             return _call_kernel(
                 "batched decode attention",
                 self._decode_fn,
                 query_dev,
                 rep_row_ids,
-                k_folded,
-                v_folded,
+                k_pages,
+                v_pages,
                 chunk_index_tables,
                 mask_by_chunk,
                 self.scale,

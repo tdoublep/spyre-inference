@@ -863,7 +863,7 @@ def test_head_major_batched_decode_matches_fp32_reference(
     qpk: int,
     ragged: bool,
 ) -> None:
-    """The folded page gather feeds the same reduction the token-major kernel gets.
+    """The head-major page read feeds the same reduction the token-major kernel gets.
 
     Card-free and fp32, as its token-major twin: it pins the read and the entry-major,
     kv-minor row order the mask is broadcast in, not the fp16 tolerances.
@@ -899,12 +899,9 @@ def test_head_major_batched_decode_matches_fp32_reference(
 
     rep_row_ids = torch.arange(b_seqs, dtype=torch.int64).clamp(max=num_seqs - 1)
     rep_row_ids = rep_row_ids.repeat_interleave(bpc)
-    # What build_chunk_index_tables produces, in int64 for eager CPU indexing.
-    heads = torch.arange(num_kv_heads, dtype=torch.int64)
-    chunk_row_ids = [
-        (page_ids[:, c * bpc : (c + 1) * bpc].reshape(entries, 1) * num_kv_heads + heads)
-        .reshape(entries * num_kv_heads, 1)
-        .contiguous()
+    # One index row per page, in int64 for eager CPU indexing.
+    chunk_page_ids = [
+        page_ids[:, c * bpc : (c + 1) * bpc].reshape(entries, 1).contiguous()
         for c in range(num_chunks)
     ]
     mask_by_chunk = (
@@ -919,13 +916,15 @@ def test_head_major_batched_decode_matches_fp32_reference(
     query_padded = torch.zeros(b_seqs, num_heads * head_size, dtype=torch.float32)
     query_padded[:num_seqs] = query
 
+    # The cache as this layout stores it: [pages, KV, block, D].
+    k_hm = k_pages.permute(0, 2, 1, 3).contiguous()
+    v_hm = v_pages.permute(0, 2, 1, 3).contiguous()
     actual = batched_decode_head_major_kernel(
         query_padded,
         rep_row_ids,
-        # The cache as this layout stores it, folded on (page, kv_head).
-        k_pages.permute(0, 2, 1, 3).contiguous().reshape(-1, block_size, head_size),
-        v_pages.permute(0, 2, 1, 3).contiguous().reshape(-1, block_size, head_size),
-        chunk_row_ids,
+        k_hm,
+        v_hm,
+        chunk_page_ids,
         mask_by_chunk,
         scale,
         b_seqs,
@@ -956,8 +955,12 @@ def test_head_major_batched_decode_matches_fp32_reference(
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
     indirect=True,
 )
-def test_head_major_chunk_index_tables(default_vllm_config, configure_compilation):
-    """Each chunk's table is the builder's page ids folded onto ``page * KV + kv``."""
+def test_head_major_batched_decode_uses_plain_page_ids(default_vllm_config, configure_compilation):
+    """The batched kernel gathers whole pages, so its index is the builder's page ids.
+
+    Guards against folding them onto ``page * KV + kv`` again: that moves the same bytes
+    with num_kv_heads times the gather entries, which measured ~2x the kernel time.
+    """
     from tests.attention.test_spyre_attn import _build_metadata
 
     torch.set_default_device("cpu")
@@ -996,12 +999,9 @@ def test_head_major_chunk_index_tables(default_vllm_config, configure_compilatio
 
     tables = impl.build_chunk_index_tables(attn_metadata, torch.device("cpu"))
     assert len(tables) == len(attn_metadata.chunk_page_ids_cpu)
-    for pages, folded in zip(attn_metadata.chunk_page_ids_cpu, tables, strict=True):
-        assert folded.shape == (entries * num_kv_heads, 1)
-        assert folded.dtype == torch.int32
-        for e in range(entries):
-            for kv in range(num_kv_heads):
-                assert int(folded[e * num_kv_heads + kv, 0]) == int(pages[e, 0]) * num_kv_heads + kv
+    for pages, table in zip(attn_metadata.chunk_page_ids_cpu, tables, strict=True):
+        assert table.shape == (entries, 1)
+        torch.testing.assert_close(table, pages)
 
 
 @pytest.fixture()

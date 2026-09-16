@@ -154,6 +154,76 @@ def ref_attn(query, key_cache, value_cache, query_lens, kv_lens, block_tables, b
     return torch.cat(outputs, dim=0)
 
 
+def _head_major_impl(num_query_heads, num_kv_heads, head_size, scale):
+    from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
+        SpyreHeadMajorAttentionImpl,
+    )
+
+    return SpyreHeadMajorAttentionImpl(
+        num_heads=num_query_heads,
+        head_size=head_size,
+        scale=scale,
+        num_kv_heads=num_kv_heads,
+    )
+
+
+def _head_major_seeded_cache(
+    num_blocks,
+    block_size,
+    num_kv_heads,
+    head_size,
+    cache_device,
+    hist_k,
+    hist_v,
+    hist_slots,
+    query,
+    key,
+    value,
+    slot_mapping,
+):
+    """A head-major cache holding the same logical KV as ``k_pages_cpu``.
+
+    History and current tokens both go through ``do_kv_cache_update``: the layout is
+    pinned on device, so a host-populated transfer lands the wrong rows.
+    """
+    from vllm.v1.kv_cache_interface import AttentionSpec
+
+    from spyre_inference.custom_ops.utils import convert
+    from spyre_inference.v1.attention.backends.spyre_attn import SpyrePagedKVCache
+    from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
+        SpyreHeadMajorAttentionImpl,
+    )
+
+    num_query_heads = query.shape[1]
+    impl = _head_major_impl(num_query_heads, num_kv_heads, head_size, head_size**-0.5)
+    spec = AttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=DTYPE,
+    )
+    if cache_device.type != "spyre":
+        shape = (num_blocks, num_kv_heads, block_size, head_size)
+        cache = SpyrePagedKVCache(
+            k_pages=torch.zeros(shape, dtype=DTYPE), v_pages=torch.zeros(shape, dtype=DTYPE)
+        )
+    else:
+        cache = SpyreHeadMajorAttentionImpl.allocate_pages(num_blocks, spec, cache_device)
+
+    def write(k_src, v_src, slots):
+        impl.do_kv_cache_update(None, k_src, v_src, cache, impl.kv_write_index(slots, cache_device))
+
+    if hist_slots:
+        write(
+            convert(torch.cat(hist_k), cache_device),
+            convert(torch.cat(hist_v), cache_device),
+            torch.tensor(hist_slots, dtype=torch.int64),
+        )
+    key_dev, value_dev = _fused_qkv_kv_views(query, key, value, cache_device)
+    write(key_dev, value_dev, slot_mapping)
+    return cache.k_pages, cache.v_pages
+
+
 def build_metadata(
     num_query_heads,
     num_kv_heads,
@@ -334,7 +404,26 @@ def build_inputs_from_requests(
             return cache.to(cache_device, device_layout=layout)
         return torch.zeros_like(cache).to(cache_device, device_layout=layout)
 
-    k_pages, v_pages = to_device(k_pages_cpu), to_device(v_pages_cpu)
+    if kv_layout == "head_major":
+        # This layout's cache cannot be host-populated: the device layout is pinned, so a
+        # transfer lands the wrong rows. Every write goes through the impl, as production
+        # and tests/attention/test_spyre_head_major_attn.py do.
+        k_pages, v_pages = _head_major_seeded_cache(
+            num_blocks,
+            block_size,
+            num_kv_heads,
+            head_size,
+            cache_device,
+            hist_k,
+            hist_v,
+            hist_slots,
+            query,
+            key,
+            value,
+            slot_mapping,
+        )
+    else:
+        k_pages, v_pages = to_device(k_pages_cpu), to_device(v_pages_cpu)
 
     if kv_layout == "slot_major_devfill" and cache_device.type == "spyre" and hist_slots:
         # Same index_copy_ the kernel uses, on the same [-1, H, D] view.
@@ -475,7 +564,7 @@ def span_cpu_time_us(prof, span=SPANS["layer"]):
     return float("nan")
 
 
-def make_forward(inputs, num_query_heads, num_kv_heads, head_size, kv_write=False):
+def make_forward(inputs, num_query_heads, num_kv_heads, head_size, kv_write=False, kv_layout=None):
     """One emulated attention layer, in the order ``attn_layer`` runs it.
 
     The query is staged here because ``attn_layer`` stages it in the block graph,
@@ -489,7 +578,14 @@ def make_forward(inputs, num_query_heads, num_kv_heads, head_size, kv_write=Fals
         SpyrePagedKVCache,
     )
 
-    impl = SpyreAttentionImpl(
+    impl_cls = SpyreAttentionImpl
+    if kv_layout == "head_major":
+        from spyre_inference.v1.attention.backends.spyre_head_major_attn import (
+            SpyreHeadMajorAttentionImpl,
+        )
+
+        impl_cls = SpyreHeadMajorAttentionImpl
+    impl = impl_cls(
         num_heads=num_query_heads,
         head_size=head_size,
         scale=inputs["scale"],
@@ -511,7 +607,11 @@ def make_forward(inputs, num_query_heads, num_kv_heads, head_size, kv_write=Fals
             if kv_write:
                 with torch.profiler.record_function(SPANS["reshape_and_cache"]):
                     impl.do_kv_cache_update(
-                        None, inputs["key_dev"], inputs["value_dev"], kv_cache, slots_dev
+                        None,
+                        inputs["key_dev"],
+                        inputs["value_dev"],
+                        kv_cache,
+                        impl.kv_write_index(slots_dev, device),
                     )
             q_staging[:rows] = inputs["query_dev"]
             impl.forward(
@@ -720,7 +820,14 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
 
         record_padding(row, inputs["attn_metadata"], query_lens, seq_lens, block_size)
 
-        run, output, impl = make_forward(inputs, num_q, num_kv, head_size, kv_write=row["kv_write"])
+        run, output, impl = make_forward(
+            inputs,
+            num_q,
+            num_kv,
+            head_size,
+            kv_write=row["kv_write"],
+            kv_layout=row["kv_layout"],
+        )
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -736,10 +843,17 @@ def run_config(entry, variant, cfg, records, csv_path, block_size=None):
         atol, rtol = cfg.get("atol", 0.3), cfg.get("rtol", 0.2)
         max_outliers = cfg.get("max_outliers", 5)
         got = output.to("cpu").float()
+        # ref_attn indexes a page's token axis first. head_major stores [KV, block, D]
+        # per page and its device layout is pinned, so the host mirror is the reference:
+        # comparing the kernel's output against it still exercises the device store.
+        if row["kv_layout"] == "head_major":
+            k_ref, v_ref = inputs["k_pages_cpu"], inputs["v_pages_cpu"]
+        else:
+            k_ref, v_ref = inputs["k_pages"].to("cpu"), inputs["v_pages"].to("cpu")
         ref = ref_attn(
             inputs["query_cpu"],
-            inputs["k_pages"].to("cpu"),
-            inputs["v_pages"].to("cpu"),
+            k_ref,
+            v_ref,
             inputs["query_lens"],
             inputs["seq_lens"],
             inputs["block_tables"],
@@ -924,6 +1038,7 @@ def run_startup_guard(cfg, entries, block_size, span, args):
         cfg["num_kv_heads"],
         cfg["head_size"],
         kv_write=bool(cfg.get("kv_write", False)),
+        kv_layout=cfg.get("kv_layout", "slot_major_devfill"),
     )
     probe_run()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.PrivateUse1]) as prof:
@@ -947,13 +1062,15 @@ def main():
     ap.add_argument("--device", default=None)
     ap.add_argument(
         "--kv-layout",
-        choices=["plain", "slot_major", "slot_major_devfill", "page_major"],
+        choices=["plain", "slot_major", "slot_major_devfill", "page_major", "head_major"],
         default=None,
         help="KV page device layout. 'slot_major_devfill' (default) matches the "
         "worker: zeroed slot-major alloc, history written on device. 'plain' is "
         "correct for a host-populated cache. 'slot_major' pins the worker layout "
         "on a host-populated cache and is numerically wrong. 'page_major' is an "
-        "index_select layout/SDSC probe.",
+        "index_select layout/SDSC probe. 'head_major' selects the "
+        "SPYRE_ATTN_KV_LAYOUT=head_major backend, whose cache is "
+        "[num_blocks, KV, block_size, D] and can only be filled through the impl.",
     )
     ap.add_argument(
         "--span",
