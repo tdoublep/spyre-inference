@@ -197,15 +197,13 @@ the write can scatter through a slot-major view of it:
 | 5. Write-back | CPU → Spyre | Stage each sequence's result into a CPU buffer, then one bulk copy into the Spyre output (per-token `spyre.overwrite` scatter doesn't scale) |
 
 Decode takes its own kernel. The general form gives the score matmul batch axes
-`(num_kv_heads, num_queries_per_kv)` while a page carries only `num_kv_heads`, so the
-page is broadcast over the group axis and Inductor materializes that as one clone per
-group (torch-spyre#4123). At a single query row the group axis folds into the matmul's
-row axis instead — `q` becomes `[num_kv_heads, num_queries_per_kv, head_size]` against a
-3-D `[num_kv_heads, block_size, head_size]` page — so the page keeps one batch dim and is
-read where it lies. The mask tile is head-independent at one query row, so it broadcasts
-across the folded axis unchanged. `SPYRE_ATTN_DECODE_FOLD=0` restores the shared kernel.
-The batched decode kernel is already in this form, since its per-sequence axis gives the
-page a matching batch dim.
+`(num_kv_heads, num_queries_per_kv)` while a page carries only `num_kv_heads`, so the page
+is broadcast over the group axis and Inductor materializes that as one clone per group
+(torch-spyre#4123). At a single query row the group axis folds into the matmul's row axis
+instead — `q` becomes `[num_kv_heads, num_queries_per_kv, head_size]` against a 3-D
+`[num_kv_heads, block_size, head_size]` page — so the page keeps one batch dim and is read
+where it lies. `SPYRE_ATTN_DECODE_FOLD=0` restores the shared kernel. The batched decode
+kernel is already in this form, since its per-sequence axis gives the page a batch dim.
 
 The compiled kernels themselves — the per-sequence page attention, the batched decode
 path, the KV store, and the cache's device layout — live under

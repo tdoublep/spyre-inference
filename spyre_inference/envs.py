@@ -75,9 +75,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #  - "head_major":  [num_blocks, num_kv_heads, block_size, head_size], which drops
     #    the per-page permute the kernels do before the matmuls
     "SPYRE_ATTN_KV_LAYOUT": lambda: os.getenv("SPYRE_ATTN_KV_LAYOUT") or "token_major",
-    # When "1" (default), decode steps take a kernel that folds the query groups into
-    # the matmul's row axis instead of broadcasting each KV page over a size-1 group
-    # axis. "0" restores the single prefill/decode kernel.
+    # When "1" (default), decode takes a kernel that folds the query groups into the
+    # matmul's row axis rather than broadcasting each KV page over a size-1 group axis.
     "SPYRE_ATTN_DECODE_FOLD": lambda: bool(int(os.getenv("SPYRE_ATTN_DECODE_FOLD", "1"))),
     # When "1", enables the batched multi-sequence decode kernel. Off by default
     # pending performance characterisation at small batch sizes (num_seqs <= 4).

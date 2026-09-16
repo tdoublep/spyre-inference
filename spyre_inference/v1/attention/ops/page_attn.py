@@ -151,12 +151,9 @@ def page_attn_decode_kernel(
 ):
     """Decode (Q=1) attention with the query groups folded into the row axis.
 
-    The 4-D GQA form of ``page_attn_kernel`` leaves each page a size-1 group axis for
-    the matmuls to broadcast over, and Inductor materializes that broadcast as a clone
-    per group (torch-spyre#4123). At one query row the group axis folds into the
-    matmul's row axis instead, so the page keeps a single batch dim and is read where
-    it lies. Same arguments and result as ``page_attn_kernel``, except that ALiBi keeps
-    that kernel: its bias tile carries the group axis this one folds away.
+    Same arguments and result as ``page_attn_kernel``, whose 4-D form gives each page a
+    size-1 group axis to broadcast over that Inductor clones per group
+    (torch-spyre#4123). Folding leaves the page one batch dim. ALiBi keeps that kernel.
     """
     assert padded_query_len == 1, "decode kernel is specialized for a single query row"
     assert alibi_bias_tiles is None, "ALiBi layers dispatch to page_attn_kernel"
@@ -181,8 +178,7 @@ def page_attn_decode_kernel(
         scores = torch.matmul(q, k_page_t) * scale
         if logits_soft_cap > 0.0:
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
-        # At one query row the mask is head-independent, so its [1, block_size] tile
-        # broadcasts across the folded group axis.
+        # Head-independent at one query row, so the [1, block_size] tile broadcasts.
         scores = scores + mask_tiles[i]
         scores_max = torch.amax(scores, dim=-1, keepdim=True)
 

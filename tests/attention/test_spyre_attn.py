@@ -483,8 +483,7 @@ def _run_spyre_attn_test(
 
             return _spy_attn_fn
 
-        # Both: decode dispatches its own kernel, so wrapping only _attn_fn would
-        # leave every query_len=1 call unobserved.
+        # Both: decode dispatches its own kernel, so _attn_fn alone misses query_len=1.
         attn_impl._attn_fn = _spy(attn_impl._attn_fn)
         attn_impl._decode_attn_fn = _spy(attn_impl._decode_attn_fn)
 
@@ -2671,9 +2670,8 @@ def test_decode_fold_matches_unfolded(kv: int, qpk: int, soft_cap: float) -> Non
 def test_decode_fold_dispatch(default_vllm_config, monkeypatch, fold, shares_kernel) -> None:
     """Decode picks the folded kernel; SPYRE_ATTN_DECODE_FOLD=0 restores the shared one.
 
-    One env value per test: ``envs`` caches on first read and the autouse cache-clearing
-    fixture in ``tests/conftest.py`` runs per test, so both values in one body would read
-    whichever was set first.
+    One value per test: ``envs`` caches on first read and conftest clears it per test, so
+    both values in one body would read whichever was set first.
     """
     monkeypatch.setenv("SPYRE_ATTN_DECODE_FOLD", fold)
     impl = SpyreAttentionImpl(num_heads=32, head_size=128, scale=128**-0.5, num_kv_heads=8)
