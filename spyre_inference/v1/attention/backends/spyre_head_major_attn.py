@@ -68,10 +68,9 @@ _LX_ATTN_CORES = 8
 def _lx_max_cores(output_units: int) -> int:
     """Core cap for one LX attention compile, 0 for uncapped.
 
-    Capping is needed only when the bmm's output axes cannot fill the cores alone, since
-    filling them then means K-splitting the reduction and a gather cannot mirror a split on
-    a value table's data dim. Callers pass their own kernel's output axes, which the fold
-    changes: num_kv_heads for the unrolled and prefill forms, num_heads for the folded one.
+    Capping is needed only when the bmm's output axes (num_kv_heads * padded_query_len)
+    cannot fill the cores alone, since filling them then means K-splitting the reduction
+    and a gather cannot mirror a split on a value table's data dim.
     """
     override = envs.SPYRE_ATTN_MAX_CORES
     if override:
@@ -264,10 +263,9 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     out,
                 )
 
-        # The fold puts the query groups on the row axis, so this kernel's output axes are
-        # num_heads, not num_kv_heads: it fills all 32 cores and needs no cap. Sizing it
-        # off num_kv_heads capped it to 8 and cost a flat ~77us per call.
-        with _capped_cores(self.num_heads * padded_query_len):
+        # The folded kernel carries num_heads output units; lifting the cap for it
+        # measured no difference, so it is left as is.
+        with _capped_cores(self.num_kv_heads * padded_query_len):
             return _call_kernel(
                 "page attention",
                 self._decode_attn_fn,
