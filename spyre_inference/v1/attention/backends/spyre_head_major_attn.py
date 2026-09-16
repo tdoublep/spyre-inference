@@ -34,7 +34,7 @@ from vllm.v1.attention.backend import AttentionLayer
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from spyre_inference import envs
-from spyre_inference.custom_ops.utils import convert
+from spyre_inference.custom_ops.utils import convert, convert_cached
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionBackend,
     SpyreAttentionImpl,
@@ -209,13 +209,21 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         return [
             (
                 [
-                    convert(int(pages[b, 0]) * self.num_kv_heads + heads, device=device)
+                    convert_cached(
+                        int(pages[b, 0]) * self.num_kv_heads + heads,
+                        self._h2d_cache,
+                        device=device,
+                    )
                     for b in range(pages.shape[0])
                 ],
                 # Only a wide query reads these, and building them for a decode step would
                 # add an H2D transfer per page to the path this layout exists to speed up.
                 [
-                    convert(torch.tensor([int(pages[b, 0])], dtype=torch.int32), device=device)
+                    convert_cached(
+                        torch.tensor([int(pages[b, 0])], dtype=torch.int32),
+                        self._h2d_cache,
+                        device=device,
+                    )
                     for b in range(pages.shape[0])
                 ]
                 if query_lens[s] > 1

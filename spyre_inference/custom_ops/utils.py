@@ -19,6 +19,7 @@ for execution on IBM's Spyre device, primarily handling device transfer and
 dtype conversion.
 """
 
+from collections import OrderedDict
 from functools import lru_cache
 
 import torch
@@ -102,6 +103,48 @@ def convert(tensor, device=None, dtype=None):
         device,  # ty: ignore[invalid-argument-type]
         dtype,  # ty: ignore[invalid-argument-type]
     )
+
+
+# Attention metadata is rebuilt every step but is mostly unchanged between steps: a
+# decoding sequence keeps the same page index tables until it allocates a block, and
+# only the mask tile holding the current position moves. An H2D costs ~150 us, hashing
+# a few hundred bytes ~1 us, so a content-keyed cache turns most of them into hits.
+# The cache is passed in rather than global: it holds device buffers, so its lifetime
+# must be the model's, or torn-down engines keep pinning HBM.
+# Per decoding sequence the hot set is one entry per KV block for the index table,
+# two mask tiles (all-valid interior plus the moving boundary one) and the query row
+# table; the boundary tile is a fresh entry every step, so the bound has to clear the
+# hot set by enough that LRU evicts spent boundary tiles rather than live tables.
+# Measured: 64 is too tight and gives back part of the win.
+CONVERT_CACHE_MAX = 256
+
+
+def convert_cached(tensor, cache: OrderedDict | None = None, device=None, dtype=None):
+    """`convert`, reusing a device buffer already holding a byte-identical CPU tensor.
+
+    Only for read-only kernel inputs: byte-identical tensors share one device buffer.
+    Cached buffers come from `convert` itself, so they stay standalone offset-0
+    allocations (torch-spyre#3770). `cache` is the owner's bounded LRU; entries hold
+    device memory until it is dropped; `cache=None` disables caching entirely.
+    """
+    if cache is None or tensor is None or tensor.device.type != "cpu":
+        return convert(tensor, device=device, dtype=dtype)
+    key = (
+        str(device),
+        dtype,
+        tensor.dtype,
+        tuple(tensor.shape),
+        tensor.detach().contiguous().numpy().tobytes(),
+    )
+    hit = cache.get(key)
+    if hit is not None:
+        cache.move_to_end(key)
+        return hit
+    out = convert(tensor, device=device, dtype=dtype)
+    cache[key] = out
+    while len(cache) > CONVERT_CACHE_MAX:
+        cache.popitem(last=False)
+    return out
 
 
 @lru_cache(maxsize=1)

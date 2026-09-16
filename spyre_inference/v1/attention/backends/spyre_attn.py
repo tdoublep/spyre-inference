@@ -17,6 +17,7 @@
 import contextlib
 import functools
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import ClassVar, NamedTuple
 
@@ -40,7 +41,7 @@ from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.kv_cache_interface import AttentionSpec, EncoderOnlyAttentionSpec
 
 from spyre_inference import envs
-from spyre_inference.custom_ops.utils import convert
+from spyre_inference.custom_ops.utils import convert, convert_cached
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.ops.layout import (
@@ -123,16 +124,16 @@ class SpyrePagedKVCache(NamedTuple):
 
 
 def _mirror_mask_tiles(
-    tiles_cpu: list[list[torch.Tensor]], device: torch.device
+    tiles_cpu: list[list[torch.Tensor]], device: torch.device, cache: OrderedDict | None = None
 ) -> list[list[torch.Tensor]]:
     """Mirror per-block mask tiles to `device`, one transfer per distinct tile.
 
-    `_get_zero_tile` hands the same CPU tensor to every interior block, so
-    keying on `id()` collapses those to a single H2D transfer instead of one
-    per block. `tiles_cpu` keeps strong references for the whole call, so no
-    id can be recycled mid-flight, and sharing one device buffer across blocks
-    is safe because mask tiles are read-only by contract (see
-    `_get_zero_tile`).
+    `_get_zero_tile` hands the same CPU tensor to every interior block, so keying
+    on `id()` collapses those without hashing; `convert_cached` then collapses the
+    rest, including tiles unchanged since the previous step. `tiles_cpu` keeps
+    strong references for the whole call, so no id can be recycled mid-flight, and
+    sharing one device buffer across blocks is safe because mask tiles are
+    read-only by contract (see `_get_zero_tile`).
     """
     mirrored: dict[int, torch.Tensor] = {}
     tiles_device: list[list[torch.Tensor]] = []
@@ -141,7 +142,7 @@ def _mirror_mask_tiles(
         for tile in seq_tiles:
             dev_tile = mirrored.get(id(tile))
             if dev_tile is None:
-                dev_tile = convert(tile, device=device)
+                dev_tile = convert_cached(tile, cache, device=device)
                 mirrored[id(tile)] = dev_tile
             row.append(dev_tile)
         tiles_device.append(row)
@@ -149,7 +150,9 @@ def _mirror_mask_tiles(
 
 
 def _build_query_row_tables(
-    attn_metadata: "SpyreAttentionMetadata", device: torch.device
+    attn_metadata: "SpyreAttentionMetadata",
+    device: torch.device,
+    cache: OrderedDict | None = None,
 ) -> list[torch.Tensor]:
     """Build query gather/dest row tables for the whole batch.
 
@@ -168,7 +171,7 @@ def _build_query_row_tables(
         row = torch.zeros(index_len, dtype=torch.int32)
         last_real = max(int(lens[s]) - 1, 0)
         row[:aligned] = (starts[s] + torch.arange(aligned).clamp(max=last_real)).to(torch.int32)
-        tables.append(convert(row, device=device))
+        tables.append(convert_cached(row, cache, device=device))
     return tables
 
 
@@ -1162,6 +1165,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
             get_current_vllm_config().scheduler_config.max_num_batched_tokens + 1
         )
         self._staging: tuple[torch.Tensor, torch.Tensor] | None = None
+        # Owned here so the device buffers it holds are freed with the model. Only the
+        # step's first layer fills it; the rest read the result off attn_metadata.
+        self._h2d_cache: OrderedDict = OrderedDict()
 
         logger.debug_once(
             "Using SpyreAttentionBackend with a dense paged KV cache and indirect page gather"
@@ -1247,7 +1253,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
                 "attention_mask_tiles must be precomputed by the metadata builder"
             )
             attn_metadata.attention_mask_tiles_device = _mirror_mask_tiles(
-                tiles_cpu, _target_device
+                tiles_cpu, _target_device, self._h2d_cache
             )
 
         # The KV write is not here: attn_layer.py traces it for the layers it splits,
@@ -1648,8 +1654,8 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Per sequence, the device index table this impl's kernel gathers pages with."""
         tables_cpu = attn_metadata.page_index_tables_cpu
         assert tables_cpu is not None, "page_index_tables_cpu must come from the builder"
-        # Fresh offset-0 allocations (torch-spyre#3770).
-        return [convert(table, device=device) for table in tables_cpu]
+        # Offset-0 allocations (torch-spyre#3770); read-only, so shareable across steps.
+        return [convert_cached(table, self._h2d_cache, device=device) for table in tables_cpu]
 
     def index_tables(self, attn_metadata: "SpyreAttentionMetadata", device: torch.device) -> list:
         """`build_index_tables`, memoized so only the step's first layer pays for it."""
@@ -1830,7 +1836,7 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
 
             if attn_metadata.query_row_tables is None:
                 attn_metadata.query_row_tables = _build_query_row_tables(
-                    attn_metadata, _target_device
+                    attn_metadata, _target_device, self._h2d_cache
                 )
             row_table = attn_metadata.query_row_tables[seq_idx]
 

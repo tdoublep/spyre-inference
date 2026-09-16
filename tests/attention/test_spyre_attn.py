@@ -23,6 +23,7 @@ from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import AttentionSpec, FullAttentionSpec
 
+from spyre_inference.custom_ops import utils as custom_ops_utils
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_attn import (
@@ -1477,14 +1478,16 @@ def test_mirror_mask_tiles_one_transfer_per_distinct_tile(default_vllm_config, m
 
     # `convert` short-circuits same-device/same-dtype, so a real CPU->CPU call
     # would hand back the input and make identity checks vacuous. Count the
-    # calls and return a distinct tensor from each instead.
+    # calls and return a distinct tensor from each instead. Patched where the
+    # transfer actually happens: `_mirror_mask_tiles` reaches it via
+    # `convert_cached`, which resolves `convert` in its own module.
     calls: list[torch.Tensor] = []
 
     def counting_convert(tensor, device=None, dtype=None):
         calls.append(tensor)
         return tensor.clone()
 
-    monkeypatch.setattr(spyre_attn, "convert", counting_convert)
+    monkeypatch.setattr(custom_ops_utils, "convert", counting_convert)
     tiles_device = _mirror_mask_tiles(tiles_cpu, torch.device("cpu"))
 
     assert len(calls) == num_distinct, (
