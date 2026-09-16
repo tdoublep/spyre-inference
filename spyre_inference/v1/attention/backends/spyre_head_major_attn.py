@@ -96,6 +96,7 @@ def _select_prefill_kernel():
 
 
 _page_attn_prefill_selected, _prefill_wants_folded = _select_prefill_kernel()
+_prefill_variant_default = _page_attn_prefill_selected is _page_attn_prefill_compiled
 
 _SPYRE_CORES = 32
 _LX_ATTN_CORES = 8
@@ -286,7 +287,11 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             with _capped_cores(self.num_kv_heads * padded_query_len):
                 return _call_kernel(
                     "page attention (prefill)",
-                    _page_attn_prefill_selected,
+                    # Resolved by name on the default path so a test can spy the module
+                    # attribute; a variant override replaces the kernel outright.
+                    _page_attn_prefill_compiled
+                    if _prefill_variant_default
+                    else _page_attn_prefill_selected,
                     query,
                     row_table,
                     *pages,
