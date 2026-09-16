@@ -142,6 +142,7 @@ def page_attn_head_major_decode_kernel(
     block_size,
     logits_soft_cap=0.0,
     out=None,
+    k_transposed=False,
 ):
     """Decode (Q=1) attention with the query groups folded into the row axis.
 
@@ -162,10 +163,13 @@ def page_attn_head_major_decode_kernel(
 
     for i in range(num_blocks):
         kv_rows = kv_index_tables[i]
-        k_page = k_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
+        if k_transposed:
+            k_t = k_pages[kv_rows].reshape(num_kv_heads, head_size, block_size)
+        else:
+            k_t = k_pages[kv_rows].reshape(num_kv_heads, block_size, head_size).permute(0, 2, 1)
         v_page = v_pages[kv_rows].reshape(num_kv_heads, block_size, head_size)
 
-        scores = torch.matmul(q, k_page.permute(0, 2, 1)) * scale
+        scores = torch.matmul(q, k_t) * scale
         if logits_soft_cap > 0.0:
             scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
         # At one query row the mask is head-independent, so its [1, block_size] tile

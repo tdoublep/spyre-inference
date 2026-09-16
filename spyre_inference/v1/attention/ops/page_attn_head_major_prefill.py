@@ -39,6 +39,7 @@ def page_attn_head_major_prefill_kernel(
     block_size,
     logits_soft_cap=0.0,
     out=None,
+    k_transposed=False,
 ):
     """Online softmax attention over ``num_blocks`` pages of the unfolded cache.
 
@@ -68,7 +69,10 @@ def page_attn_head_major_prefill_kernel(
         v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
         mask_tile = mask_tiles[i]
 
-        scores = torch.matmul(q, k_page.transpose(-2, -1)) * scale
+        # A [head_size, block_size] page is already the orientation matmul wants for its
+        # stationary operand; swapping it back would reintroduce the stick swap.
+        k_t = k_page if k_transposed else k_page.transpose(-2, -1)
+        scores = torch.matmul(q, k_t) * scale
         if logits_soft_cap > 0.0:
             # Before the mask add: tanh(-inf/cap)*cap is -cap, not -inf, so capping after it
             # would un-mask the padded lanes.

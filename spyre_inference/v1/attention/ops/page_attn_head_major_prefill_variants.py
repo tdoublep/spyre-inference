@@ -70,7 +70,7 @@ def _masked_scores(q, k_page, mask_tile, scale, num_kv_heads, num_queries_per_kv
 def page_attn_head_major_prefill_fold_kernel(
     query, query_row_index, k_pages, v_pages, page_index_tables, mask_tiles, scale,
     num_blocks, padded_query_len, num_heads, num_kv_heads, head_size, block_size,
-    logits_soft_cap=0.0, out=None, prescale=False,
+    logits_soft_cap=0.0, out=None, k_transposed=False, prescale=False,
 ):
     """915's online softmax with the query group folded into the row axis."""
     g = num_heads // num_kv_heads
@@ -110,7 +110,7 @@ def page_attn_head_major_prefill_fold_kernel(
 def page_attn_head_major_prefill_hoist_kernel(
     query, query_row_index, k_pages, v_pages, page_index_tables, mask_tiles, scale,
     num_blocks, padded_query_len, num_heads, num_kv_heads, head_size, block_size,
-    logits_soft_cap=0.0, out=None, prescale=False,
+    logits_soft_cap=0.0, out=None, k_transposed=False, prescale=False,
 ):
     """Folded, with the row max taken over every block before any exp.
 
@@ -153,7 +153,7 @@ def page_attn_head_major_prefill_hoist_kernel(
 def page_attn_head_major_prefill_slab_kernel(
     query, query_row_index, k_pages, v_pages, page_index_tables, mask_tiles, scale,
     num_blocks, padded_query_len, num_heads, num_kv_heads, head_size, block_size,
-    logits_soft_cap=0.0, out=None, prescale=False,
+    logits_soft_cap=0.0, out=None, k_transposed=False, prescale=False,
 ):
     """Folded, with every page concatenated into one slab and one softmax.
 
@@ -188,7 +188,7 @@ def page_attn_head_major_prefill_slab_kernel(
 def page_attn_head_major_prefill_mmpair_kernel(
     query, query_row_index, k_pages, v_pages, page_index_tables, mask_tiles, scale,
     num_blocks, padded_query_len, num_heads, num_kv_heads, head_size, block_size,
-    logits_soft_cap=0.0, out=None, prescale=False,
+    logits_soft_cap=0.0, out=None, k_transposed=False, prescale=False,
 ):
     """Diagnostic, numerically wrong: both matmuls per block, no softmax at all.
 
@@ -209,7 +209,7 @@ def page_attn_head_major_prefill_mmpair_kernel(
 def page_attn_head_major_prefill_qkonly_kernel(
     query, query_row_index, k_pages, v_pages, page_index_tables, mask_tiles, scale,
     num_blocks, padded_query_len, num_heads, num_kv_heads, head_size, block_size,
-    logits_soft_cap=0.0, out=None, prescale=False,
+    logits_soft_cap=0.0, out=None, k_transposed=False, prescale=False,
 ):
     """Diagnostic, numerically wrong: QK matmul and the mask add only."""
     g = num_heads // num_kv_heads
@@ -227,7 +227,7 @@ def page_attn_head_major_prefill_qkonly_kernel(
 def page_attn_head_major_prefill_nopv_kernel(
     query, query_row_index, k_pages, v_pages, page_index_tables, mask_tiles, scale,
     num_blocks, padded_query_len, num_heads, num_kv_heads, head_size, block_size,
-    logits_soft_cap=0.0, out=None, prescale=False,
+    logits_soft_cap=0.0, out=None, k_transposed=False, prescale=False,
 ):
     """Diagnostic, numerically wrong: full online softmax with the PV matmul removed."""
     g = num_heads // num_kv_heads
@@ -261,7 +261,7 @@ def page_attn_head_major_prefill_nopv_kernel(
 def page_attn_head_major_prefill_foldkv_kernel(
     query, query_row_index, k_pages, v_pages, kv_index_tables, mask_tiles, scale,
     num_blocks, padded_query_len, num_heads, num_kv_heads, head_size, block_size,
-    logits_soft_cap=0.0, out=None, prescale=False,
+    logits_soft_cap=0.0, out=None, k_transposed=False, prescale=False,
 ):
     """Folded query, and the page gathered per kv head off the folded cache.
 
@@ -313,7 +313,7 @@ def page_attn_head_major_prefill_foldkv_kernel(
 def page_attn_head_major_prefill_batchedkv_kernel(
     query, query_row_index, k_pages, v_pages, kv_index_tables, mask_tiles, scale,
     num_blocks, padded_query_len, num_heads, num_kv_heads, head_size, block_size,
-    logits_soft_cap=0.0, out=None, prescale=False,
+    logits_soft_cap=0.0, out=None, k_transposed=False, prescale=False,
 ):
     """915's batched GQA form, with 893's per-kv-head gather off the folded cache."""
     g = num_heads // num_kv_heads
@@ -362,7 +362,7 @@ def page_attn_head_major_prefill_batchedkv_kernel(
 def page_attn_head_major_prefill_batchedt_kernel(
     query, query_row_index, k_pages, v_pages, page_index_tables, mask_tiles, scale,
     num_blocks, padded_query_len, num_heads, num_kv_heads, head_size, block_size,
-    logits_soft_cap=0.0, out=None, prescale=False,
+    logits_soft_cap=0.0, out=None, k_transposed=False, prescale=False,
 ):
     """915's batched GQA form with the score matrix transposed.
 
@@ -418,7 +418,7 @@ def page_attn_head_major_prefill_batchedt_kernel(
 def page_attn_head_major_prefill_foldt_kernel(
     query, query_row_index, k_pages, v_pages, kv_index_tables, mask_tiles, scale,
     num_blocks, padded_query_len, num_heads, num_kv_heads, head_size, block_size,
-    logits_soft_cap=0.0, out=None, prescale=False,
+    logits_soft_cap=0.0, out=None, k_transposed=False, prescale=False,
 ):
     """Transposed scores over a folded query and 893's per-kv-head page gather."""
     g = num_heads // num_kv_heads
@@ -474,7 +474,7 @@ def page_attn_head_major_prefill_foldt_kernel(
 def page_attn_head_major_prefill_slabb_kernel(
     query, query_row_index, k_pages, v_pages, page_index_tables, mask_tiles, scale,
     num_blocks, padded_query_len, num_heads, num_kv_heads, head_size, block_size,
-    logits_soft_cap=0.0, out=None, prescale=False,
+    logits_soft_cap=0.0, out=None, k_transposed=False, prescale=False,
 ):
     """915's batched GQA form over one concatenated slab of every page.
 
@@ -518,7 +518,7 @@ def page_attn_head_major_prefill_slabb_kernel(
 def page_attn_head_major_prefill_qknotr_kernel(
     query, query_row_index, k_pages, v_pages, page_index_tables, mask_tiles, scale,
     num_blocks, padded_query_len, num_heads, num_kv_heads, head_size, block_size,
-    logits_soft_cap=0.0, out=None, prescale=False,
+    logits_soft_cap=0.0, out=None, k_transposed=False, prescale=False,
 ):
     """Diagnostic, numerically wrong: ``qkonly`` with the page fed in untransposed.
 

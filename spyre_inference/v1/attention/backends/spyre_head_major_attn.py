@@ -51,6 +51,8 @@ from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
 )
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
     reshape_and_cache_head_major_kernel,
+    reshape_and_cache_head_major_kt_kernel,
+    reshape_and_cache_head_major_kt_v_only_kernel,
 )
 
 logger = init_logger(__name__)
@@ -97,6 +99,10 @@ def _select_prefill_kernel():
 
 _page_attn_prefill_selected, _prefill_wants_folded = _select_prefill_kernel()
 _prefill_variant_default = _page_attn_prefill_selected is _page_attn_prefill_compiled
+
+# Q @ K^T wants the K page sticked on block_size while the cache stores it sticked on
+# head_size, so every page read pays a stick swap. Storing K's pages transposed removes it.
+_KT_CACHE = envs.SPYRE_ATTN_KT_CACHE
 
 _SPYRE_CORES = 32
 _LX_ATTN_CORES = 8
@@ -160,6 +166,10 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         self.block_size: int = get_current_vllm_config().cache_config.block_size
 
         self._reshape_fn = torch.compile(reshape_and_cache_head_major_kernel, dynamic=False)
+        self._reshape_kt_fn = torch.compile(reshape_and_cache_head_major_kt_kernel, dynamic=False)
+        self._reshape_kt_v_fn = torch.compile(
+            reshape_and_cache_head_major_kt_v_only_kernel, dynamic=False
+        )
         # Always the compiled kernel, even under --enforce-eager: the gather that keeps a
         # page LX-resident is a 2-D subscript, which lowers to aten.index and fails eager
         # by upcasting the int32 index to int64. Attention compiles in its own domain, so
@@ -185,9 +195,17 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
             num_blocks * spec.num_kv_heads, spec.block_size, spec.head_size, torch.float16
         )
         shape = (num_blocks, spec.num_kv_heads, spec.block_size, spec.head_size)
+        v_pages = torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout)  # ty: ignore[no-matching-overload]
+        if not _KT_CACHE:
+            k_pages = torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout)  # ty: ignore[no-matching-overload]
+            return SpyrePagedKVCache(k_pages=k_pages, v_pages=v_pages)
+        k_layout = head_major_kv_layout(
+            num_blocks * spec.num_kv_heads, spec.head_size, spec.block_size, torch.float16
+        )
+        k_shape = (num_blocks, spec.num_kv_heads, spec.head_size, spec.block_size)
         return SpyrePagedKVCache(
-            k_pages=torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
-            v_pages=torch.zeros(shape, dtype=torch.float16).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
+            k_pages=torch.zeros(k_shape, dtype=torch.float16).to(device, device_layout=k_layout),  # ty: ignore[no-matching-overload]
+            v_pages=v_pages,
         )
 
     def kv_write_index(
@@ -203,16 +221,27 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         """
         block = torch.div(slot_mapping, self.block_size, rounding_mode="floor")
         base = block * self.num_kv_heads * self.block_size + slot_mapping % self.block_size
-        return [
+        rows = [
             convert(base + h * self.block_size, device=device) for h in range(self.num_kv_heads)
         ]
+        if not _KT_CACHE:
+            return rows
+        # A transposed K page is written whole, so K indexes by page id. One id per
+        # block_size-token group, in the order the store reshapes them.
+        num_tokens = slot_mapping.shape[0]
+        if num_tokens % self.block_size:
+            return (rows, None)
+        groups = block.reshape(num_tokens // self.block_size, self.block_size)[:, 0]
+        return (rows, convert(groups.to(torch.int32), device=device))
 
     def kv_slot_views(self, kv_cache: SpyrePagedKVCache) -> SpyrePagedKVCache:
         """One row per (block, kv_head, token), which is what ``kv_write_index`` indexes."""
         if self._kv_slots is None:
             k_pages, v_pages = kv_cache
-            shape = (-1, k_pages.shape[3])
-            self._kv_slots = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
+            v_rows = v_pages.view(-1, v_pages.shape[3])
+            # Under the flag K is written a page at a time, so it is handed over whole.
+            k_side = k_pages if _KT_CACHE else k_pages.view(-1, k_pages.shape[3])
+            self._kv_slots = SpyrePagedKVCache(k_side, v_rows)
         return self._kv_slots
 
     def _batched_decode_supported(self) -> bool:
@@ -223,8 +252,10 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
     def _folded_pages(self, k_pages: torch.Tensor, v_pages: torch.Tensor) -> SpyrePagedKVCache:
         """The cache as [pages * kv_head, block_size, head_size]; free under this layout."""
         if self._folded is None:
-            shape = (k_pages.shape[0] * k_pages.shape[1], k_pages.shape[2], k_pages.shape[3])
-            self._folded = SpyrePagedKVCache(k_pages.view(shape), v_pages.view(shape))
+            def fold(t):
+                return t.view(t.shape[0] * t.shape[1], t.shape[2], t.shape[3])
+
+            self._folded = SpyrePagedKVCache(fold(k_pages), fold(v_pages))
         return self._folded
 
     # The base publishes one table per sequence; this layout needs two, so the pair travels
@@ -305,6 +336,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     self.block_size,
                     self.logits_soft_cap,
                     out,
+                    _KT_CACHE,
                 )
 
         # The folded kernel carries num_heads output units; lifting the cap for it
@@ -328,6 +360,7 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                 self.block_size,
                 self.logits_soft_cap,
                 out,
+                _KT_CACHE,
             )
 
     # `slot_mapping` narrows the base's single index tensor to the per-head list
@@ -344,8 +377,18 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         assert key.device.type == kv_cache[0].device.type, (
             f"kv cache update source is on {key.device.type}, pages on {kv_cache[0].device.type}"
         )
-        k_rows, v_rows = self.kv_slot_views(kv_cache)
-        self._reshape_fn(key, value, k_rows, v_rows, slot_mapping)
-        # Only k_rows is returned; Inductor fuses the stores into one kernel, so
-        # ordering the read after it covers the V write too.
-        return k_rows
+        k_side, v_rows = self.kv_slot_views(kv_cache)
+        if not _KT_CACHE:
+            self._reshape_fn(key, value, k_side, v_rows, slot_mapping)
+            # Only k_side is returned; Inductor fuses the stores into one kernel, so
+            # ordering the read after it covers the V write too.
+            return k_side
+        v_row_index, block_ids = slot_mapping
+        if block_ids is None:
+            # Not a whole number of pages; see the v-only store's docstring for when
+            # dropping K here is sound.
+            return self._reshape_kt_v_fn(key, value, v_rows, v_row_index)
+        num_blocks = key.shape[0] // self.block_size
+        return self._reshape_kt_fn(
+            key, value, k_side, v_rows, block_ids, v_row_index, num_blocks, self.block_size
+        )

@@ -30,3 +30,39 @@ def reshape_and_cache_head_major_kernel(key, value, k_rows, v_rows, row_index):
     for h, idx in enumerate(row_index):
         k_rows.index_copy_(0, idx, key[:, h])
         v_rows.index_copy_(0, idx, value[:, h])
+
+
+def reshape_and_cache_head_major_kt_kernel(
+    key, value, k_pages, v_rows, block_ids, v_row_index, num_blocks, block_size
+):
+    """Store into a K cache whose pages are ``[head_size, block_size]``.
+
+    K's token axis is innermost there, so a token's key is a column rather than a row and
+    the per-token row copy V uses cannot express it. This writes whole pages instead,
+    which is exact when the step's tokens are a whole number of block-aligned pages.
+
+    The materializing pass runs *after* the permute on purpose: before it, the scatter is
+    left reconciling two stick axes and fails to lower ("no mechanism to resolve stick
+    incompatibility").
+    """
+    kv, head_size = key.shape[1], key.shape[2]
+    pages = (
+        key.reshape(num_blocks, block_size, kv, head_size).permute(0, 2, 3, 1) * 1.0
+    ).reshape(num_blocks, kv, head_size, block_size)
+    k_pages.index_copy_(0, block_ids, pages)
+    value = value * 1.0
+    for h, idx in enumerate(v_row_index):
+        v_rows.index_copy_(0, idx, value[:, h])
+    return k_pages
+
+
+def reshape_and_cache_head_major_kt_v_only_kernel(key, value, v_rows, v_row_index):
+    """V store alone, for a step whose tokens are not a whole number of pages.
+
+    Only reachable when nothing reads the K it skips: at ``--output-len 1`` the first
+    token comes out of the last prefill chunk and no decode step runs.
+    """
+    value = value * 1.0
+    for h, idx in enumerate(v_row_index):
+        v_rows.index_copy_(0, idx, value[:, h])
+    return v_rows

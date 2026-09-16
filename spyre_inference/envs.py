@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LAYOUT: str = "token_major"
     SPYRE_ATTN_MAX_CORES: int = 0
+    SPYRE_ATTN_KT_CACHE: bool = False
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
@@ -79,6 +80,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Core cap for the attention compile only, leaving the rest of the model on all 32.
     # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
+    "SPYRE_ATTN_KT_CACHE": lambda: os.getenv("SPYRE_ATTN_KT_CACHE", "0") == "1",
     # When "1" (default), enables the batched multi-sequence decode kernel for
     # batches of at least _MIN_BATCHED_SEQS sequences; smaller batches take the
     # per-seq loop either way. "0" forces the loop for all batch sizes. Not
