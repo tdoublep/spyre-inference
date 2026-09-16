@@ -45,6 +45,7 @@ from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.ops.batched_decode import batched_decode_kernel
 from spyre_inference.v1.attention.ops.layout import (
     INT32_ELEMS_PER_STICK,
+    query_staging_layout,
     slot_major_kv_layout,
     stick_aligned_len,
 )
@@ -1176,12 +1177,17 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         kernel reads its arguments from storage offset 0 (torch-spyre#3770), so a
         slice past row 0 reads the wrong storage. Allocated whole (hence at offset
         0) and reused, at one size for the whole run.
+
+        Row-outermost (``query_staging_layout``): the kernels gather from and scatter into
+        the row axis, which the default layout would relayout whole per call.
         """
         if self._staging is None:
             shape = (self.staging_rows, self.num_heads, self.head_size)
+            # Host-allocated then transferred: only .to() takes a device_layout.
+            layout = query_staging_layout(*shape, self.model_dtype)
             self._staging = (
-                convert(torch.zeros(shape, dtype=self.model_dtype), device=device),
-                convert(torch.zeros(shape, dtype=self.model_dtype), device=device),
+                torch.zeros(shape, dtype=self.model_dtype).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
+                torch.zeros(shape, dtype=self.model_dtype).to(device, device_layout=layout),  # ty: ignore[no-matching-overload]
             )
         return self._staging
 
