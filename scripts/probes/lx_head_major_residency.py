@@ -156,12 +156,14 @@ args = (
     D,
     B,
 )
+# The folded kernel needs no head gather, so it takes no head index tables.
+kernel_args = args[:5] + args[6:] if FOLD else args
 
 prev_cores = ts_config.sencores
 if MAX_CORES:
     ts_config.sencores = MAX_CORES
 try:
-    got = torch.compile(KERNEL, dynamic=False)(*args).cpu()[:Q_LEN]
+    got = torch.compile(KERNEL, dynamic=False)(*kernel_args).cpu()[:Q_LEN]
 finally:
     ts_config.sencores = prev_cores
 
