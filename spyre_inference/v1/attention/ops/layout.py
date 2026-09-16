@@ -58,21 +58,3 @@ def head_major_kv_layout(num_pages: int, block_size: int, head_size: int, dtype:
         stride_map=[block_size * head_size, head_size, eps, 1],
         device_dtype=get_device_dtype(dtype),
     )
-
-
-def query_staging_layout(num_rows: int, num_heads: int, head_size: int, dtype: torch.dtype):
-    """Row-outermost layout for the ``[num_rows, num_heads, head_size]`` staging buffers.
-
-    The kernels gather query rows out of these and scatter output back in, which needs the
-    row axis whole at device dim 0. The default tiled layout puts it second-innermost, so
-    the compiler relayouts the whole buffer per call instead (torch-spyre#3705).
-    """
-    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
-
-    eps = get_elem_in_stick(dtype)
-    sticks = (head_size + eps - 1) // eps
-    return SpyreTensorLayout(
-        device_size=[num_rows, num_heads, sticks, eps],
-        stride_map=[num_heads * sticks * eps, sticks * eps, eps, 1],
-        device_dtype=get_device_dtype(dtype),
-    )

@@ -28,10 +28,31 @@ from vllm.utils.torch_utils import direct_register_custom_op
 logger = init_logger(__name__)
 
 
+def _row_outermost_layout(shape: torch.Size, dtype: torch.dtype):
+    """Layout with dim 0 whole at device position 0, last dim as the stick axis.
+
+    Spyre needs an indexed dim outermost; the default tiled layout places it
+    second-innermost, so a gather or scatter relayouts the whole tensor instead.
+    """
+    from torch_spyre._C import SpyreTensorLayout, get_device_dtype, get_elem_in_stick
+
+    eps = get_elem_in_stick(dtype)
+    *lead, width = shape
+    dims = [*lead, (width + eps - 1) // eps, eps]
+    strides = [1]
+    for d in reversed(dims[1:]):
+        strides.append(strides[-1] * d)
+    strides.reverse()
+    return SpyreTensorLayout(
+        device_size=dims, stride_map=strides, device_dtype=get_device_dtype(dtype)
+    )
+
+
 def _convert_op_func(
     tensor: torch.Tensor,
     device: torch.device | None = None,
     dtype: torch.dtype | None = None,
+    row_major: bool = False,
 ) -> torch.Tensor:
     """Opaque-op body: device/dtype conversion with the Spyre dtype detour.
 
@@ -55,6 +76,12 @@ def _convert_op_func(
     if tensor.dtype != target_dtype:
         tensor = tensor.to(dtype=target_dtype)
 
+    if row_major and target_device.type == "spyre":
+        # Only .to() carries a device_layout, so this replaces the transfer below.
+        return tensor.to(  # ty: ignore[no-matching-overload]
+            target_device, device_layout=_row_outermost_layout(tensor.shape, target_dtype)
+        )
+
     if tensor.device.type != target_device.type:
         tensor = tensor.to(device=target_device)
 
@@ -65,13 +92,14 @@ def _convert_op_fake(
     tensor: torch.Tensor,
     device: torch.device | None = None,
     dtype: torch.dtype | None = None,
+    row_major: bool = False,
 ) -> torch.Tensor:
     target_device = device if device is not None else tensor.device
     target_dtype = dtype if dtype is not None else tensor.dtype
     return torch.empty(tensor.shape, dtype=target_dtype, device=target_device)
 
 
-def convert(tensor, device=None, dtype=None):
+def convert(tensor, device=None, dtype=None, row_major=False):
     """Convert tensor device and/or dtype. No-op when both are None.
 
     Routes through the opaque custom op `torch.ops.vllm.spyre_convert` so the
@@ -83,6 +111,7 @@ def convert(tensor, device=None, dtype=None):
         tensor: Input tensor, or None (passed through as None).
         device: Target device as `str` or `torch.device` (None = keep current).
         dtype: Target dtype (None = keep current).
+        row_major: Place dim 0 outermost on device (see `_row_outermost_layout`).
 
     Returns:
         Converted tensor, or None if input is None.
@@ -97,11 +126,7 @@ def convert(tensor, device=None, dtype=None):
     target_dtype = dtype if dtype is not None else tensor.dtype
     if tensor.device.type == target_device.type and tensor.dtype == target_dtype:
         return tensor
-    return torch.ops.vllm.spyre_convert(
-        tensor,
-        device,  # ty: ignore[invalid-argument-type]
-        dtype,  # ty: ignore[invalid-argument-type]
-    )
+    return torch.ops.vllm.spyre_convert(tensor, device, dtype, row_major)
 
 
 @lru_cache(maxsize=1)
