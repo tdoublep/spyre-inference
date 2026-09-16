@@ -43,7 +43,9 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     _call_kernel,
 )
 from spyre_inference.v1.attention.ops.layout import head_major_kv_layout
-from spyre_inference.v1.attention.ops.page_attn_head_major import page_attn_head_major_kernel
+from spyre_inference.v1.attention.ops.page_attn_head_major import (
+    page_attn_head_major_decode_kernel,
+)
 from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
     page_attn_head_major_prefill_kernel,
 )
@@ -55,8 +57,8 @@ logger = init_logger(__name__)
 
 # Compiled apart from the token-major kernels: same reason those are compiled at module
 # scope, and a shared artifact would guard on the page shape either way.
-_page_attn_compiled = torch.compile(page_attn_head_major_kernel, dynamic=False)
 # Kernels already specialise per padded_query_len, so dispatching per regime adds no compiles.
+_page_attn_decode_compiled = torch.compile(page_attn_head_major_decode_kernel, dynamic=False)
 _page_attn_prefill_compiled = torch.compile(page_attn_head_major_prefill_kernel, dynamic=False)
 
 _SPYRE_CORES = 32
@@ -125,14 +127,13 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         # page LX-resident is a 2-D subscript, which lowers to aten.index and fails eager
         # by upcasting the int32 index to int64. Attention compiles in its own domain, so
         # this leaves the rest of the model eager.
-        self._attn_fn = _page_attn_compiled
+        self._decode_attn_fn = _page_attn_decode_compiled
         if self.alibi_slopes is not None:
             raise NotImplementedError(
                 "ALiBi is not supported on the head-major KV layout; use the default "
                 "token-major layout (SPYRE_ATTN_KV_LAYOUT=token_major)."
             )
         self._folded: SpyrePagedKVCache | None = None
-        self._head_index_tables: list[torch.Tensor] | None = None
 
         logger.info_once(
             "Using SpyreHeadMajorAttentionBackend with a head-major paged KV cache, "
@@ -262,28 +263,17 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
                     out,
                 )
 
-        if self._head_index_tables is None:
-            self._head_index_tables = [
-                convert(
-                    torch.tensor(
-                        [kv * self.num_queries_per_kv + g for kv in range(self.num_kv_heads)],
-                        dtype=torch.int32,
-                    ),
-                    device=k_pages.device,
-                )
-                for g in range(self.num_queries_per_kv)
-            ]
-
+        # The folded kernel carries num_heads output units; lifting the cap for it
+        # measured no difference, so it is left as is.
         with _capped_cores(self.num_kv_heads * padded_query_len):
             return _call_kernel(
                 "page attention",
-                self._attn_fn,
+                self._decode_attn_fn,
                 query,
                 row_table,
                 k_folded,
                 v_folded,
                 kv_row_table,
-                self._head_index_tables,
                 mask_tiles,
                 self.scale,
                 num_blocks,
