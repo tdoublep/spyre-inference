@@ -88,6 +88,7 @@ def _select_prefill_kernel():
         "foldt": _v.page_attn_head_major_prefill_foldt_kernel,
         "slabb": _v.page_attn_head_major_prefill_slabb_kernel,
         "qknotr": _v.page_attn_head_major_prefill_qknotr_kernel,
+        "ktmat": _v.page_attn_head_major_prefill_ktmat_kernel,
     }[base]
     if flag == "prescale":
         fn = functools.partial(fn, prescale=True)

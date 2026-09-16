@@ -538,3 +538,55 @@ def page_attn_head_major_prefill_qknotr_kernel(
         acc = scores if acc is None else acc + scores
     attn = _unfold_out(acc[:, :, :head_size], padded_query_len, num_heads, head_size)
     return _store(out, attn, query_row_index, padded_query_len)
+
+
+def page_attn_head_major_prefill_ktmat_kernel(
+    query, query_row_index, k_pages, v_pages, page_index_tables, mask_tiles, scale,
+    num_blocks, padded_query_len, num_heads, num_kv_heads, head_size, block_size,
+    logits_soft_cap=0.0, out=None, k_transposed=False, prescale=False,
+):
+    """915's kernel, but the swapped K page is materialized once per block.
+
+    The swap's cost scales with query rows, not page bytes, so it looks like the operand
+    being re-conditioned per output row rather than shuffled once. An elementwise pass
+    forces one real relayout per block instead -- no cache-layout or write-path change.
+    """
+    g = num_heads // num_kv_heads
+    q_rows = query.index_select(0, query_row_index[:padded_query_len])
+    q = (
+        q_rows.unsqueeze(0)
+        .transpose(1, 2)
+        .reshape(num_kv_heads, g, padded_query_len, head_size)
+    )
+
+    tile_max = None
+    tile_sum = None
+    tile_out = None
+    for i in range(num_blocks):
+        page_idx = page_index_tables[i]
+        k_page = k_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+        v_page = v_pages.index_select(0, page_idx).squeeze(0).unsqueeze(1)
+        # Not contiguous(): a page view can already report contiguous, making it a no-op.
+        k_t = k_page.transpose(-2, -1) * 1.0
+        scores = torch.matmul(q, k_t) * scale
+        if logits_soft_cap > 0.0:
+            scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
+        scores = scores + mask_tiles[i]
+        scores_max = torch.amax(scores, dim=-1, keepdim=True)
+        if i == 0:
+            tile_max = scores_max
+            probs = torch.exp(scores - tile_max)
+            tile_out = torch.matmul(probs, v_page)
+            tile_sum = probs.sum(dim=-1, keepdim=True)
+        else:
+            new_max = torch.maximum(tile_max, scores_max)
+            rescale = torch.exp(tile_max - new_max)
+            tile_out = tile_out * rescale
+            tile_sum = tile_sum * rescale
+            probs = torch.exp(scores - new_max)
+            tile_out = tile_out + torch.matmul(probs, v_page)
+            tile_sum = tile_sum + probs.sum(dim=-1, keepdim=True)
+            tile_max = new_max
+
+    attn = _unfold_out(tile_out / tile_sum, padded_query_len, num_heads, head_size)
+    return _store(out, attn, query_row_index, padded_query_len)
