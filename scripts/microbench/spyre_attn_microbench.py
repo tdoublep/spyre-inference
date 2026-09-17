@@ -673,12 +673,12 @@ def expected_kernels(row, span):
     attention one.
     """
     num_seqs, num_decode = row["num_reqs"], row["num_decode_seqs"]
-    if row["attn_path"].startswith("batched"):
-        attn = 1 + (num_seqs - num_decode)
-    else:
-        attn = num_seqs
+    batched = row["attn_path"].startswith("batched")
+    per_seq_kernels = num_seqs - num_decode if batched else num_seqs
+    attn = (1 if batched else 0) + per_seq_kernels
+    # Only the per-seq unrolled kernel emits a separate store; the batched one fuses it.
     if row.get("attn_kv_layout") == "head_major" and row["padded_query_len"] == 1:
-        attn *= 2
+        attn += per_seq_kernels
     write = 1 if row["kv_write"] else 0
     if span == SPANS["reshape_and_cache"]:
         return write
@@ -1075,7 +1075,7 @@ def main():
         default=None,
         help="KV cache decomposition the backend reads (SPYRE_ATTN_KV_LAYOUT). "
         "'head_major' stores a page as [KV, block_size, head_size] and selects the "
-        "head-major backend, which has no batched decode kernel.",
+        "head-major backend.",
     )
     ap.add_argument(
         "--span",
@@ -1164,11 +1164,6 @@ def main():
     # Selects the backend via the platform, and is cached on first envs read like the rest.
     attn_kv_layout = cfg.setdefault("attn_kv_layout", "token_major")
     os.environ["SPYRE_ATTN_KV_LAYOUT"] = attn_kv_layout
-    if attn_kv_layout == "head_major" and next(iter(batched_modes)):
-        raise SystemExit(
-            "the head-major KV layout has no batched decode kernel; run the batched "
-            "variant on token_major."
-        )
 
     entries = entries_from_config(cfg)
     limits = derive_lattice(entries)
