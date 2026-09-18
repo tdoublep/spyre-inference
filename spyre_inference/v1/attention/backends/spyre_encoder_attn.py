@@ -314,21 +314,40 @@ def encoder_mask(
     return mask
 
 
-def _slot_mask(slots, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    """The group's additive mask, built where the consumer can read it.
+_SLOT_MASK_CACHE: dict[tuple, torch.Tensor] = {}
 
-    Inlined attention traces this, and a host build followed by ``convert`` leaves a
-    ``spyre_convert`` FallbackKernel in the graph that the backend's
-    ``propagate_named_dims`` pass rejects, so build straight on device there.
+
+def _slot_mask_key(slots, dtype: torch.dtype) -> tuple:
+    return (slots.extent, tuple(slots.kv_lens()), dtype)
+
+
+def prime_slot_mask(slots, dtype: torch.dtype, device: torch.device) -> None:
+    """Build this step's slot mask *outside* any traced region.
+
+    The mask depends only on host values, never on a traced tensor, so it does not
+    belong in the graph at all. Building it here gives the inlined-attention path
+    both properties it needs: ``convert``'s device layout (an in-graph build lands
+    in a layout the backend rejects with "no mechanism to resolve stick
+    incompatibility", because ``kv_len`` is not stick-aligned and the write is a
+    partial stick), and no ``spyre_convert`` FallbackKernel in the graph for
+    ``propagate_named_dims`` to choke on. ``_build_plans`` then only looks it up, so
+    dynamo lifts it as a graph input.
     """
-    if torch.compiler.is_compiling():
-        return torch.cat(
-            [encoder_mask(slots.extent, kv, dtype, device) for kv in slots.kv_lens()], dim=0
+    key = _slot_mask_key(slots, dtype)
+    if key not in _SLOT_MASK_CACHE:
+        _SLOT_MASK_CACHE[key] = convert(
+            torch.cat([encoder_mask(slots.extent, kv, dtype) for kv in slots.kv_lens()], dim=0),
+            device,
         )
-    return convert(
-        torch.cat([encoder_mask(slots.extent, kv, dtype) for kv in slots.kv_lens()], dim=0),
-        device,
-    )
+
+
+def _slot_mask(slots, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """The group's additive mask. Primed by ``prime_slot_mask`` before the forward."""
+    cached = _SLOT_MASK_CACHE.get(_slot_mask_key(slots, dtype))
+    if cached is not None:
+        return cached
+    prime_slot_mask(slots, dtype, device)
+    return _SLOT_MASK_CACHE[_slot_mask_key(slots, dtype)]
 
 
 def _host_pad_head_dim(x: torch.Tensor, padded: int) -> torch.Tensor:

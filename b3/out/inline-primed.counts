@@ -1,0 +1,11 @@
+arm            inline-primed
+granularity    block
+layers         12
+module         /tmp/b3-inductor-inline-primed/nc/cncesnzwl4vskr4euokj6pwqiwanxei42y7cumrcm72txhm2rsux.py
+module_lines   2178
+sdsc_run_sites 1
+sdsc_distinct  1
+modules_total  16
+unified_attn   0
+fallback       0
+to_dtype_cpu   0

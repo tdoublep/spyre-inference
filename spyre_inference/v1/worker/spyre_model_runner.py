@@ -373,6 +373,16 @@ class _SpyreModelWrapper:
         if self._slot_padding and envs.SPYRE_ENCODER_SLOT_PADDING:
             # Left set for the whole step: the pooler reads it after the forward.
             encoder_slots.set_current(self._plan_slots(kwargs))
+            if envs.SPYRE_ATTN_INLINE:
+                # Inlined attention traces _build_plans, so the mask has to exist
+                # before the forward rather than be built inside the graph.
+                slots = encoder_slots.current()
+                if slots is not None:
+                    from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+                        prime_slot_mask,
+                    )
+
+                    prime_slot_mask(slots, torch.float16, self._spyre_device)
 
         def _convert_int(t):
             if (
