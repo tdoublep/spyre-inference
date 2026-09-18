@@ -210,28 +210,56 @@ _encoder_fused_compiled = torch.compile(_encoder_fused_kernel, dynamic=False)
 
 
 def _encoder_slot_kernel(
-    out, query, key, value, mask, scale, group, num_heads, num_kv_heads, head_size
+    out, query, key, value, mask, scale, group, num_heads, num_kv_heads, head_size, cap=0
 ):
     """Attend a slot-padded body: every request already owns ``extent`` rows.
 
     The gather and store the packed layout needs are ``.view()``s here, which is
     the whole point -- they were 60% of this kernel's device time. Keyed on
-    ``(out.shape[0], group)``; ``extent`` follows from the two.
+    ``(out.shape[0], group, cap)``; ``extent`` follows from the first two.
+
+    ``cap`` bounds how many slots share one SDPA call. The score tensor is
+    ``[slots, heads, extent, extent]``, so attending the whole buffer at once
+    grows it with the batch and cost per slot rises with it; tiling the slot axis
+    holds the tile size fixed. The loop is unrolled into this one graph, so the
+    launch count per layer does not change. Slicing here is safe where slicing
+    the kernel's arguments would not be (torch-spyre#3770): these views are
+    internal to the traced region, and ``out``/``query`` still arrive at offset 0.
     """
     extent = query.shape[0] // group
-    q = query.view(group, extent, num_heads, head_size).transpose(1, 2)
-    k = key.view(group, extent, num_kv_heads, head_size).transpose(1, 2)
-    v = value.view(group, extent, num_kv_heads, head_size).transpose(1, 2)
-    attn = F.scaled_dot_product_attention(
-        q,
-        k,
-        v,
-        attn_mask=mask,
-        scale=scale,
-        is_causal=False,
-        enable_gqa=(num_heads != num_kv_heads),
-    )
-    out.copy_(attn.transpose(1, 2).reshape(group * extent, num_heads, head_size))
+    gqa = num_heads != num_kv_heads
+    if not cap or cap >= group:
+        q = query.view(group, extent, num_heads, head_size).transpose(1, 2)
+        k = key.view(group, extent, num_kv_heads, head_size).transpose(1, 2)
+        v = value.view(group, extent, num_kv_heads, head_size).transpose(1, 2)
+        attn = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=mask,
+            scale=scale,
+            is_causal=False,
+            enable_gqa=gqa,
+        )
+        out.copy_(attn.transpose(1, 2).reshape(group * extent, num_heads, head_size))
+        return out
+
+    q = query.view(group, extent, num_heads, head_size)
+    k = key.view(group, extent, num_kv_heads, head_size)
+    v = value.view(group, extent, num_kv_heads, head_size)
+    out_slots = out.view(group, extent, num_heads, head_size)
+    for start in range(0, group, cap):
+        stop = min(start + cap, group)
+        tile = F.scaled_dot_product_attention(
+            q[start:stop].transpose(1, 2),
+            k[start:stop].transpose(1, 2),
+            v[start:stop].transpose(1, 2),
+            attn_mask=mask[start:stop],
+            scale=scale,
+            is_causal=False,
+            enable_gqa=gqa,
+        )
+        out_slots[start:stop].copy_(tile.transpose(1, 2))
     return out
 
 
@@ -454,6 +482,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             num_heads,
             num_kv_heads,
             head_size,
+            envs.SPYRE_ENCODER_MAX_ATTN_GROUP,
         )
 
     def _run_store(self, out, row_index, attn):

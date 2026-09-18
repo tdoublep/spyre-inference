@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     SPYRE_BATCHED_DECODE: bool = False
     SPYRE_ENCODER_BATCHED_ATTN: bool = True
     SPYRE_ENCODER_SLOT_PADDING: bool = True
+    SPYRE_ENCODER_MAX_ATTN_GROUP: int = 0
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
@@ -86,6 +87,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # warmup. Set to 0 to trade that back for the shorter startup.
     "SPYRE_ENCODER_BATCHED_ATTN": lambda: bool(int(os.getenv("SPYRE_ENCODER_BATCHED_ATTN", "1"))),
     "SPYRE_ENCODER_SLOT_PADDING": lambda: bool(int(os.getenv("SPYRE_ENCODER_SLOT_PADDING", "1"))),
+    # Slots per SDPA call inside the slot kernel. The score tensor is
+    # [slots, heads, extent, extent] -- 25 MB at 4 slots of 512, and cost per slot
+    # climbs steeply above that, so a whole-buffer SDPA is what makes a larger
+    # batch lose. Tiling the batch axis inside the graph keeps one launch per
+    # layer. 0 attends the whole buffer at once.
+    "SPYRE_ENCODER_MAX_ATTN_GROUP": lambda: int(os.getenv("SPYRE_ENCODER_MAX_ATTN_GROUP", "0")),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.
