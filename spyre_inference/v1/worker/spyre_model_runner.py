@@ -58,6 +58,7 @@ from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.model_executor.models.utils import PPMissingLayer
 from vllm.pooling_params import PoolingParams
 from vllm.tasks import PoolingTask
+from vllm.v1.kv_cache_interface import EncoderOnlyAttentionSpec
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     KVConnectorOutput,
@@ -97,6 +98,7 @@ from spyre_inference.v1.pool import (
     copy_pooler_output_to_cpu,
     select_rows,
 )
+from spyre_inference.v1.worker import encoder_slots
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     logits_row_buckets,
@@ -305,6 +307,8 @@ class _SpyreModelWrapper:
         keep_outputs_on_device: bool = False,
         logits_row_buckets: list[int] | None = None,
         shape_bucketer: SpyreShapeBucketer | None = None,
+        slot_padding: bool = False,
+        max_slots: int = 0,
     ):
         # Use object.__setattr__ to avoid triggering __setattr__ override
         object.__setattr__(self, "_model", model)
@@ -312,12 +316,64 @@ class _SpyreModelWrapper:
         object.__setattr__(self, "_keep_outputs_on_device", keep_outputs_on_device)
         object.__setattr__(self, "_logits_row_buckets", logits_row_buckets or [])
         object.__setattr__(self, "_shape_bucketer", shape_bucketer)
+        object.__setattr__(self, "_slot_padding", slot_padding)
+        object.__setattr__(self, "_max_slots", max_slots)
+
+    def _plan_slots(self, kwargs):
+        """Reorder input_ids/positions so every request owns its own row slot.
+
+        Done on the host int tensors, before the embedding, so the slot-aligned
+        hidden states cost nothing on device. See ``encoder_slots``.
+        """
+        from vllm.forward_context import get_forward_context
+
+        ids = kwargs.get("input_ids")
+        if ids is None or ids.dim() != 1 or self._shape_bucketer is None:
+            return None
+        try:
+            meta = get_forward_context().attn_metadata
+        except AssertionError:
+            return None
+        if isinstance(meta, dict):
+            meta = next(iter(meta.values()), None)
+        starts = getattr(meta, "query_start_loc", None)
+        if starts is None:
+            return None
+        bounds = starts.cpu().tolist()
+        num_seqs = int(getattr(meta, "num_seqs", len(bounds) - 1))
+        starts = [int(bounds[i]) for i in range(num_seqs)]
+        lens = [int(bounds[i + 1]) - int(bounds[i]) for i in range(num_seqs)]
+        if any(length <= 0 for length in lens) or starts[-1] + lens[-1] > ids.shape[0]:
+            return None
+        layout = encoder_slots.plan(
+            lens,
+            self._shape_bucketer.find_bucket,
+            self._max_extent_for_slots,
+            self._max_slots,
+        )
+        if layout is None:
+            return None
+        kwargs["input_ids"] = encoder_slots.repack(ids, starts, lens, layout, int(ids[0]))
+        positions = kwargs.get("positions")
+        if positions is not None:
+            if positions.dim() != 1:
+                return None
+            kwargs["positions"] = encoder_slots.repack(positions, starts, lens, layout, 0)
+        return layout
+
+    @property
+    def _max_extent_for_slots(self) -> int:
+        return self._shape_bucketer.bucket_sizes[-1] if self._shape_bucketer else 0
 
     def __call__(self, *args, **kwargs):
         # Convert integer tensor inputs to Spyre int64. Do not use int32:
         # stock torch-spyre SDSC cannot schedule integer add (warmup crash
         # ``0_add``). RoBERTa ``position_ids + padding_idx`` is applied on CPU
         # in models/roberta.py.
+        if self._slot_padding and envs.SPYRE_ENCODER_SLOT_PADDING:
+            # Left set for the whole step: the pooler reads it after the forward.
+            encoder_slots.set_current(self._plan_slots(kwargs))
+
         def _convert_int(t):
             if (
                 t is not None
@@ -605,7 +661,23 @@ class TorchSpyreModelRunner(GPUModelRunner):
                 else logits_row_buckets(bucketer.bucket_sizes, self.max_num_reqs)
             ),
             shape_bucketer=bucketer,
+            slot_padding=self._slot_padding_supported(),
+            # total = find_bucket(num_seqs * extent) < 2 * num_seqs * extent, and a
+            # bucket floor of ENCODER_MIN_BODY_BUCKET can add slots for a tiny batch.
+            max_slots=max(4, 2 * self.max_num_reqs),
         )
+
+    def _slot_padding_supported(self) -> bool:
+        """Slot padding reorders the body's rows, so only row-addressed poolers.
+
+        CLS/LAST name their rows through ``cursor_row_indices_cpu``, which follows
+        the layout. MEAN and the token-wise poolers read a contiguous prefix of the
+        packed body and would silently read padding instead.
+        """
+        if self.model_config.runner_type != "pooling":
+            return False
+        pooler_config = getattr(self.model_config, "pooler_config", None)
+        return getattr(pooler_config, "seq_pooling_type", None) in ("CLS", "LAST")
 
     @staticmethod
     def _model_has_spyre_fp8(model: nn.Module) -> bool:
@@ -1001,6 +1073,46 @@ class TorchSpyreModelRunner(GPUModelRunner):
         return BatchDescriptor(num_tokens=desc.padded_num_tokens)
 
     @torch.inference_mode()
+    @property
+    def _encoder_only_kv(self) -> bool:
+        """True when no attention layer in the model has a KV cache."""
+        cached = getattr(self, "_encoder_only_kv_cached", None)
+        if cached is None:
+            groups = getattr(self, "kv_cache_config", None)
+            cached = bool(groups and groups.kv_cache_groups) and all(
+                isinstance(g.kv_cache_spec, EncoderOnlyAttentionSpec)
+                for g in groups.kv_cache_groups
+            )
+            self._encoder_only_kv_cached = cached
+        return cached
+
+    def _get_slot_mappings(self, num_tokens_padded: int, *args, **kwargs):
+        """Reuse one zero buffer per shape for a cache that does not exist.
+
+        Upstream allocates and zero-fills a ``[num_tokens_padded]`` int64 slot
+        mapping on the device every step for ``EncoderOnlyAttentionSpec``, then
+        hands it to a backend whose ``build()`` ignores it. The buffer is
+        write-only from the model's point of view, so one per shape is enough,
+        and shapes are bucketed.
+        """
+        if not (envs.SPYRE_ENCODER_FASTPATH and self._encoder_only_kv):
+            return super()._get_slot_mappings(num_tokens_padded, *args, **kwargs)
+
+        cache = self.__dict__.setdefault("_encoder_slot_mapping_cache", {})
+        entry = cache.get(num_tokens_padded)
+        if entry is None:
+            dummy = torch.zeros((num_tokens_padded,), dtype=torch.int64, device=self.device)
+            by_gid = {
+                gid: dummy for gid, _ in enumerate(self.kv_cache_config.kv_cache_groups)
+            }
+            by_layer = {
+                name: dummy
+                for group in self.kv_cache_config.kv_cache_groups
+                for name in group.layer_names
+            }
+            entry = cache[num_tokens_padded] = (by_gid, by_layer)
+        return entry
+
     def _dummy_run(self, *args, **kwargs):
         """Force D2H during dummy forward (upstream logits index is CPU).
 

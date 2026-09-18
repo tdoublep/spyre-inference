@@ -104,6 +104,39 @@ def convert(tensor, device=None, dtype=None):
     )
 
 
+def _offset_positions_op_func(
+    position_ids: torch.Tensor, offset: int, device: torch.device
+) -> torch.Tensor:
+    """Opaque-op body: ``position_ids + offset`` via the host, back as int64.
+
+    Stock torch-spyre cannot schedule an SDSC int32 add, and an int64 add
+    CPU-falls-back through ``spyre::to_dtype_cpu``, which is registered only for
+    PrivateUse1 -- so tracing the add emits a fallback the dispatcher then
+    refuses on CPU. Keeping the whole detour behind an opaque op is what lets a
+    whole-model graph (``SPYRE_COMPILE_GRANULARITY=model``) compile and run.
+    """
+    pos = position_ids
+    if pos.device.type != "cpu":
+        pos = pos.to(device="cpu")
+    pos = pos + int(offset)
+    return pos.to(device=device, dtype=torch.int64)
+
+
+def _offset_positions_op_fake(
+    position_ids: torch.Tensor, offset: int, device: torch.device
+) -> torch.Tensor:
+    return torch.empty(position_ids.shape, dtype=torch.int64, device=device)
+
+
+def offset_positions(position_ids: torch.Tensor, offset: int, device: torch.device):
+    """``position_ids + offset`` as int64 on ``device``."""
+    return torch.ops.vllm.spyre_offset_positions(
+        position_ids,
+        offset,
+        device,  # ty: ignore[invalid-argument-type]
+    )
+
+
 @lru_cache(maxsize=1)
 def register():
     """Register the spyre_convert custom op with vLLM."""
@@ -116,6 +149,13 @@ def register():
         dispatch_key="CompositeExplicitAutograd",
     )
     logger.debug_once("Registered custom op: spyre_convert")
+    direct_register_custom_op(
+        op_name="spyre_offset_positions",
+        op_func=_offset_positions_op_func,
+        fake_impl=_offset_positions_op_fake,
+        dispatch_key="CompositeExplicitAutograd",
+    )
+    logger.debug_once("Registered custom op: spyre_offset_positions")
 
 
 def place_row_gathered(src: torch.Tensor, fn, name: str) -> torch.Tensor:

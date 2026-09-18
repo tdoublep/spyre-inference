@@ -36,6 +36,7 @@ from vllm.v1.worker.gpu_worker import Worker, init_worker_distributed_environmen
 from vllm.v1.worker.worker_base import CompilationTimes
 
 from spyre_inference import envs
+from spyre_inference.v1.worker import _hostprobe
 from spyre_inference.custom_ops import register_all
 from spyre_inference.models import register_models
 from spyre_inference.platform import _raise_dynamo_recompile_limits
@@ -181,6 +182,7 @@ class TorchSpyreWorker(Worker):
 
         warmup_start_time = time.perf_counter()
         self.model_runner.warming_up_model()
+        _hostprobe.install(self.model_runner)
         self.compilation_config.compilation_time = time.perf_counter() - warmup_start_time
         return CompilationTimes(
             language_model=self.compilation_config.compilation_time,

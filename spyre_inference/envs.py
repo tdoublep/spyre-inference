@@ -37,6 +37,8 @@ if TYPE_CHECKING:
     SPYRE_ATTN_KV_LAYOUT: str = "token_major"
     SPYRE_BATCHED_DECODE: bool = False
     SPYRE_ENCODER_BATCHED_ATTN: bool = True
+    SPYRE_ENCODER_SLOT_PADDING: bool = True
+    SPYRE_ENCODER_FASTPATH: bool = False
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
@@ -84,6 +86,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # dispatch-bound, so grouping is worth ~1.4x warm throughput for ~70s of extra
     # warmup. Set to 0 to trade that back for the shorter startup.
     "SPYRE_ENCODER_BATCHED_ATTN": lambda: bool(int(os.getenv("SPYRE_ENCODER_BATCHED_ATTN", "1"))),
+    "SPYRE_ENCODER_SLOT_PADDING": lambda: bool(int(os.getenv("SPYRE_ENCODER_SLOT_PADDING", "1"))),
+    # Encoder-only models have no KV cache, but upstream still allocates a
+    # zero-filled slot mapping and block table on the device every step and
+    # hands them to a backend that reads neither. Reuse one buffer per shape.
+    "SPYRE_ENCODER_FASTPATH": lambda: bool(int(os.getenv("SPYRE_ENCODER_FASTPATH", "0"))),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.

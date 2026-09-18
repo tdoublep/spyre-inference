@@ -33,7 +33,7 @@ from vllm.model_executor.models.roberta import (
     RobertaForTokenClassification,
 )
 
-from spyre_inference.custom_ops.utils import convert
+from spyre_inference.custom_ops.utils import offset_positions
 from spyre_inference.models._token_type import (
     SpyreTokenTypeEmbedding,
     SpyreTokenTypeModel,
@@ -51,11 +51,12 @@ def offset_roberta_position_ids(
 
     Stock torch-spyre cannot schedule SDSC int32 add (warmup crash:
     ``0_add``), and int64 add CPU-falls-back through ``to_dtype``. Keep the
-    offset off the device so position embedding is only a gather.
+    offset off the device so position embedding is only a gather. The detour
+    lives behind an opaque op so the add is never traced -- tracing it emits a
+    ``spyre::to_dtype_cpu`` fallback that the dispatcher refuses on CPU, which
+    is what stopped ``SPYRE_COMPILE_GRANULARITY=model`` from running at all.
     """
-    pos = convert(position_ids, device="cpu")
-    pos = pos + int(padding_idx) + 1
-    return convert(pos, device=device, dtype=torch.int64)
+    return offset_positions(position_ids, int(padding_idx) + 1, device)
 
 
 class SpyreRobertaEmbedding(SpyreTokenTypeEmbedding, RobertaEmbedding):
