@@ -1,0 +1,11 @@
+arm            inline-block-3
+granularity    block
+layers         12
+module         /tmp/b3-inductor-inline-block-3/2d/c2drpqowddscgbocrrsmnmc3lexjx7zcgrza6f2ojmojmq4l4u6y.py
+module_lines   2394
+sdsc_run_sites 2
+sdsc_distinct  2
+modules_total  6
+unified_attn   0
+fallback       0
+to_dtype_cpu   0

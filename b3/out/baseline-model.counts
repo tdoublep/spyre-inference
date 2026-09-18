@@ -1,0 +1,11 @@
+arm            baseline-model
+granularity    model
+layers         12
+module         /tmp/b3-inductor-baseline-model/hf/chfrm3sxbropkrfhuxymbkibljcy2znac7o5r2v5j7fh3ipmsivh.py
+module_lines   10271
+sdsc_run_sites 29
+sdsc_distinct  29
+modules_total  25
+unified_attn   24
+fallback       0
+to_dtype_cpu   0

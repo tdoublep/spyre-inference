@@ -43,6 +43,13 @@ def _convert_op_func(
     target_dtype = dtype if dtype is not None else tensor.dtype
 
     if tensor.device.type == target_device.type and tensor.dtype == target_dtype:
+        # Inlined attention traces _build_plans, so this op is replayed from the
+        # compiled graph on operands that are already converted. The assert is a
+        # waste-detector, not a correctness requirement, so it steps aside there.
+        from spyre_inference import envs
+
+        if envs.SPYRE_ATTN_INLINE:
+            return tensor
         raise RuntimeError(
             f"Trying to convert a tensor to the same device ({tensor.device.type}) "
             + f"and same dtype ({tensor.dtype}), should never happen!"

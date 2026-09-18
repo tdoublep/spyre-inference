@@ -1,0 +1,315 @@
+INFO 09-18 13:01:29 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 09-18 13:01:29 [__init__.py:54] - spyre_inference -> spyre_inference:register
+INFO 09-18 13:01:29 [__init__.py:66] Loading plugin spyre_inference
+INFO 09-18 13:01:29 [__init__.py:254] Platform plugin spyre_inference is activated
+INFO 09-18 13:01:32 [importing.py:88] Triton not installed or not compatible; certain GPU-related functions will not be available.
+INFO 09-18 13:01:33 [api_utils.py:272] non-default args: {'runner': 'pooling', 'max_model_len': 512, 'enable_prefix_caching': False, 'max_num_seqs': 4, 'disable_log_stats': True, 'compilation_config': {'mode': None, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': [], 'ir_enable_torch_wrap': None, 'splitting_ops': None, 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [2048], 'compile_ranges_endpoints': None, 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': None, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': None, 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': None, 'pass_config': {}, 'max_cudagraph_capture_size': None, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': None, 'static_all_moe_layers': []}, 'model': 'ibm-granite/granite-embedding-278m-multilingual'}
+INFO 09-18 13:01:34 [config.py:961] Found sentence-transformers tokenize configuration.
+INFO 09-18 13:01:34 [model.py:672] Resolved architecture: XLMRobertaModel
+INFO 09-18 13:01:34 [config.py:849] Found sentence-transformers modules configuration.
+INFO 09-18 13:01:34 [config.py:876] Found pooling configuration.
+INFO 09-18 13:01:34 [model.py:1965] Using max model len 512
+WARNING 09-18 13:01:34 [platform.py:332] Capping max_num_batched_tokens to 2048 
+INFO 09-18 13:01:34 [kernel.py:308] Final IR op priority after setting platform defaults: IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native'])
+INFO 09-18 13:01:34 [vllm.py:1422] Cudagraph mode FULL_AND_PIECEWISE is not compatible with compilation mode 1.Overriding to NONE.
+
+    [91m▄█▀▀█▄[0m  [38;5;208m█▀▀▀█▄[0m  [93m█   █[0m  [92m█▀▀▀█▄[0m  [94m█▀▀▀▀[0m    [97;1m█  █▄   █  █▀▀▀▀ █▀▀▀▀  █▀▀▀█▄ █▀▀▀▀  █▄   █  ▄█▀▀█▄ █▀▀▀▀[0m
+    [91m▀▀▄▄▄[0m   [38;5;208m█▄▄▄█▀[0m  [93m▀▄ ▄▀[0m  [92m█▄▄▄█▀[0m  [94m█▄▄▄[0m     [97;1m█  █ █  █  █▄▄▄  █▄▄▄   █▄▄▄█▀ █▄▄▄   █ █  █  █      █▄▄▄[0m
+         [91m█[0m  [38;5;208m█[0m        [93m▀█▀[0m   [92m█ ▀█▄[0m   [94m█[0m        [97;1m█  █  █ █  █     █      █ ▀█▄  █      █  █ █  █      █[0m
+    [91m▀▄▄▄█▀[0m  [38;5;208m█[0m         [93m█[0m    [92m█   ▀█[0m  [94m█▄▄▄▄[0m    [97;1m█  █   ▀█  █     █▄▄▄▄  █   ▀█ █▄▄▄▄  █   ▀█  ▀█▄▄█▀ █▄▄▄▄[0m
+
+    version [97;1m0.1.dev476[0m    model [97;1mibm-granite/granite-embedding-278m-multilingual[0m
+
+INFO 09-18 13:01:34 [threading_config.py:92] Initial threading configuration: OMP_NUM_THREADS=192 OPENBLAS_NUM_THREADS=None MKL_NUM_THREADS=None NUMEXPR_NUM_THREADS=None VECLIB_MAXIMUM_THREADS=None
+INFO 09-18 13:01:34 [threading_config.py:119] SPYRE_NUM_CPUS is set to 32. Setting each threading configuration to 32 for 1 worker(s) (SPYRE_UPDATE_THREAD_CONFIG enabled).
+INFO 09-18 13:01:34 [platform.py:594] Loading worker from: spyre_inference.v1.worker.spyre_worker.TorchSpyreWorker
+INFO 09-18 13:01:34 [platform.py:603] Loading scheduler from: vllm.v1.core.sched.scheduler.Scheduler
+WARNING 09-18 13:01:34 [cpu.py:163] Reset SSM cache type to float32 for AMX mamba attention.
+INFO 09-18 13:01:34 [platform.py:636] Pooling/encoder model has no KV cache; leaving num_gpu_blocks_override unset.
+INFO 09-18 13:01:34 [compilation.py:329] Enabled custom fusions: norm_quant, act_quant
+INFO 09-18 13:01:39 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 09-18 13:01:39 [__init__.py:54] - spyre_inference -> spyre_inference:register
+INFO 09-18 13:01:39 [__init__.py:66] Loading plugin spyre_inference
+INFO 09-18 13:01:39 [__init__.py:254] Platform plugin spyre_inference is activated
+INFO 09-18 13:01:43 [importing.py:88] Triton not installed or not compatible; certain GPU-related functions will not be available.
+(EngineCore pid=1798527) INFO 09-18 13:01:45 [core.py:122] Initializing a V1 LLM engine (v0.28.0) with config: model='ibm-granite/granite-embedding-278m-multilingual', speculative_config=None, tokenizer='ibm-granite/granite-embedding-278m-multilingual', skip_tokenizer_init=False, tokenizer_mode=auto, revision=main, tokenizer_revision=main, trust_remote_code=False, dtype=torch.float16, max_seq_len=512, download_dir=None, load_format=auto, tensor_parallel_size=1, pipeline_parallel_size=1, data_parallel_size=1, decode_context_parallel_size=1, dcp_comm_backend=ag_rs, disable_custom_all_reduce=True, quantization=None, quantization_config=None, enforce_eager=False, enable_return_routed_experts=False, kv_cache_dtype=auto, device_config=cpu, structured_outputs_config=StructuredOutputsConfig(backend='auto', disable_any_whitespace=False, disable_additional_properties=False, reasoning_parser='', reasoning_parser_plugin='', enable_in_reasoning=False), observability_config=ObservabilityConfig(show_hidden_metrics_for_version=None, otlp_traces_endpoint=None, collect_detailed_traces=None, kv_cache_metrics=False, kv_cache_metrics_sample=0.01, cudagraph_metrics=False, enable_layerwise_nvtx_tracing=False, enable_mfu_metrics=False, enable_mm_processor_stats=False, enable_logging_iteration_details=False, jit_monitor_mode='warn', jit_monitor_verbose=False), seed=0, served_model_name=ibm-granite/granite-embedding-278m-multilingual, enable_prefix_caching=False, enable_chunked_prefill=False, pooler_config=PoolerConfig(task=None, pooling_type=None, seq_pooling_type='CLS', tok_pooling_type='ALL', use_activation=True, dimensions=None, enable_chunked_processing=False, max_embed_len=None, logit_mean=None, logit_sigma=None, step_tag_id=None, returned_token_ids=None), compilation_config={'mode': <CompilationMode.STOCK_TORCH_COMPILE: 1>, 'debug_dump_path': None, 'cache_dir': '', 'compile_cache_save_format': 'binary', 'backend': 'inductor', 'custom_ops': ['all'], 'ir_enable_torch_wrap': False, 'splitting_ops': [], 'compile_mm_encoder': False, 'cudagraph_mm_encoder': False, 'encoder_cudagraph_token_budgets': [], 'encoder_cudagraph_max_vision_items_per_batch': 0, 'encoder_cudagraph_max_frames_per_batch': None, 'compile_sizes': [2048], 'compile_ranges_endpoints': [2048], 'inductor_compile_config': {'enable_auto_functionalized_v2': False, 'combo_kernels': True, 'benchmark_combo_kernel': True}, 'inductor_passes': {}, 'cudagraph_mode': <CUDAGraphMode.NONE: 0>, 'cudagraph_num_of_warmups': 0, 'cudagraph_capture_sizes': [], 'cudagraph_copy_inputs': False, 'cudagraph_specialize_lora': True, 'use_inductor_graph_partition': False, 'pass_config': {'fuse_norm_quant': True, 'fuse_act_quant': True, 'fuse_attn_quant': False, 'enable_sp': False, 'fuse_gemm_comms': False, 'fuse_allreduce_rms': False, 'enable_qk_norm_rope_fusion': False, 'fuse_rope_kvcache_cat_mla': False, 'fuse_act_padding': False, 'fuse_qk_norm_rope_kvcache': False}, 'max_cudagraph_capture_size': None, 'dynamic_shapes_config': {'type': <DynamicShapesType.BACKED: 'backed'>, 'evaluate_guards': False, 'assume_32_bit_indexing': False}, 'local_cache_dir': None, 'fast_moe_cold_start': False, 'static_all_moe_layers': []}, kernel_config=KernelConfig(ir_op_priority=IrOpPriorityConfig(rms_norm=['native'], fused_add_rms_norm=['native']), enable_flashinfer_autotune=True, enable_cutedsl_warmup=True, enable_jit_warmup=True, enable_bf16x3_router_gemm=False, moe_backend='auto', linear_backend='auto')
+(EngineCore pid=1798527) INFO 09-18 13:01:45 [multiproc_executor.py:150] DP group leader: node_rank=0, node_rank_within_dp=0, master_addr=127.0.0.1, mq_connect_ip=10.131.12.8 (local), world_size=1, local_world_size=1
+INFO 09-18 13:01:45 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 09-18 13:01:45 [__init__.py:54] - spyre_inference -> spyre_inference:register
+INFO 09-18 13:01:45 [__init__.py:66] Loading plugin spyre_inference
+INFO 09-18 13:01:45 [__init__.py:254] Platform plugin spyre_inference is activated
+INFO 09-18 13:01:50 [importing.py:88] Triton not installed or not compatible; certain GPU-related functions will not be available.
+(Worker pid=1798648) INFO 09-18 13:01:52 [spyre_worker.py:123] Spyre worker device selection: local_rank=0 requested SPYRE_DEVICES=None pcie_address=unknown
+(Worker pid=1798648) INFO 09-18 13:01:52 [__init__.py:43] Registering custom ops for spyre_inference
+(Worker pid=1798648) INFO 09-18 13:01:52 [fp8_linear_kernel.py:300] Registered SpyreFp8LinearKernel for PlatformEnum.OOT (aten._scaled_mm)
+(Worker pid=1798648) INFO 09-18 13:01:52 [parallel_state.py:1638] world_size=1 rank=0 local_rank=0 distributed_init_method=file:///tmp/vllm_dist_8dfb5c7c922849a0a831dfc65527cc89 backend=cpu:gloo,spyre:spyreccl
+(Worker pid=1798648) INFO 09-18 13:01:58 [parallel_state.py:1982] rank 0 in world size 1 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, EP rank N/A, EPLB rank N/A
+(Worker pid=1798648) INFO 09-18 13:01:58 [spyre_model_runner.py:586] Loading model ibm-granite/granite-embedding-278m-multilingual...
+(Worker pid=1798648) INFO 09-18 13:01:58 [weight_utils.py:858] Filesystem type for checkpoints: NFS4. Checkpoint size: 0.52 GiB. Available RAM: 76.00 GiB.
+(Worker pid=1798648) INFO 09-18 13:01:58 [weight_utils.py:820] Prefetching checkpoint files into page cache started (in background, num_threads=8, block_size=16777216 bytes)
+(Worker pid=1798648) Loading safetensors checkpoint shards:   0% Completed | 0/1 [00:00<?, ?it/s]
+(Worker pid=1798648) Loading safetensors checkpoint shards: 100% Completed | 1/1 [00:00<00:00, 293.29it/s]
+(Worker pid=1798648) 
+(Worker pid=1798648) INFO 09-18 13:01:58 [default_loader.py:430] Loading weights took 0.05 seconds
+(Worker pid=1798648) INFO 09-18 13:01:58 [weight_utils.py:792] Prefetching checkpoint files: 10% (1/1)
+(Worker pid=1798648) INFO 09-18 13:01:58 [weight_utils.py:815] Prefetching checkpoint files into page cache finished in 0.13s
+[rank0]:[W918 13:01:59.219401495 types_mapping.h:95] Warning: Backend Spyre does not support int64; downcasting to int32 may change values outside the 32-bit range. You can silence this via warnings.filterwarnings(...) or spyre.set_downcast_warning(False) or TORCH_SPYRE_DOWNCAST_WARN env. variable. (function operator())
+(Worker pid=1798648) INFO 09-18 13:01:59 [spyre_pooler.py:585] Pooling: hidden states stay on spyre (2 method(s), 2 normalize, 1 embed heads)
+(Worker pid=1798648) INFO 09-18 13:01:59 [spyre_model_runner.py:639] Spyre-native layer weights moved to spyre
+(Worker pid=1798648) INFO 09-18 13:01:59 [spyre_model_runner.py:640] Model loaded for Spyre in 1.403s.
+(Worker pid=1798648) INFO 09-18 13:01:59 [spyre_model_runner.py:778] Wrapped 12 transformer blocks of SpyreRobertaEmbeddingModel for per-block compile on Spyre (fullgraph=True).
+(Worker pid=1798648) INFO 09-18 13:01:59 [spyre_shape_bucketer.py:106] SpyreShapeBucketer initialized with 1 body token buckets: min=2048, max=2048
+(EngineCore pid=1798527) WARNING 09-18 13:01:59 [torch_utils.py:250] OMP_NUM_THREADS=32 is set; leaving Torch threads at 32 for serving. Multi-threaded torch CPU ops during serving can degrade performance through spin-wait contention and cgroup CPU-quota throttling.
+(Worker pid=1798648) INFO 09-18 13:01:59 [spyre_attn_bucketer.py:225] SpyreAttnBucketer: 3 kv buckets [128..512], 5 query buckets [1..2048], max num_blocks=4
+(Worker pid=1798648) INFO 09-18 13:01:59 [spyre_model_runner.py:835] Warming up model...
+(Worker pid=1798648) INFO 09-18 13:01:59 [lazy_compile.py:61] Compiling SpyreVocabParallelEmbedding.forward as its own graph: no enclosing graph covers it.
+(Worker pid=1798648) [WARNING] [spyre.inductor.propagate_named_dims] unhandled operation type <class 'torch._inductor.ir.FallbackKernel'>
+(Worker pid=1798648) [WARNING] [spyre.inductor.propagate_named_dims] unhandled operation type <class 'torch._inductor.ir.MultiOutput'>
+(Worker pid=1798648) [WARNING] [spyre.inductor.assign_dim_hints] spyre_hint on [buf39, buf40, buf41, buf42, buf43, buf44, buf45, buf46, buf47, buf48, buf49, buf50, buf51, buf52, buf53, buf54, buf55, buf56, buf57, buf58, buf59, buf60, buf61, buf62, buf63, buf64, buf65, buf66, buf67, buf68, buf69, buf70, buf71, buf72, buf73, buf74]: no op iterates over the hinted dimension — hint ignored
+(Worker pid=1798648) /home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/torch/_dynamo/eval_frame.py:1446: UserWarning: vllm::spyre_convert (with implementation in ???): The output of this custom operator (1) must not also be an input to this custom operator and (2) may not alias any inputs to this custom operator or other returns. The most common way to trigger this error is if we have y = custom_op(x) and y and x are the same Tensor. Please instead return a clone of the offending output tensor(s) (e.g. return x.clone()) or refactor the custom operator to not return y. This is deprecated and will become an error in a future version of PyTorch.
+(Worker pid=1798648)   return fn(*args, **kwargs)
+Signal Received: 11 (Segmentation fault)
+Signal Received from pid=0 
+*** BACKTRACE ***
+/opt/ibm/spyre/senlib/lib/libsenlib-dd2.so(+0x47681f)[0x7f43892b881f]
+/lib64/libc.so.6(+0x411c0)[0x7f45808481c0]
+/lib64/libc.so.6(+0xa4da8)[0x7f45808abda8]
+/lib64/libc.so.6(malloc+0x9d)[0x7f45808accad]
+/lib64/libstdc++.so.6(_Znwm+0x1c)[0x7f45693a882c]
+/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/torch_spyre/_C.so(_ZN8nlohmann16json_abi_v3_11_26detail6parserINS0_10basic_jsonISt3mapSt6vectorNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEblmdSaNS0_14adl_serializerES5_IhSaIhEEEENS1_22iterator_input_adapterIN9__gnu_cxx17__normal_iteratorIPKcSB_EEEEE18sax_parse_internalINS1_19json_sax_dom_parserISF_EEEEbPT_+0xf5d)[0x7f438b33613d]
+/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/torch_spyre/_C.so(_ZN8nlohmann16json_abi_v3_11_26detail6parserINS0_10basic_jsonISt3mapSt6vectorNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEblmdSaNS0_14adl_serializerES5_IhSaIhEEEENS1_22iterator_input_adapterIN9__gnu_cxx17__normal_iteratorIPKcSB_EEEEE5parseEbRSF_+0x435)[0x7f438b337115]
+/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/torch_spyre/_C.so(_ZN5spyre14JobPlanBuilderC2ERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPKNS_11SpyreStreamESt8optionalIS6_E+0x4ef)[0x7f438b32a0ef]
+/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/torch_spyre/_C.so(_ZN5spyre13prepareKernelERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPKNS_11SpyreStreamESt8optionalIS5_E+0x48)[0x7f438b32a488]
+/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/torch_spyre/_C.so(+0x120f59)[0x7f438b2fcf59]
+/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/torch_spyre/_C.so(+0xbc8e5)[0x7f438b2988e5]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x3e3a)[0x7f4580b6a4da]
+/lib64/libpython3.12.so.1.0(PyObject_CallOneArg+0x5d)[0x7f4580b93add]
+/lib64/libpython3.12.so.1.0(_PyObject_GenericGetAttrWithDict+0x2d6)[0x7f4580b85656]
+/lib64/libpython3.12.so.1.0(PyObject_GetAttr+0x45)[0x7f4580b5efb5]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x123c)[0x7f4580b678dc]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x53d0)[0x7f4580b6ba70]
+/lib64/libpython3.12.so.1.0(PyObject_Vectorcall+0x36)[0x7f4580b7c4c6]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x788)[0x7f4580b66e28]
+/lib64/libpython3.12.so.1.0(PyObject_Vectorcall+0x36)[0x7f4580b7c4c6]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x788)[0x7f4580b66e28]
+/lib64/libpython3.12.so.1.0(+0x8cc72)[0x7f4580a6cc72]
+/lib64/libpython3.12.so.1.0(_PyObject_Call_Prepend+0x6a)[0x7f4580b95a9a]
+/lib64/libpython3.12.so.1.0(+0x2877b8)[0x7f4580c677b8]
+/lib64/libpython3.12.so.1.0(_PyObject_MakeTpCall+0x2db)[0x7f4580b5c9cb]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x788)[0x7f4580b66e28]
+/lib64/libpython3.12.so.1.0(PyObject_Vectorcall+0x36)[0x7f4580b7c4c6]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x788)[0x7f4580b66e28]
+/lib64/libpython3.12.so.1.0(PyObject_Vectorcall+0x36)[0x7f4580b7c4c6]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x788)[0x7f4580b66e28]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x53d0)[0x7f4580b6ba70]
+/lib64/libpython3.12.so.1.0(PyObject_Vectorcall+0x36)[0x7f4580b7c4c6]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x788)[0x7f4580b66e28]
+/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/torch/lib/libtorch_python.so(dynamo_eval_custom_code+0x1ce)[0x7f457e932f6e]
+/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/torch/lib/libtorch_python.so(+0x896c00)[0x7f457e934c00]
+/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/torch/lib/libtorch_python.so(+0x897ef7)[0x7f457e935ef7]
+/lib64/libpython3.12.so.1.0(+0xb79a0)[0x7f4580a979a0]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x53d0)[0x7f4580b6ba70]
+/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/torch/lib/libtorch_python.so(+0x895131)[0x7f457e933131]
+/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/torch/lib/libtorch_python.so(+0x8980c9)[0x7f457e9360c9]
+/lib64/libpython3.12.so.1.0(+0xb79a0)[0x7f4580a979a0]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x53d0)[0x7f4580b6ba70]
+/lib64/libpython3.12.so.1.0(_PyObject_FastCallDictTstate+0x1dc)[0x7f4580b5f75c]
+/lib64/libpython3.12.so.1.0(_PyObject_Call_Prepend+0x6a)[0x7f4580b95a9a]
+/lib64/libpython3.12.so.1.0(+0x2877b8)[0x7f4580c677b8]
+/lib64/libpython3.12.so.1.0(_PyObject_MakeTpCall+0x2db)[0x7f4580b5c9cb]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x788)[0x7f4580b66e28]
+/lib64/libpython3.12.so.1.0(+0x1d2cfa)[0x7f4580bb2cfa]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x53d0)[0x7f4580b6ba70]
+/lib64/libpython3.12.so.1.0(+0x1d2cfa)[0x7f4580bb2cfa]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x53d0)[0x7f4580b6ba70]
+/lib64/libpython3.12.so.1.0(_PyObject_FastCallDictTstate+0x1dc)[0x7f4580b5f75c]
+/lib64/libpython3.12.so.1.0(_PyObject_Call_Prepend+0x6a)[0x7f4580b95a9a]
+/lib64/libpython3.12.so.1.0(+0x2877b8)[0x7f4580c677b8]
+/lib64/libpython3.12.so.1.0(_PyObject_MakeTpCall+0x2db)[0x7f4580b5c9cb]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x788)[0x7f4580b66e28]
+/lib64/libpython3.12.so.1.0(+0x1d31dd)[0x7f4580bb31dd]
+/lib64/libpython3.12.so.1.0(+0x1d2d66)[0x7f4580bb2d66]
+/lib64/libpython3.12.so.1.0(_PyObject_Call+0x130)[0x7f4580b97d20]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x53d0)[0x7f4580b6ba70]
+/lib64/libpython3.12.so.1.0(_PyObject_FastCallDictTstate+0x27b)[0x7f4580b5f7fb]
+/lib64/libpython3.12.so.1.0(_PyObject_Call_Prepend+0x6a)[0x7f4580b95a9a]
+/lib64/libpython3.12.so.1.0(+0x2877b8)[0x7f4580c677b8]
+/lib64/libpython3.12.so.1.0(_PyObject_MakeTpCall+0x2db)[0x7f4580b5c9cb]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x788)[0x7f4580b66e28]
+/lib64/libpython3.12.so.1.0(+0x1d31dd)[0x7f4580bb31dd]
+/lib64/libpython3.12.so.1.0(+0x1d2d66)[0x7f4580bb2d66]
+/lib64/libpython3.12.so.1.0(_PyObject_Call+0x130)[0x7f4580b97d20]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x53d0)[0x7f4580b6ba70]
+/lib64/libpython3.12.so.1.0(+0x1d31dd)[0x7f4580bb31dd]
+/lib64/libpython3.12.so.1.0(+0x1d2d66)[0x7f4580bb2d66]
+/lib64/libpython3.12.so.1.0(_PyObject_Call+0x130)[0x7f4580b97d20]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x53d0)[0x7f4580b6ba70]
+/lib64/libpython3.12.so.1.0(_PyObject_FastCallDictTstate+0x27b)[0x7f4580b5f7fb]
+/lib64/libpython3.12.so.1.0(_PyObject_Call_Prepend+0x6a)[0x7f4580b95a9a]
+/lib64/libpython3.12.so.1.0(+0x2877b8)[0x7f4580c677b8]
+/lib64/libpython3.12.so.1.0(_PyObject_Call+0xb9)[0x7f4580b97ca9]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x53d0)[0x7f4580b6ba70]
+/lib64/libpython3.12.so.1.0(_PyObject_FastCallDictTstate+0x27b)[0x7f4580b5f7fb]
+/lib64/libpython3.12.so.1.0(_PyObject_Call_Prepend+0x6a)[0x7f4580b95a9a]
+/lib64/libpython3.12.so.1.0(+0x2877b8)[0x7f4580c677b8]
+/lib64/libpython3.12.so.1.0(_PyObject_Call+0xb9)[0x7f4580b97ca9]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x53d0)[0x7f4580b6ba70]
+/lib64/libpython3.12.so.1.0(+0x1d31dd)[0x7f4580bb31dd]
+/lib64/libpython3.12.so.1.0(+0x1d2d66)[0x7f4580bb2d66]
+/lib64/libpython3.12.so.1.0(_PyObject_Call+0x130)[0x7f4580b97d20]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x53d0)[0x7f4580b6ba70]
+/lib64/libpython3.12.so.1.0(+0x1d31dd)[0x7f4580bb31dd]
+/lib64/libpython3.12.so.1.0(+0x1d2d98)[0x7f4580bb2d98]
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x53d0)[0x7f4580b6ba70]
+/lib64/libpython3.12.so.1.0(PyEval_EvalCode+0xaa)[0x7f4580c1ef5a]
+/lib64/libpython3.12.so.1.0(+0x27ad01)[0x7f4580c5ad01]
+/lib64/libpython3.12.so.1.0(+0x2756ab)[0x7f4580c556ab]
+/lib64/libpython3.12.so.1.0(PyRun_StringFlags+0x6d)[0x7f4580c517bd]
+/lib64/libpython3.12.so.1.0(PyRun_SimpleStringFlags+0x40)[0x7f4580c51710]
+/lib64/libpython3.12.so.1.0(Py_RunMain+0x483)[0x7f4580c4e863]
+/lib64/libpython3.12.so.1.0(Py_BytesMain+0x3b)[0x7f4580c087fb]
+/lib64/libc.so.6(+0x2a58e)[0x7f458083158e]
+/lib64/libc.so.6(__libc_start_main+0x89)[0x7f4580831649]
+VLLM::Worker(_start+0x25)[0x55e9d4c3b095]
+*****************
+(EngineCore pid=1798527) ERROR 09-18 13:02:31 [multiproc_executor.py:311] Worker proc VllmWorker-0 died unexpectedly (exit code: None), shutting down executor.
+(EngineCore pid=1798527) INFO 09-18 13:02:31 [multiproc_executor.py:469] [shutdown] Executor: waiting for worker exit count=1
+(EngineCore pid=1798527) INFO 09-18 13:02:32 [multiproc_executor.py:476] [shutdown] Executor: all workers exited gracefully
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346] EngineCore failed to start.
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346] Traceback (most recent call last):
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/core.py", line 1315, in run_engine_core
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     return func(*args, **kwargs)
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/core.py", line 1073, in __init__
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     super().__init__(
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/core.py", line 144, in __init__
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     kv_cache_config = self._initialize_kv_caches(vllm_config)
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     return func(*args, **kwargs)
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/core.py", line 331, in _initialize_kv_caches
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     self.model_executor.compile_or_warm_up_model()
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/executor/abstract.py", line 126, in compile_or_warm_up_model
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     compilation_times: list[CompilationTimes] = self.collective_rpc(
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]                                                 ^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 445, in collective_rpc
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     return future if non_block else future.result()
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]                                     ^^^^^^^^^^^^^^^
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 99, in result
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     return super().result()
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]            ^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/usr/lib64/python3.12/concurrent/futures/_base.py", line 449, in result
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     return self.__get_result()
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]            ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/usr/lib64/python3.12/concurrent/futures/_base.py", line 401, in __get_result
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     raise self._exception
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 103, in _wait_for_response
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     response = self.aggregate(self.get_response())
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]                               ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 430, in get_response
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     status, result = mq.dequeue(timeout=dequeue_timeout)
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/distributed/device_communicators/shm_broadcast.py", line 889, in dequeue
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     with self.acquire_read(timeout, indefinite) as buf:
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/usr/lib64/python3.12/contextlib.py", line 137, in __enter__
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     return next(self.gen)
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]            ^^^^^^^^^^^^^^
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/distributed/device_communicators/shm_broadcast.py", line 797, in acquire_read
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346]     raise RuntimeError("cancelled")
+(EngineCore pid=1798527) ERROR 09-18 13:02:32 [core.py:1346] RuntimeError: cancelled
+(EngineCore pid=1798527) Process EngineCore:
+(EngineCore pid=1798527) Traceback (most recent call last):
+(EngineCore pid=1798527)   File "/usr/lib64/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+(EngineCore pid=1798527)     self.run()
+(EngineCore pid=1798527)   File "/usr/lib64/python3.12/multiprocessing/process.py", line 108, in run
+(EngineCore pid=1798527)     self._target(*self._args, **self._kwargs)
+(EngineCore pid=1798527)   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/core.py", line 1350, in run_engine_core
+(EngineCore pid=1798527)     raise e
+(EngineCore pid=1798527)   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/core.py", line 1315, in run_engine_core
+(EngineCore pid=1798527)     engine_core = EngineCoreProc(*args, engine_index=dp_rank, **kwargs)
+(EngineCore pid=1798527)                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527)   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=1798527)     return func(*args, **kwargs)
+(EngineCore pid=1798527)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527)   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/core.py", line 1073, in __init__
+(EngineCore pid=1798527)     super().__init__(
+(EngineCore pid=1798527)   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/core.py", line 144, in __init__
+(EngineCore pid=1798527)     kv_cache_config = self._initialize_kv_caches(vllm_config)
+(EngineCore pid=1798527)                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527)   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+(EngineCore pid=1798527)     return func(*args, **kwargs)
+(EngineCore pid=1798527)            ^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527)   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/core.py", line 331, in _initialize_kv_caches
+(EngineCore pid=1798527)     self.model_executor.compile_or_warm_up_model()
+(EngineCore pid=1798527)   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/executor/abstract.py", line 126, in compile_or_warm_up_model
+(EngineCore pid=1798527)     compilation_times: list[CompilationTimes] = self.collective_rpc(
+(EngineCore pid=1798527)                                                 ^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527)   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 445, in collective_rpc
+(EngineCore pid=1798527)     return future if non_block else future.result()
+(EngineCore pid=1798527)                                     ^^^^^^^^^^^^^^^
+(EngineCore pid=1798527)   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 99, in result
+(EngineCore pid=1798527)     return super().result()
+(EngineCore pid=1798527)            ^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527)   File "/usr/lib64/python3.12/concurrent/futures/_base.py", line 449, in result
+(EngineCore pid=1798527)     return self.__get_result()
+(EngineCore pid=1798527)            ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527)   File "/usr/lib64/python3.12/concurrent/futures/_base.py", line 401, in __get_result
+(EngineCore pid=1798527)     raise self._exception
+(EngineCore pid=1798527)   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 103, in _wait_for_response
+(EngineCore pid=1798527)     response = self.aggregate(self.get_response())
+(EngineCore pid=1798527)                               ^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527)   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/executor/multiproc_executor.py", line 430, in get_response
+(EngineCore pid=1798527)     status, result = mq.dequeue(timeout=dequeue_timeout)
+(EngineCore pid=1798527)                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527)   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/distributed/device_communicators/shm_broadcast.py", line 889, in dequeue
+(EngineCore pid=1798527)     with self.acquire_read(timeout, indefinite) as buf:
+(EngineCore pid=1798527)          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+(EngineCore pid=1798527)   File "/usr/lib64/python3.12/contextlib.py", line 137, in __enter__
+(EngineCore pid=1798527)     return next(self.gen)
+(EngineCore pid=1798527)            ^^^^^^^^^^^^^^
+(EngineCore pid=1798527)   File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/distributed/device_communicators/shm_broadcast.py", line 797, in acquire_read
+(EngineCore pid=1798527)     raise RuntimeError("cancelled")
+(EngineCore pid=1798527) RuntimeError: cancelled
+INFO 09-18 13:02:33 [utils.py:615] [shutdown] Process manager: send sigterm to process EngineCore
+Traceback (most recent call last):
+  File "/home/senuser/spyre-inference/.claude/worktrees/s3-dev2-b3-launch-sites/b3/compile_only.py", line 50, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/home/senuser/spyre-inference/.claude/worktrees/s3-dev2-b3-launch-sites/b3/compile_only.py", line 44, in main
+    LLM(**kwargs)
+  File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/entrypoints/llm.py", line 343, in __init__
+    self.llm_engine = LLMEngine.from_engine_args(
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/llm_engine.py", line 179, in from_engine_args
+    return cls(
+           ^^^^
+  File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/llm_engine.py", line 105, in __init__
+    self.engine_core = EngineCoreClient.make_client(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/core_client.py", line 110, in make_client
+    return SyncMPClient(vllm_config, executor_class, log_stats)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/tracing/otel.py", line 178, in sync_wrapper
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/core_client.py", line 812, in __init__
+    super().__init__(
+  File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/core_client.py", line 609, in __init__
+    with launch_core_engines(
+         ^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib64/python3.12/contextlib.py", line 144, in __exit__
+    next(self.gen)
+  File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/utils.py", line 1206, in launch_core_engines
+    wait_for_engine_startup(
+  File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/vllm/v1/engine/utils.py", line 1286, in wait_for_engine_startup
+    raise RuntimeError(
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+/usr/lib64/python3.12/multiprocessing/resource_tracker.py:279: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '
+/usr/lib64/python3.12/multiprocessing/resource_tracker.py:279: UserWarning: resource_tracker: There appear to be 1 leaked shared_memory objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '

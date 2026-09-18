@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LAYOUT: str = "token_major"
     SPYRE_BATCHED_DECODE: bool = False
+    SPYRE_ATTN_INLINE: bool = False
     SPYRE_ENCODER_BATCHED_ATTN: bool = True
     SPYRE_ENCODER_SLOT_PADDING: bool = True
     SPYRE_ENCODER_FASTPATH: bool = False
@@ -77,6 +78,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #  - "head_major":  [num_blocks, num_kv_heads, block_size, head_size], which drops
     #    the per-page permute the kernels do before the matmuls
     "SPYRE_ATTN_KV_LAYOUT": lambda: os.getenv("SPYRE_ATTN_KV_LAYOUT") or "token_major",
+    # When "1", attention is not registered as an opaque custom op, so dynamo traces
+    # the attention forward into the surrounding body graph. Off by default.
+    "SPYRE_ATTN_INLINE": lambda: bool(int(os.getenv("SPYRE_ATTN_INLINE", "0"))),
     # When "1", enables the batched multi-sequence decode kernel. Off by default
     # pending performance characterisation at small batch sizes (num_seqs <= 4).
     # Re-enable to measure the path or to restore it after calibration.

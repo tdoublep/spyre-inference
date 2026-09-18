@@ -360,7 +360,12 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if self._compile_attn:
+        # Inlining wants the raw callables: a nested torch.compile is a second
+        # segment boundary dynamo will not trace through, so keeping the compiled
+        # wrappers here would defeat the non-opaque attention op. _compile_attn
+        # itself stays true so the slot path and the fused store stay selected.
+        self._inline_attn = envs.SPYRE_ATTN_INLINE
+        if self._compile_attn and not self._inline_attn:
             self._gather_fn = _encoder_gather_compiled
             self._attn_fn = _encoder_sdpa_compiled
             self._store_fn = _encoder_store_compiled
@@ -570,9 +575,14 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             else None
         )
         if slots is not None and query.shape[0] == slots.total_rows:
-            logger.info_once(
-                "Encoder slot padding active: %d slots x %d rows", slots.num_slots, slots.extent
-            )
+            # Dynamo cannot trace a Logger method, and _build_plans is inside the
+            # traced region once attention is inlined.
+            if not torch.compiler.is_compiling():
+                logger.info_once(
+                    "Encoder slot padding active: %d slots x %d rows",
+                    slots.num_slots,
+                    slots.extent,
+                )
             # One plan for the whole buffer: no row table, so gather and store
             # become views inside `_encoder_slot_kernel`.
             return [
@@ -704,17 +714,23 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
         # Folds the per-layer eager store into the attention jobplan. Re-checked
         # per call: vLLM hands out a fresh buffer per layer.
-        fused_store_ok = (
-            self._compile_attn
-            and output.dtype == query.dtype
+        # storage_offset() returns a host int, which is fatal inside a fullgraph
+        # region. When we are being traced the buffers are Inductor-allocated by
+        # spyre_empty_with_layout, i.e. offset 0 and contiguous by construction, so
+        # the probe is only needed on the eager path that vLLM hands real buffers to.
+        layout_ok = (
+            True
+            if self._inline_attn and torch.compiler.is_compiling()
             # A compiled kernel reads its arguments from offset 0: torch-spyre#3770.
-            and output.storage_offset() == 0
-            and output.is_contiguous()
+            else (output.storage_offset() == 0 and output.is_contiguous())
         )
+        fused_store_ok = self._compile_attn and output.dtype == query.dtype and layout_ok
         store_mode = "index" if fused_store_ok else "none"
         self._slot_ok = fused_store_ok
 
-        if store_mode == "index":
+        # Warming compiles the nested kernel graphs, which do not exist when the
+        # attention math is inlined into the caller's graph.
+        if store_mode == "index" and not (self._inline_attn and torch.compiler.is_compiling()):
             self._warm_kernels(query, key, value, output, num_heads, num_kv_heads, head_size)
 
         # Built once per step; the whole encoder stack shares one build.

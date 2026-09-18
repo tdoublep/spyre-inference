@@ -1,0 +1,11 @@
+arm            inline-2
+granularity    model
+layers         12
+module         /tmp/b3-inductor-inline-2/mn/cmnnss67zxck2s7du5svoiv7sgyekniyonrzushisubxjseaidcd.py
+module_lines   26271
+sdsc_run_sites 8
+sdsc_distinct  8
+modules_total  1
+unified_attn   0
+fallback       0
+to_dtype_cpu   0

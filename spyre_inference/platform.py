@@ -380,6 +380,15 @@ class TorchSpyrePlatform(CpuPlatform):
         return False
 
     @classmethod
+    def opaque_attention_op(cls) -> bool:
+        # CpuPlatform says True, which makes every attention layer a hard segment
+        # boundary: the residual has to be re-materialised by its own jobplan to
+        # cross it. False lets dynamo trace the attention forward into the body graph.
+        from spyre_inference import envs
+
+        return not envs.SPYRE_ATTN_INLINE
+
+    @classmethod
     def supports_fp8(cls) -> bool:
         # Linear layers use SpyreFp8LinearKernel (aten._scaled_mm).
         return True
