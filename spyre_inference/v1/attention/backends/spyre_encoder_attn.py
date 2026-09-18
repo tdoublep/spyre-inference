@@ -47,8 +47,11 @@ import torch
 import torch.nn.functional as F
 from vllm.v1.attention.backend import AttentionLayer
 
+from vllm.logger import init_logger
+
 from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
+from spyre_inference.v1.worker import encoder_slots
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionBackend,
     SpyreAttentionImpl,
@@ -62,6 +65,8 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 # keeps the row-index table stick-aligned and the matmul's contraction dimension
 # aligned, and it is the width of a shared mask tile. Encoder attention has no KV
 # cache and so no block walk -- this is alignment, not a block size.
+logger = init_logger(__name__)
+
 ENCODER_LEN_ALIGNMENT = 64
 
 
@@ -204,6 +209,35 @@ def _encoder_fused_kernel(
 _encoder_fused_compiled = torch.compile(_encoder_fused_kernel, dynamic=False)
 
 
+def _encoder_slot_kernel(
+    out, query, key, value, mask, scale, group, num_heads, num_kv_heads, head_size
+):
+    """Attend a slot-padded body: every request already owns ``extent`` rows.
+
+    The gather and store the packed layout needs are ``.view()``s here, which is
+    the whole point -- they were 60% of this kernel's device time. Keyed on
+    ``(out.shape[0], group)``; ``extent`` follows from the two.
+    """
+    extent = query.shape[0] // group
+    q = query.view(group, extent, num_heads, head_size).transpose(1, 2)
+    k = key.view(group, extent, num_kv_heads, head_size).transpose(1, 2)
+    v = value.view(group, extent, num_kv_heads, head_size).transpose(1, 2)
+    attn = F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=mask,
+        scale=scale,
+        is_causal=False,
+        enable_gqa=(num_heads != num_kv_heads),
+    )
+    out.copy_(attn.transpose(1, 2).reshape(group * extent, num_heads, head_size))
+    return out
+
+
+_encoder_slot_compiled = torch.compile(_encoder_slot_kernel, dynamic=False)
+
+
 def _create_dense_attn_kernel(num_heads: int, num_kv_heads: int, head_size: int):
     """Test helper: bind the non-tensor args the way a forward call would."""
 
@@ -225,12 +259,17 @@ class EncoderSeqPlan:
     starts: list[int]
     query_lens: list[int]
     extent: int
-    row_table: torch.Tensor
+    row_table: torch.Tensor | None
     mask: torch.Tensor
 
     @property
     def group(self) -> int:
         return len(self.starts)
+
+    @property
+    def group_slots(self) -> int:
+        """Batch members the kernel attends, including unused trailing slots."""
+        return self.mask.shape[0]
 
 
 def encoder_index_dtype(device: torch.device) -> torch.dtype:
@@ -326,15 +365,20 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             self._attn_fn = _encoder_sdpa_compiled
             self._store_fn = _encoder_store_compiled
             self._fused_fn = _encoder_fused_compiled
+            self._slot_fn = _encoder_slot_compiled
         else:
             self._gather_fn = _encoder_gather_kernel
             self._attn_fn = _encoder_sdpa_kernel
             self._store_fn = _encoder_store_kernel
             self._fused_fn = _encoder_fused_kernel
+            self._slot_fn = _encoder_slot_kernel
         # Grouping only pays off through the compiled kernels; in eager mode the
         # per-request loop has no launch overhead to amortise.
         self._batched_attn = self._compile_attn and envs.SPYRE_ENCODER_BATCHED_ATTN
         self._warmed_buffers: set[int] = set()
+        # The slot kernel writes `output` from inside a compiled region, so it needs
+        # the same offset-0 contiguity the fused store does (torch-spyre#3770).
+        self._slot_ok = False
         # A request's extent cannot exceed its own length, so warming past the
         # model length compiles the most expensive graphs for shapes no request
         # can reach.
@@ -347,6 +391,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         # A group cannot hold more requests than a step can run, so warming past
         # max_num_seqs compiles graphs no plan can dispatch to.
         self._max_group = config.scheduler_config.max_num_seqs
+        self._max_slots = max(4, 2 * config.scheduler_config.max_num_seqs)
 
     def _run_gather(self, query, key, value, row_index):
         return _call_kernel("encoder_gather", self._gather_fn, query, key, value, row_index)
@@ -395,6 +440,22 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             head_size,
         )
 
+    def _run_slot(self, out, query, key, value, mask, group, num_heads, num_kv_heads, head_size):
+        return _call_kernel(
+            "encoder_slot",
+            self._slot_fn,
+            out,
+            query,
+            key,
+            value,
+            mask,
+            self.scale,
+            group,
+            num_heads,
+            num_kv_heads,
+            head_size,
+        )
+
     def _run_store(self, out, row_index, attn):
         return _call_kernel("encoder_store", self._store_fn, out, row_index, attn)
 
@@ -429,6 +490,28 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         self._warmed_buffers.add(buffer_rows)
 
         dtype, device = query.dtype, query.device
+        if envs.SPYRE_ENCODER_SLOT_PADDING:
+            # A slot-padded step dispatches one kernel keyed on (buffer_rows, slots);
+            # every reachable slot count for this buffer, so none compiles mid-serve.
+            extent = ENCODER_LEN_ALIGNMENT
+            while extent <= min(buffer_rows, self._max_extent):
+                slots = buffer_rows // extent
+                if slots * extent == buffer_rows and slots <= self._max_slots:
+                    self._run_slot(
+                        output,
+                        query,
+                        key,
+                        value,
+                        convert(
+                            torch.cat([encoder_mask(extent, extent, dtype)] * slots, dim=0),
+                            device,
+                        ),
+                        slots,
+                        num_heads,
+                        num_kv_heads,
+                        head_size,
+                    )
+                extent *= 2
         index_dtype = encoder_index_dtype(device)
 
         extent = ENCODER_LEN_ALIGNMENT
@@ -481,6 +564,36 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         query: torch.Tensor,
     ) -> list[EncoderSeqPlan]:
         """Row tables and masks for the step, one plan per group of equal extent."""
+        slots = (
+            encoder_slots.current()
+            if envs.SPYRE_ENCODER_SLOT_PADDING and self._slot_ok
+            else None
+        )
+        if slots is not None and query.shape[0] == slots.total_rows:
+            logger.info_once(
+                "Encoder slot padding active: %d slots x %d rows", slots.num_slots, slots.extent
+            )
+            # One plan for the whole buffer: no row table, so gather and store
+            # become views inside `_encoder_slot_kernel`.
+            return [
+                EncoderSeqPlan(
+                    starts=list(slots.row_starts),
+                    query_lens=list(slots.query_lens),
+                    extent=slots.extent,
+                    row_table=None,
+                    mask=convert(
+                        torch.cat(
+                            [
+                                encoder_mask(slots.extent, kv, query.dtype)
+                                for kv in slots.kv_lens()
+                            ],
+                            dim=0,
+                        ),
+                        query.device,
+                    ),
+                )
+            ]
+
         query_start_loc = attn_metadata.query_start_loc.cpu().tolist()
         seq_lens = attn_metadata.seq_lens.cpu().tolist()
         # The body may 1D-pad past num_actual_tokens; those rows are not a request.
@@ -599,6 +712,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             and output.is_contiguous()
         )
         store_mode = "index" if fused_store_ok else "none"
+        self._slot_ok = fused_store_ok
 
         if store_mode == "index":
             self._warm_kernels(query, key, value, output, num_heads, num_kv_heads, head_size)
@@ -608,6 +722,19 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             attn_metadata.encoder_seq_plans = self._build_plans(attn_metadata, query)
 
         for plan in attn_metadata.encoder_seq_plans:
+            if plan.row_table is None:
+                self._run_slot(
+                    output,
+                    query,
+                    key,
+                    value,
+                    plan.mask,
+                    plan.group_slots,
+                    num_heads,
+                    num_kv_heads,
+                    head_size,
+                )
+                continue
             if store_mode == "index":
                 # One graph for the whole plan: gather, attend, store.
                 self._run_fused(

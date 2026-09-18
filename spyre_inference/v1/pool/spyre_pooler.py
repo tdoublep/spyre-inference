@@ -35,6 +35,7 @@ from vllm.v1.outputs import PoolerOutput
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import note_unattributed_compiles
+from spyre_inference.v1.worker import encoder_slots
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     default_encoder_len_buckets,
     next_bucket,
@@ -101,6 +102,13 @@ def copy_pooler_output_to_cpu(
 
 def cursor_row_indices_cpu(pooling_cursor, *, last: bool) -> torch.Tensor:
     """First/last row indices from CPU counts (device cumsum slices are unsafe)."""
+    layout = encoder_slots.current()
+    if layout is not None:
+        # Slot-padded body: request i starts at i * extent, not at a running sum.
+        starts = torch.tensor(layout.row_starts, dtype=torch.int64)
+        if not last:
+            return starts
+        return starts + torch.tensor(layout.query_lens, dtype=torch.int64) - 1
     counts = pooling_cursor.num_scheduled_tokens_cpu.to(torch.int64)
     ends = torch.cumsum(counts, dim=0)
     return ends - 1 if last else ends - counts
