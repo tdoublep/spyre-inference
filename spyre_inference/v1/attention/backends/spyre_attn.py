@@ -211,6 +211,12 @@ def note_unattributed_compiles(where: str) -> None:
     does not mean "no compiles".
     """
     global _last_graph_count
+    if torch.compiler.is_compiling():
+        # Inlined attention calls this from inside the traced region, where dynamo
+        # cannot trace a Logger ("logging.Logger method not supported"). Leave the
+        # counter alone so the next eager call still sees and reports the delta,
+        # rather than swallowing it here.
+        return
     now = counters["stats"]["unique_graphs"]
     if _warmup_complete and now > _last_graph_count:
         delta = now - _last_graph_count
@@ -238,7 +244,12 @@ def _call_kernel(label: str, fn, *args):
     the message, so it reported "at least one" as though it were exactly one.
     """
     global _last_graph_count
-    if not _warmup_complete:
+    if not _warmup_complete or torch.compiler.is_compiling():
+        # Inlined attention runs this inside the traced region, where reading
+        # dynamo's own counters makes the graph guard on that dict -- and it changes
+        # constantly, so the guard fails and the whole block recompiles every call.
+        # There is nothing to attribute here anyway: a traced call compiles with its
+        # enclosing graph, not per kernel.
         return fn(*args)
     before = counters["stats"]["unique_graphs"]
     result = fn(*args)

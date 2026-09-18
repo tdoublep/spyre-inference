@@ -318,7 +318,16 @@ _SLOT_MASK_CACHE: dict[tuple, torch.Tensor] = {}
 
 
 def _slot_mask_key(slots, dtype: torch.dtype) -> tuple:
-    return (slots.extent, tuple(slots.kv_lens()), dtype)
+    """Shape only -- deliberately NOT the kv_lens.
+
+    ``kv_lens()`` returns one entry per slot, so it fixes the mask's *contents*
+    but never its shape. Keying on it made every distinct set of request lengths
+    a distinct tensor, and with attention inlined this key is read from inside the
+    traced region, so dynamo guarded on those lengths and recompiled the whole
+    fused body graph for each new batch -- ~300 s, on nearly every real step.
+    Keying on shape alone lets one buffer serve every length combination.
+    """
+    return (slots.extent, slots.num_slots, dtype)
 
 
 def prime_slot_mask(slots, dtype: torch.dtype, device: torch.device) -> None:
@@ -334,20 +343,85 @@ def prime_slot_mask(slots, dtype: torch.dtype, device: torch.device) -> None:
     dynamo lifts it as a graph input.
     """
     key = _slot_mask_key(slots, dtype)
-    if key not in _SLOT_MASK_CACHE:
-        _SLOT_MASK_CACHE[key] = convert(
-            torch.cat([encoder_mask(slots.extent, kv, dtype) for kv in slots.kv_lens()], dim=0),
-            device,
-        )
+    host = torch.cat([encoder_mask(slots.extent, kv, dtype) for kv in slots.kv_lens()], dim=0)
+    cached = _SLOT_MASK_CACHE.get(key)
+    if cached is None:
+        _SLOT_MASK_CACHE[key] = convert(host, device)
+    else:
+        # Same buffer, new contents: the traced region must keep seeing one tensor
+        # of one shape per (extent, num_slots) or it recompiles. Runs here, outside
+        # the graph, so the write is not something dynamo has to reason about.
+        cached.copy_(convert(host, device))
+
+
+_SLOT_PLAN_CACHE: dict[tuple, list["EncoderSeqPlan"]] = {}
+_current_slot_plans: list["EncoderSeqPlan"] | None = None
+
+
+def prime_slot_plan(slots, dtype: torch.dtype, device: torch.device) -> None:
+    """Build this step's slot plan *outside* any traced region, and publish it.
+
+    ``forward`` used to cache the plan on the attention metadata behind
+    ``if attn_metadata.encoder_seq_plans is None``. Inlined, that branch is traced,
+    and dynamo guards on the None-ness: it is None when the graph is first traced
+    and non-None on every later step, so the guard fails and the whole fused body
+    graph recompiles *every step* (~300 s measured, flat over three identical
+    batches). Publishing the plan from out here removes the branch from the graph.
+
+    Nothing in it needs ``query``: the slot path's plan is a function of the layout
+    alone, and its only tensor is the mask, which is already hoisted.
+    """
+    global _current_slot_plans
+    if slots is None:
+        # A step that kept the packed layout must not inherit the last slot-padded
+        # step's plan; the caller then falls back to building one per step.
+        _current_slot_plans = None
+        return
+    key = _slot_mask_key(slots, dtype)
+    prime_slot_mask(slots, dtype, device)
+    cached = _SLOT_PLAN_CACHE.get(key)
+    if cached is None:
+        cached = [
+            EncoderSeqPlan(
+                starts=list(slots.row_starts),
+                query_lens=list(slots.query_lens),
+                extent=slots.extent,
+                row_table=None,
+                mask=_SLOT_MASK_CACHE[key],
+            )
+        ]
+        _SLOT_PLAN_CACHE[key] = cached
+    else:
+        # Reuse the list AND the plan inside it: dynamo guards a global it reads by
+        # object identity, so handing it a fresh container each step re-fires the
+        # guard however stable the contents are. `starts`/`query_lens` are per-step
+        # and the slot branch reads neither, but keep them honest for other readers.
+        cached[0].starts = list(slots.row_starts)
+        cached[0].query_lens = list(slots.query_lens)
+    _current_slot_plans = cached
+
+
+def current_slot_plans() -> list["EncoderSeqPlan"] | None:
+    """The plan ``prime_slot_plan`` published for this step, if any."""
+    return _current_slot_plans
 
 
 def _slot_mask(slots, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    """The group's additive mask. Primed by ``prime_slot_mask`` before the forward."""
+    """The group's additive mask, primed by ``prime_slot_mask`` before the forward.
+
+    The buffer is keyed on shape alone, so its contents belong to whichever step
+    last primed it. Inlined, the runner primes every step and this must stay a pure
+    lookup -- priming here would put the host build back in the graph, which is
+    what hoisting it was for. Not inlined, nothing else primes, so refresh here or
+    serve a mask built for another step's kv_lens.
+    """
+    if not torch.compiler.is_compiling():
+        prime_slot_mask(slots, dtype, device)
     cached = _SLOT_MASK_CACHE.get(_slot_mask_key(slots, dtype))
-    if cached is not None:
-        return cached
-    prime_slot_mask(slots, dtype, device)
-    return _SLOT_MASK_CACHE[_slot_mask_key(slots, dtype)]
+    if cached is None:
+        prime_slot_mask(slots, dtype, device)
+        cached = _SLOT_MASK_CACHE[_slot_mask_key(slots, dtype)]
+    return cached
 
 
 def _host_pad_head_dim(x: torch.Tensor, padded: int) -> torch.Tensor:
@@ -768,11 +842,17 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         if store_mode == "index" and not (self._inline_attn and torch.compiler.is_compiling()):
             self._warm_kernels(query, key, value, output, num_heads, num_kv_heads, head_size)
 
-        # Built once per step; the whole encoder stack shares one build.
-        if attn_metadata.encoder_seq_plans is None:
-            attn_metadata.encoder_seq_plans = self._build_plans(attn_metadata, query)
+        # Built once per step; the whole encoder stack shares one build. Inlined,
+        # the `is None` test would be traced and dynamo would guard on it -- None on
+        # the first trace, set by layer 0 thereafter -- recompiling the fused body
+        # every step. So the inline path reads a plan primed outside the graph.
+        plans = current_slot_plans() if self._inline_attn else None
+        if plans is None:
+            if attn_metadata.encoder_seq_plans is None:
+                attn_metadata.encoder_seq_plans = self._build_plans(attn_metadata, query)
+            plans = attn_metadata.encoder_seq_plans
 
-        for plan in attn_metadata.encoder_seq_plans:
+        for plan in plans:
             if plan.row_table is None:
                 self._run_slot(
                     output,
