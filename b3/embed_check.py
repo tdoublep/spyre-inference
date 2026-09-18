@@ -55,7 +55,7 @@ def main() -> int:
         "norms": [sum(x * x for x in v) ** 0.5 for v in vecs],
         "vectors": vecs,
     }
-    path = f"/home/senuser/spyre-inference/.claude/worktrees/s3-dev2-b3-launch-sites/b3/out/{tag}.embeds.json"
+    path = f"/home/senuser/spyre-inference/.claude/worktrees/s3c-b3-fusion/b3/out/{tag}.embeds.json"
     with open(path, "w") as f:
         json.dump(out, f)
     print(f"B3_EMBEDS_WRITTEN {path}", flush=True)

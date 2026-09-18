@@ -5,4 +5,4 @@
 export SPYRE_ATTN_INLINE=1
 export SPYRE_COMPILE_GRANULARITY=block
 export SPYRE_ENCODER_SLOT_PADDING=0
-exec bash /home/senuser/spyre-inference/.claude/worktrees/s3-dev2-b3-launch-sites/b3/count.sh "$@"
+exec bash /home/senuser/spyre-inference/.claude/worktrees/s3c-b3-fusion/b3/count.sh "$@"

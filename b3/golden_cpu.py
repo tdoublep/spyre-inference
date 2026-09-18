@@ -16,10 +16,10 @@ import sys
 import torch
 from transformers import AutoModel, AutoTokenizer
 
-sys.path.insert(0, "/home/senuser/spyre-inference/.claude/worktrees/s3-dev2-b3-launch-sites/b3")
+sys.path.insert(0, "/home/senuser/spyre-inference/.claude/worktrees/s3c-b3-fusion/b3")
 from embed_check import MODEL, TEXTS  # noqa: E402
 
-OUT = "/home/senuser/spyre-inference/.claude/worktrees/s3-dev2-b3-launch-sites/b3/out/golden-cpu.embeds.json"
+OUT = "/home/senuser/spyre-inference/.claude/worktrees/s3c-b3-fusion/b3/out/golden-cpu.embeds.json"
 
 
 def main() -> int:

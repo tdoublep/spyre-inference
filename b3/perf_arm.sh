@@ -4,7 +4,7 @@
 # profiled is ~2.8x slower for the rest of its life (GOAL measurement trap).
 # One server at a time -- the accelerator takes a single process.
 set -u
-WT="/home/senuser/spyre-inference/.claude/worktrees/s3-dev2-b3-launch-sites"
+WT="/home/senuser/spyre-inference/.claude/worktrees/s3c-b3-fusion"
 TAG="${1:?tag}"
 INLINE="${2:?inline 0|1}"
 OUT="$WT/b3/out"

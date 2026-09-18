@@ -4,7 +4,7 @@
 # Writes b3/out/<arm>.log and b3/out/<arm>.counts, and copies the largest
 # generated Inductor module to b3/out/<arm>.module.py so counts stay auditable.
 set -u
-WT="/home/senuser/spyre-inference/.claude/worktrees/s3-dev2-b3-launch-sites"
+WT="/home/senuser/spyre-inference/.claude/worktrees/s3c-b3-fusion"
 ARM="${1:?arm name required}"
 OUT="$WT/b3/out"
 mkdir -p "$OUT"
