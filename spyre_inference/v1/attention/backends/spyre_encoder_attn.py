@@ -288,7 +288,9 @@ def encoder_row_table(start: int, query_len: int, extent: int, dtype: torch.dtyp
     return torch.arange(extent, dtype=dtype).clamp(max=query_len - 1) + start
 
 
-def encoder_mask(extent: int, kv_len: int, dtype: torch.dtype) -> torch.Tensor:
+def encoder_mask(
+    extent: int, kv_len: int, dtype: torch.dtype, device: torch.device | None = None
+) -> torch.Tensor:
     """Additive mask ``[1, 1, 1, extent]`` for one sequence, on the host.
 
     The head and query axes are 1 and left to broadcast: an encoder mask depends
@@ -300,10 +302,33 @@ def encoder_mask(extent: int, kv_len: int, dtype: torch.dtype) -> torch.Tensor:
     left an eager ``cat`` on the device, which torch-spyre compiled once per tile
     pattern -- and warmup could not cover those, because it only ever built masks
     with ``kv_len == extent`` (no partial tile) while real requests always have one.
+
+    The ``device`` argument is for the inlined-attention path only, where the
+    host build plus ``convert`` would put a ``spyre_convert`` FallbackKernel in the
+    traced graph -- and the backend's ``propagate_named_dims`` cannot handle one.
+    Built on device the ``cat`` is compiled with the enclosing graph, so the eager
+    per-tile-pattern compiles the note above warns about do not arise.
     """
-    mask = torch.full((1, 1, 1, extent), torch.finfo(dtype).min, dtype=dtype)
+    mask = torch.full((1, 1, 1, extent), torch.finfo(dtype).min, dtype=dtype, device=device)
     mask[..., :kv_len] = 0
     return mask
+
+
+def _slot_mask(slots, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """The group's additive mask, built where the consumer can read it.
+
+    Inlined attention traces this, and a host build followed by ``convert`` leaves a
+    ``spyre_convert`` FallbackKernel in the graph that the backend's
+    ``propagate_named_dims`` pass rejects, so build straight on device there.
+    """
+    if torch.compiler.is_compiling():
+        return torch.cat(
+            [encoder_mask(slots.extent, kv, dtype, device) for kv in slots.kv_lens()], dim=0
+        )
+    return convert(
+        torch.cat([encoder_mask(slots.extent, kv, dtype) for kv in slots.kv_lens()], dim=0),
+        device,
+    )
 
 
 def _host_pad_head_dim(x: torch.Tensor, padded: int) -> torch.Tensor:
@@ -591,16 +616,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                     query_lens=list(slots.query_lens),
                     extent=slots.extent,
                     row_table=None,
-                    mask=convert(
-                        torch.cat(
-                            [
-                                encoder_mask(slots.extent, kv, query.dtype)
-                                for kv in slots.kv_lens()
-                            ],
-                            dim=0,
-                        ),
-                        query.device,
-                    ),
+                    mask=_slot_mask(slots, query.dtype, query.device),
                 )
             ]
 

@@ -1,0 +1,11 @@
+arm            inline-devmask
+granularity    block
+layers         12
+module         /tmp/b3-inductor-inline-devmask/pi/cpigrgxjs3wyvjigh6acya57eor4lvlkuc6wi63vaklmlvbjyolg.py
+module_lines   214
+sdsc_run_sites 1
+sdsc_distinct  1
+modules_total  5
+unified_attn   0
+fallback       0
+to_dtype_cpu   0

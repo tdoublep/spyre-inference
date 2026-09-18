@@ -49,7 +49,11 @@ def _convert_op_func(
         from spyre_inference import envs
 
         if envs.SPYRE_ATTN_INLINE:
-            return tensor
+            # `clone`, not `tensor`: `_convert_op_fake` returns a fresh `torch.empty`,
+            # so the schema promises a non-aliasing output. Handing back an input
+            # makes functionalization and the memory planner both believe they own
+            # the same buffer, which frees it twice.
+            return tensor.clone()
         raise RuntimeError(
             f"Trying to convert a tensor to the same device ({tensor.device.type}) "
             + f"and same dtype ({tensor.dtype}), should never happen!"
