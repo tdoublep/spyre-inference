@@ -13,14 +13,9 @@ mkdir -p "$OUT"
 export PYTHONPATH="$WT:${PYTHONPATH:-}"
 export LAYOUT_SOLVER=greedy
 export SPYRE_COMPILE_GRANULARITY=block
-# Device-program cache ON, but in a fresh per-arm dir. Disabling it entirely made
-# every new shape rebuild its device program from scratch on every request
-# (~185 s/request in the warmup loop); pointing it at the shared
-# /share/torch_sendnn_cache risks the stale entries that masked an earlier error.
-export TORCH_SENDNN_CACHE_ENABLE=1
-export TORCH_SENDNN_CACHE_DIR="/tmp/b3-sendnn-cache-$TAG"
-rm -rf "$TORCH_SENDNN_CACHE_DIR"
-mkdir -p "$TORCH_SENDNN_CACHE_DIR"
+# NOTE: TORCH_SENDNN_CACHE_* is INERT in this stack -- torch_sendnn is not
+# installed and torch_spyre only ever sets TORCH_SENDNN_LOG. Do not set it and do
+# not attribute anything to it.
 export SPYRE_ATTN_INLINE="$INLINE"
 export TORCHINDUCTOR_CACHE_DIR="/tmp/b3-inductor-perf-$TAG"
 
