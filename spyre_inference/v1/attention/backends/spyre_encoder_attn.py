@@ -108,6 +108,42 @@ _encoder_gather_compiled = torch.compile(_encoder_gather_kernel, dynamic=False)
 _ATTN_HEAD_CHUNK = envs.SPYRE_ENCODER_ATTN_HEAD_CHUNK
 
 
+def _sdpa_maybe_head_chunked(q, k, v, mask, scale, num_heads, num_kv_heads):
+    """SDPA over 4-D operands, optionally split into head chunks.
+
+    The score tensor is ``[group, heads, extent, extent]``; splitting the head axis
+    shrinks it without shrinking a matmul dimension -- only the bmm batch count --
+    so unlike key or query tiling it does not push the matmuls into the regime where
+    this hardware's per-FLOP cost climbs. Only worth it once the tensor overruns
+    on-chip capacity, i.e. at large ``group``; below that the extra calls dominate.
+    """
+    chunk = _ATTN_HEAD_CHUNK
+    if chunk and num_heads == num_kv_heads and num_heads % chunk == 0 and chunk < num_heads:
+        return torch.cat(
+            [
+                F.scaled_dot_product_attention(
+                    q[:, i : i + chunk],
+                    k[:, i : i + chunk],
+                    v[:, i : i + chunk],
+                    attn_mask=mask,
+                    scale=scale,
+                    is_causal=False,
+                )
+                for i in range(0, num_heads, chunk)
+            ],
+            dim=1,
+        )
+    return F.scaled_dot_product_attention(
+        q,
+        k,
+        v,
+        attn_mask=mask,
+        scale=scale,
+        is_causal=False,
+        enable_gqa=(num_heads != num_kv_heads),
+    )
+
+
 def _encoder_sdpa_kernel(
     q_rows,
     k_rows,
@@ -143,34 +179,7 @@ def _encoder_sdpa_kernel(
     q = q_rows.reshape(group, extent, num_heads, head_size).transpose(1, 2)
     k = k_rows.reshape(group, extent, num_kv_heads, head_size).transpose(1, 2)
     v = v_rows.reshape(group, extent, num_kv_heads, head_size).transpose(1, 2)
-    chunk = _ATTN_HEAD_CHUNK
-    if chunk and num_heads == num_kv_heads and num_heads % chunk == 0 and chunk < num_heads:
-        # The score tensor is [group, heads, extent, extent]; splitting the head axis
-        # shrinks it without shrinking a matmul dimension, only the bmm batch count.
-        attn = torch.cat(
-            [
-                F.scaled_dot_product_attention(
-                    q[:, i : i + chunk],
-                    k[:, i : i + chunk],
-                    v[:, i : i + chunk],
-                    attn_mask=mask,
-                    scale=scale,
-                    is_causal=False,
-                )
-                for i in range(0, num_heads, chunk)
-            ],
-            dim=1,
-        )
-    else:
-        attn = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=mask,
-            scale=scale,
-            is_causal=False,
-            enable_gqa=(num_heads != num_kv_heads),
-        )
+    attn = _sdpa_maybe_head_chunked(q, k, v, mask, scale, num_heads, num_kv_heads)
     return attn.transpose(1, 2).reshape(group * extent, num_heads, head_size)
 
 
@@ -244,14 +253,8 @@ def _encoder_slot_kernel(
     q = query.view(group, extent, num_heads, head_size).transpose(1, 2)
     k = key.view(group, extent, num_kv_heads, head_size).transpose(1, 2)
     v = value.view(group, extent, num_kv_heads, head_size).transpose(1, 2)
-    attn = F.scaled_dot_product_attention(
-        q,
-        k,
-        v,
-        attn_mask=mask,
-        scale=scale,
-        is_causal=False,
-        enable_gqa=(num_heads != num_kv_heads),
+    attn = _sdpa_maybe_head_chunked(
+        q, k, v, mask, scale, num_heads, num_kv_heads
     )
     out.copy_(attn.transpose(1, 2).reshape(group * extent, num_heads, head_size))
     return out
