@@ -101,44 +101,85 @@ boundary, not the attention math.
    against a reference anywhere in the suite.** `slot_kernel_probe.py` is the missing test's skeleton;
    the `own-spread` check in `b3/table.py` is the cheap end-to-end form.
 
-## 5. MEASURED: the fused path recompiles per call, ~300 s, and does not amortise
+## 5. FIXED, then MEASURED: the fused path is ~11% faster per forward
 
-**This is the blocking issue for the fusion, and it outranks §1.** §1 is a bug in an unshipped
-patch that `main` does not have; this is a property of the fusion itself.
+### The per-call recompile, and what it actually was
 
-`perf_steps.py` embeds the *same* 4 texts repeatedly in one process. Three consecutive settle calls,
-`SPYRE_ATTN_INLINE=1`, default buckets, after warmup completed:
+`perf_steps.py` embeds the same 4 texts repeatedly. Before the fix, three
+consecutive settle calls with `SPYRE_ATTN_INLINE=1` cost **286 / 311 / 321 s** --
+flat, so the fused body graph was recompiling every call, not once per shape.
+Steady-state hostprobe put it beyond doubt: `_model_forward` 189,173 ms/call while
+everything outside it was microseconds.
+
+`TORCH_LOGS=recompiles` named the guards. Four causes, and **three of them are
+diagnostic instrumentation that was only ever safe while attention was opaque** --
+the same root cause as the handoff's five blockers, in new places:
+
+1. `if attn_metadata.encoder_seq_plans is None` was traced, and dynamo guarded on
+   the None-ness: None on the first trace, set by layer 0 after. Fixed by hoisting
+   the plan build out of the graph (`prime_slot_plan`).
+2. `_call_kernel` read dynamo's own `counters["stats"]`, which changes constantly,
+   so the graph guarded on that dict. 276 guard failures.
+3. `note_unattributed_compiles` called `logger.warning` inside the traced region --
+   a hard crash (`logging.Logger method not supported`) as soon as it had anything
+   to report.
+4. `forward_context.slot_mapping[...]` size mismatch, the dominant trigger. Fixed
+   by `SPYRE_ENCODER_FASTPATH=1`, an existing flag whose whole job is to reuse one
+   slot-mapping buffer per shape; it is **off by default**.
+
+Also fixed, latent rather than firing: the slot mask was keyed on `kv_lens`, which
+fixes its contents but never its shape, and that key was read inside the traced
+region -- so every distinct set of request lengths was a distinct tensor. Keyed on
+`(extent, num_slots)` now, one buffer per shape.
+
+⚠️ **`SPYRE_COMPILE_GRANULARITY=model` is NOT the fix and should not be tried.**
+The `layer_name` guard re-specialises one block code object per layer, but that is
+**bounded at 12 and paid once** -- it is not per-call and it is not a problem. The
+107 cache entries seen before the fix were the *product* of 12 layers and ~9 calls,
+because the per-call guards kept failing. A whole-model graph addresses neither
+per-call guard and costs far more to compile.
+
+### After the fix
 
 ```
-settle (s): ['286.4043', '311.4715', '321.3795']
+settle (s): ['382.8697', '0.0585', '0.0566']     <- converges, was flat at ~300
+B3_STEPS inline=1 bucket=2048 n=6  median=56.62  mean=56.65  min=56.37  p90=57.22
 ```
 
-**Flat, not decaying.** Three identical back-to-back batches each cost ~300 s, so the cost is not a
-one-off per-shape compile that a longer warmup could absorb — it repeats. Within the first call the
-per-prompt-group ticks were 124.75 s then ~187 s, i.e. compile-sized work per group. The 40 timed
-repeats would have taken ~3.3 h; the arm was killed. **There is therefore no fused per-step number,
-and the 43 → 23 launch-count win cannot be cashed until this is understood.**
+One 383 s compile on the first call, then 58 ms. Recompiles bounded at 50, one-time.
 
-Matched baseline, same harness, same texts, `SLOT_PADDING=0` (main's packed path), which *did*
-complete and whose timed window is verified compile-free (compile-attribution counter unchanged at 3
-across all 40 repeats, all 3 in settle):
+### The number, matched arms
 
-```
-median=52.47 ms  mean=62.70  min=35.67  p10=42.32  p90=56.53   (n=40, 4 texts/call)
-settle (s): ['1.5869', '0.0583', '0.0561']      <- converges, unlike the fused arm
-```
+Same 4 texts, `bucket=2048`, `granularity=block`, `n=6`. Both arms verified against
+the CPU golden in the same process that timed them (0.999975 and 0.999974), and the
+fused arm is bit-identical to the pre-fix fused arm, so the fixes moved no numerics.
 
-Steady-state host spans for that baseline (last two hostprobe dumps differenced, per
-`_hostprobe`'s own instruction — the cumulative totals include the settle compiles):
+| arm | median ms/call | `_model_forward` ms/call |
+|---|---|---|
+| fused: `INLINE=1` + slot padding + `FASTPATH=1` | **56.62** | **23.27** |
+| baseline: `INLINE=0`, packed var-len (what ships) | 63.17 | 26.15 |
 
-| span | ms/call |
-|---|---|
-| `_model_forward` | 22.50 |
-| `OUTSIDE_execute_model` (engine+ipc) | 1.43 |
-| `_pool` | 1.04 |
+**~10% per call, ~11% per forward, i.e. 2.9 ms/step.** That is in the same ballpark
+as the handoff's ~4 ms/step estimate from 43 -> 23 launches, so its launch-cost
+argument was roughly right and `FINDING-s3-opus5-L-2`'s "prize is small" was too
+pessimistic. It is also nowhere near the 2x that GOAL.md's 200 req/s needs.
 
-The body forward is ~94% of the step, so the fusion is aimed at the right term — which is why the
-per-call recompile is worth diagnosing rather than abandoning.
+⚠️ **Caveats on the number.** `n=6`. The baseline's mean/p90 are void -- a pooler
+compile fired inside its timed window (`_pool` 134 ms/call in steady state); its
+median and min agree at 62-63 ms so the median stands, but that arm deserves a
+clean re-run. And **only ~23 of the 56.62 ms per call is the forward**: the rest is
+in-process API overhead both arms pay, so per-call wall understates the difference
+and `_model_forward` is the honest term to compare.
+
+### Still open: warmup coverage
+
+The fused path pays ~383 s on the first call for a layout warmup did not build,
+because `_warm_kernels` is skipped when inlining (`not (self._inline_attn and
+torch.compiler.is_compiling())`) and **nothing replaces its enumeration** of every
+reachable `(buffer_rows, slots)` pair. Warmup produced only `4 slots x
+{64,128,256,512}` while a real step wanted `2 slots x 512`. This is now a
+first-call cost per layout rather than a per-call cost, but a server must still
+cover every reachable layout or pay it mid-request.
 
 ### ⚠️ Retraction — I got the 185 s attribution wrong; the handoff was right
 
