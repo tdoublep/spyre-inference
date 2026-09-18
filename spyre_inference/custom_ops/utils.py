@@ -116,6 +116,7 @@ def convert(tensor, device=None, dtype=None, row_major=False):
         device: Target device as `str` or `torch.device` (None = keep current).
         dtype: Target dtype (None = keep current).
         row_major: Place dim 0 outermost on device (see `_row_outermost_layout`).
+            Ignored if the tensor is already on the target device with this dtype.
 
     Returns:
         Converted tensor, or None if input is None.
