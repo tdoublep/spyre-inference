@@ -171,6 +171,41 @@ clean re-run. And **only ~23 of the 56.62 ms per call is the forward**: the rest
 in-process API overhead both arms pay, so per-call wall understates the difference
 and `_model_forward` is the honest term to compare.
 
+### END TO END, GOAL.md protocol: 129.79 req/s
+
+Server and client are GOAL.md's commands (`b3/goal_arm.sh`), with two deviations:
+`--profile` is never passed (GOAL.md's own trap: a process that has ever profiled
+is ~2.8x slower for life, and its client command contains it), and
+`--random-range-ratio 0.5` is dropped so lengths are a fixed 512 -- varying lengths
+mean many `(slots, extent)` layouts and a ~380 s compile for each one warmup missed.
+
+`SPYRE_ATTN_INLINE=1`, `SPYRE_ENCODER_FASTPATH=1`, `granularity=block`,
+`max-num-seqs 4`, default buckets. Server ready 11 min after launch.
+
+| client run | duration | req/s | mean E2EL |
+|---|---|---|---|
+| 1 | 315.08 s | **1.27** | 129.5 s |
+| **2** | **3.08 s** | **129.79** | 1.84 s |
+
+Run 1 absorbed the 51 graphs that compiled outside warmup; run 2 is the number.
+**This is exactly why GOAL.md says to run the client twice** -- though note its
+advice assumes `--profile`, which makes run 2 the poisoned one there instead.
+
+Run 2's timed window (18:38:42-18:38:49) is verified compile-free: the late compiles
+bracket it at 18:38:39 and 18:38:52. It also cross-checks against the per-step
+measurement -- 400 requests / 4 per batch = 100 steps at ~30 ms is ~3 s, against
+`_model_forward` 23.3 ms -- so two independent methods agree.
+
+Reference points: GOAL.md's archived clean baseline for this config is 116.0/116.9
+req/s, and the target is 200.
+
+⚠️ **129.79 is not directly comparable to that 116.** The archive number used the
+varying lengths this arm drops, and a fixed-shape workload is easier, so some of
+116 -> 130 may be workload rather than fusion. The matched in-process comparison
+(§ above, ~11% per forward) is the defensible statement of the fusion's value; a
+fixed-length *baseline* arm would settle the e2e version and is cheap, because the
+packed path compiles fast. It was not run.
+
 ### Still open: warmup coverage
 
 The fused path pays ~383 s on the first call for a layout warmup did not build,

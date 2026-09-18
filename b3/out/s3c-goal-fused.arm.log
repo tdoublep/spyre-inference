@@ -1,0 +1,20 @@
+=== GOAL arm tag=s3c-goal-fused inline=1 fastpath=1
+Fri Sep 18 18:16:14 UTC 2026
+server ready
+Fri Sep 18 18:27:29 UTC 2026
+--- client run 1
+Fri Sep 18 18:27:29 UTC 2026
+Successful requests:                     400       
+Benchmark duration (s):                  315.08    
+Request throughput (req/s):              1.27      
+Mean E2EL (ms):                          129504.16 
+--- client run 2
+Fri Sep 18 18:38:39 UTC 2026
+Successful requests:                     400       
+Benchmark duration (s):                  3.08      
+Request throughput (req/s):              129.79    
+Mean E2EL (ms):                          1841.60   
+--- late compiles on the server (should be none in the timed phase):
+9
+=== done s3c-goal-fused
+Fri Sep 18 18:38:55 UTC 2026
