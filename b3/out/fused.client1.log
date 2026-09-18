@@ -1,0 +1,43 @@
+INFO 09-18 14:21:25 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 09-18 14:21:25 [__init__.py:54] - spyre_inference -> spyre_inference:register
+INFO 09-18 14:21:25 [__init__.py:66] Loading plugin spyre_inference
+INFO 09-18 14:21:25 [__init__.py:254] Platform plugin spyre_inference is activated
+INFO 09-18 14:21:28 [importing.py:88] Triton not installed or not compatible; certain GPU-related functions will not be available.
+Namespace(subparser='bench', bench_type='serve', dispatch_function=<function BenchmarkServingSubcommand.cmd at 0x7f09cd002980>, trust_remote_code=False, seed=0, num_prompts=400, dataset_name='random', no_stream=False, dataset_path=None, no_oversample=False, skip_chat_template=False, enable_multimodal_chat=False, disable_shuffle=False, custom_output_len=256, custom_ensure_client_side_data=False, spec_bench_output_len=256, spec_bench_category=None, sonnet_input_len=550, sonnet_output_len=150, sonnet_prefix_len=200, sharegpt_output_len=None, timed_trace_chunk_hash_size=16, timed_trace_sec_multiplier=1, timed_trace_label_timestamp='timestamp', timed_trace_label_input_length='input_length', timed_trace_label_output_length='output_length', timed_trace_label_hash_ids='hash_ids', blazedit_min_distance=0.0, blazedit_max_distance=1.0, asr_max_audio_len_sec=inf, asr_min_audio_len_sec=0.0, random_input_len=512, random_output_len=128, random_range_ratio='0.5', random_prefix_len=0, random_batch_size=1, no_reranker=False, random_mm_base_items_per_request=1, random_mm_num_mm_items_range_ratio=0.0, random_mm_limit_mm_per_prompt={'image': 255, 'video': 1}, random_mm_bucket_config={(256, 256, 1): 0.5, (720, 1280, 1): 0.5, (720, 1280, 16): 0.0}, hf_subset=None, hf_split=None, hf_name=None, hf_output_len=None, bfcl_categories=None, prefix_repetition_prefix_len=256, prefix_repetition_suffix_len=256, prefix_repetition_num_prefixes=10, prefix_repetition_output_len=128, speed_bench_dataset_subset='qualitative', speed_bench_output_len=4096, speed_bench_category=None, label=None, backend='openai-embeddings', base_url='http://localhost:8000', host='127.0.0.1', port=8000, endpoint='/v1/embeddings', header=None, max_concurrency=None, model='ibm-granite/granite-embedding-278m-multilingual', input_len=None, output_len=None, tokenizer=None, tokenizer_mode='auto', use_beam_search=False, logprobs=None, request_rate=inf, burstiness=1.0, probe_request_rate=0.0, disable_tqdm=False, num_warmups=100, profile=False, save_result=False, save_detailed=False, append_result=False, metadata=None, result_dir=None, result_filename=None, ignore_eos=False, self_timed=None, percentile_metrics=None, metric_percentiles='99', goodput=None, request_id_prefix='bench-301726da-', top_p=None, top_k=None, min_p=None, temperature=None, frequency_penalty=None, presence_penalty=None, repetition_penalty=None, served_model_name=None, lora_modules=None, lora_assignment='random', ramp_up_strategy=None, ramp_up_start_rps=None, ramp_up_end_rps=None, ready_check_timeout_sec=0, chat_template_kwargs=None, extra_body=None, skip_tokenizer_init=False, insecure=False, plot_timeline=False, timeline_itl_thresholds='25,50', plot_dataset_stats=False)
+INFO 09-18 14:21:32 [config.py:961] Found sentence-transformers tokenize configuration.
+INFO 09-18 14:21:32 [utils.py:90] Sampling input_len from [255, 765] and output_len from [64, 192]
+[transformers] Token indices sequence length is longer than the specified maximum sequence length for this model (689 > 512). Running this sequence through the model will result in indexing errors
+Starting initial single prompt test run...
+Skipping endpoint ready check.
+Warming up with 100 requests...
+  0%|          | 0/100 [00:00<?, ?it/s]  1%|          | 1/100 [03:05<5:06:36, 185.82s/it]Signal Received: 15 (Terminated)
+Signal Received from pid=1739466 
+*** BACKTRACE ***
+Signal Received: 15 (Terminated)
+Signal Received from pid=1851211 
+*** BACKTRACE ***
+/opt/ibm/spyre/senlib/lib/libsenlib-dd2.so(+0x47681f)[0x7f0ee8cb781f]
+/opt/ibm/spyre/senlib/lib/libsenlib-dd2.so(+0x47681f)[0x7f0ee8cb781f]
+/lib64/libc.so.6(+0x411c0)[0x7f0fa7e481c0]
+/lib64/libc.so.6(+0x411c0)[0x7f0fa7e481c0]
+/lib64/libc.so.6(epoll_wait+0x56)[0x7f0fa7f0d876]
+/lib64/libc.so.6(+0x9277e)[0x7f0fa7e9977e]
+/usr/lib64/python3.12/lib-dynload/select.cpython-312-x86_64-linux-gnu.so(+0x3056)[0x7f0fa6fde056]
+/lib64/libc.so.6(pthread_cond_wait+0x128)[0x7f0fa7e9be58]
+/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/numpy/_core/../../numpy.libs/libscipy_openblas64_-fdde5778.so(+0x43581b)[0x7f0f8e24e81b]
+/lib64/libc.so.6(+0x958bf)[0x7f0fa7e9c8bf]
+/lib64/libc.so.6(__clone+0x44)[0x7f0fa7f0d264]
+*****************
+/lib64/libpython3.12.so.1.0(_PyEval_EvalFrameDefault+0x37fb)[0x7f0fa8169e9b]
+/lib64/libpython3.12.so.1.0(PyEval_EvalCode+0xaa)[0x7f0fa821ef5a]
+/lib64/libpython3.12.so.1.0(+0x27ad01)[0x7f0fa825ad01]
+/lib64/libpython3.12.so.1.0(+0x2756ab)[0x7f0fa82556ab]
+/lib64/libpython3.12.so.1.0(+0x272652)[0x7f0fa8252652]
+/lib64/libpython3.12.so.1.0(_PyRun_SimpleFileObject+0x1cb)[0x7f0fa825201b]
+/lib64/libpython3.12.so.1.0(_PyRun_AnyFileObject+0x48)[0x7f0fa8251dd8]
+/lib64/libpython3.12.so.1.0(Py_RunMain+0x3b0)[0x7f0fa824e790]
+/lib64/libpython3.12.so.1.0(Py_BytesMain+0x3b)[0x7f0fa82087fb]
+/lib64/libc.so.6(+0x2a58e)[0x7f0fa7e3158e]
+/lib64/libc.so.6(__libc_start_main+0x89)[0x7f0fa7e31649]
+/home/senuser/spyre-inference/.venv/bin/python3(_start+0x25)[0x5598d91ab095]
+*****************
