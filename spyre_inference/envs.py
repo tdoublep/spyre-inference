@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     SPYRE_BATCHED_DECODE: bool = False
     SPYRE_ENCODER_BATCHED_ATTN: bool = True
     SPYRE_ENCODER_SLOT_PADDING: bool = True
+    SPYRE_ENCODER_ATTN_HEAD_CHUNK: int = 0
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
@@ -86,6 +87,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # warmup. Set to 0 to trade that back for the shorter startup.
     "SPYRE_ENCODER_BATCHED_ATTN": lambda: bool(int(os.getenv("SPYRE_ENCODER_BATCHED_ATTN", "1"))),
     "SPYRE_ENCODER_SLOT_PADDING": lambda: bool(int(os.getenv("SPYRE_ENCODER_SLOT_PADDING", "1"))),
+    # Heads per attention call. The score tensor is [group, heads, extent, extent],
+    # so splitting the head axis shrinks it without shrinking any matmul dimension --
+    # only the bmm batch count. Worth ~2.1x on the kernel at group 8, where the full
+    # tensor overruns on-chip capacity; a loss at group 4, where it already fits.
+    # 0 keeps one call over all heads.
+    "SPYRE_ENCODER_ATTN_HEAD_CHUNK": lambda: int(os.getenv("SPYRE_ENCODER_ATTN_HEAD_CHUNK", "0")),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.

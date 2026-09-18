@@ -105,6 +105,9 @@ def _encoder_gather_kernel(query, key, value, row_index):
 _encoder_gather_compiled = torch.compile(_encoder_gather_kernel, dynamic=False)
 
 
+_ATTN_HEAD_CHUNK = envs.SPYRE_ENCODER_ATTN_HEAD_CHUNK
+
+
 def _encoder_sdpa_kernel(
     q_rows,
     k_rows,
@@ -140,15 +143,34 @@ def _encoder_sdpa_kernel(
     q = q_rows.reshape(group, extent, num_heads, head_size).transpose(1, 2)
     k = k_rows.reshape(group, extent, num_kv_heads, head_size).transpose(1, 2)
     v = v_rows.reshape(group, extent, num_kv_heads, head_size).transpose(1, 2)
-    attn = F.scaled_dot_product_attention(
-        q,
-        k,
-        v,
-        attn_mask=mask,
-        scale=scale,
-        is_causal=False,
-        enable_gqa=(num_heads != num_kv_heads),
-    )
+    chunk = _ATTN_HEAD_CHUNK
+    if chunk and num_heads == num_kv_heads and num_heads % chunk == 0 and chunk < num_heads:
+        # The score tensor is [group, heads, extent, extent]; splitting the head axis
+        # shrinks it without shrinking a matmul dimension, only the bmm batch count.
+        attn = torch.cat(
+            [
+                F.scaled_dot_product_attention(
+                    q[:, i : i + chunk],
+                    k[:, i : i + chunk],
+                    v[:, i : i + chunk],
+                    attn_mask=mask,
+                    scale=scale,
+                    is_causal=False,
+                )
+                for i in range(0, num_heads, chunk)
+            ],
+            dim=1,
+        )
+    else:
+        attn = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=mask,
+            scale=scale,
+            is_causal=False,
+            enable_gqa=(num_heads != num_kv_heads),
+        )
     return attn.transpose(1, 2).reshape(group * extent, num_heads, head_size)
 
 
