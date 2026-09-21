@@ -14,11 +14,8 @@
 
 """Encoder-only (bidirectional) self-attention for Spyre, without a KV cache.
 
-Selected by ``TorchSpyrePlatform.get_attn_backend_cls`` for ENCODER/ENCODER_ONLY layers.
-
-The runner pads every sequence to ``L`` and the batch to ``B`` before the model runs, so
-Q/K/V arrive as exactly ``B * L`` rows with sequence ``s`` at rows ``s*L``. Attention is a
-reshape, one SDPA call and a reshape back.
+The runner pads every sequence to ``L`` and the batch to ``B``, so Q/K/V arrive as exactly
+``B * L`` rows with sequence ``s`` at rows ``s*L``.
 """
 
 from __future__ import annotations
@@ -63,11 +60,9 @@ def build_key_pad_mask(
 ) -> torch.Tensor:
     """Additive key-pad ``[B, 1, 1, L]``: 0 on real keys, a large negative on pad.
 
-    Built on the host: Spyre cannot produce bool from an int32 ``lt``, nor broadcast
-    ``where`` into a 2D grid.
-
-    ``finfo.min / 2``, not ``finfo.min`` or ``-inf``: the torch-spyre SDPA decomposition
-    does ``amax`` then ``exp(scores - max)``, so a fully masked row yields NaN.
+    Host-built: Spyre cannot produce bool from an int32 ``lt``, nor broadcast ``where``
+    into a 2D grid. ``finfo.min / 2``, not ``finfo.min`` or ``-inf``, because torch-spyre's
+    SDPA decomposition does ``amax`` then ``exp(scores - max)`` and NaNs a masked row.
     """
     if num_seqs != len(kv_lens):
         raise ValueError(f"num_seqs={num_seqs} != len(kv_lens)={len(kv_lens)}")
@@ -198,15 +193,14 @@ def _ensure_encoder_grid(
         return
 
     num_seqs = attn_metadata.num_seqs
-    # ``query_start_loc``, not ``seq_lens``: this is bidirectional self-attention so
-    # query length *is* kv length, and upstream's ``_dummy_run`` leaves ``seq_lens``
-    # carrying the whole padded token count rather than the per-sequence length.
+    # ``query_start_loc``, not ``seq_lens``: query length *is* kv length here, and
+    # upstream's ``_dummy_run`` puts the whole padded token count in ``seq_lens``.
     qsl = attn_metadata.query_start_loc.cpu()
     kv_lens = torch.diff(qsl).tolist()[:num_seqs]
     max_len = max(kv_lens, default=0)
 
-    # Pin the grid to the shape the runner padded to: its product is the row count we
-    # were handed. Re-deriving it from metadata alone lets the two disagree.
+    # Pin the grid to the shape the runner padded to; re-deriving it from metadata
+    # alone lets the two disagree.
     pair = pick_encoder_shape(
         num_seqs,
         max_len,
@@ -221,8 +215,8 @@ def _ensure_encoder_grid(
         )
     aligned_len, batch = pair
 
-    # Batch-pad sequences get one attendable key rather than none: an all-masked
-    # query row NaNs inside SDPA's online softmax. Their output is never read.
+    # Batch-pad sequences get one attendable key: an all-masked query row NaNs inside
+    # SDPA's softmax. Their output is never read.
     padded_kv_lens = kv_lens + [1] * (batch - num_seqs)
     key_pad = build_key_pad_mask(batch, aligned_len, padded_kv_lens, dtype=query.dtype)
     if target_device.type == "spyre":
@@ -320,8 +314,7 @@ class SpyreEncoderAttentionImpl(AttentionImpl):
             key = convert(key, target_device.type)
             value = convert(value, target_device.type)
 
-        # Head-dim padding stays outside the graph: MiniLM's D=32 F.pad needs a host
-        # round trip, and it is a no-op whenever head_size is already a stick.
+        # Outside the graph: MiniLM's D=32 F.pad needs a host round trip.
         q = _pad_head_dim_to_stick(query, head_size_padded)
         k = _pad_head_dim_to_stick(key, head_size_padded)
         v = _pad_head_dim_to_stick(value, head_size_padded)
@@ -337,8 +330,7 @@ class SpyreEncoderAttentionImpl(AttentionImpl):
             num_kv_heads != num_heads,
         )
 
-        # Stick-aligned heads need no prefix crop, so the output write joins the
-        # attention graph instead of costing its own dispatch.
+        # No prefix crop needed, so the output write joins the attention graph.
         if head_size == head_size_padded and output.dtype == query.dtype:
             kernel = _compile_if_spyre(_encoder_attn_kernel_out, q.device.type)
             _call_kernel("encoder attention", kernel, output, q, k, v, *args)

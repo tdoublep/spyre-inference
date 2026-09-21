@@ -540,9 +540,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # Set by load_model: whether the pooler/classifier stay on Spyre.
         self._pooling_on_spyre = False
 
-        # Declared pooling ``(L, B)`` shapes, and the grid chosen for the current
-        # step. The grid is written by _spyre_bucket_batch_descriptor and read by
-        # _preprocess and _pool, which all run once per step in that order.
+        # The grid is written by _spyre_bucket_batch_descriptor and read by _preprocess
+        # and _pool, which all run once per step in that order.
         self._encoder_shapes: list[tuple[int, int]] = (
             encoder_warmup_shapes(vllm_config)
             if vllm_config.model_config.runner_type == "pooling"
@@ -706,9 +705,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _create_shape_bucketer(self) -> SpyreShapeBucketer | None:
         """Create the 1D body bucketer.
 
-        Pooling's body token count is exactly ``B * L``, one of the products the platform
-        put in ``compile_sizes``, so both runners share the 1D lookup. Pooling keeps a
-        bucketer when eager too: the dense expansion is needed either way.
+        Pooling keeps one when eager too: the dense expansion needs it either way.
         """
         if self.model_config.runner_type == "pooling":
             return SpyreShapeBucketer(self.vllm_config)
@@ -1056,10 +1053,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
     ) -> BatchDescriptor | None:
         """Padded ``BatchDescriptor``, or None to fall through to upstream.
 
-        Pooling pads to ``B * L`` of the covering shape and stashes the grid for
-        ``_preprocess``. It must come from the shape, not the token sum: with shapes
-        ``[(64,32), (256,8), (512,2)]`` eight 100-token prompts need ``(256, 8) = 2048``
-        rows, while their 800-token sum would round to 1024.
+        The pooling count comes from the covering shape, not the token sum: eight
+        100-token prompts need ``(256, 8) = 2048`` rows, not the 1024 their sum rounds to.
         """
         bucketer = self.spyre_shape_bucketer
         if bucketer is None or not bucketer.is_warmed_up:
@@ -1082,15 +1077,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _preprocess(self, *args, **kwargs):
         """Expand the ragged body into the dense ``B * L`` grid for pooling.
 
-        Upstream ``_prepare_inputs`` has already written rows contiguously and the padding
-        hook above only sets the trailing pad count, so interior per-sequence padding has
-        to happen here.
-
-        ``query_start_loc`` and ``seq_lens`` keep the real ragged lengths: attention needs
-        them for its key-pad mask and pooling reads nothing else off them.
-
-        ``_dummy_run`` bypasses this and slices its own buffers, which still traces the
-        right graphs because ``num_tokens_padded`` is already ``B * L``.
+        Upstream writes rows contiguously and the padding hook only sets the trailing pad
+        count, so interior per-sequence padding has to happen here. ``query_start_loc``
+        and ``seq_lens`` keep the real ragged lengths, which attention's mask needs.
         """
         out = super()._preprocess(*args, **kwargs)
         grid = self._encoder_grid
@@ -1204,17 +1193,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
     ) -> torch.Tensor:
         """Re-compact the dense ``[B*L, hidden]`` grid to flat ragged ``[T, hidden]``.
 
-        This one gather is what lets the whole pooler stack stay layout-agnostic:
-        ``build_pooling_cursor`` addresses rows by ``cumsum(num_scheduled_tokens)``,
-        which is correct again once the pad rows between sequences are dropped.
-
-        Reporting padded lengths instead, to make the cursor land on ``s*L``, makes
+        The poolers address rows by ``cumsum(num_scheduled_tokens)``, so the inter-sequence
+        pad rows have to go. Reporting padded lengths instead makes
         ``PoolingCursor.is_partial_prefill()`` true and ``SpyreCLSPool`` raise.
 
-        The gather keeps its input's row count rather than shrinking to
-        ``sum(query_lens)``: a width that tracked the real token count adds a
-        ``torch.compile`` specialization per distinct total, so nearly every step
-        recompiles once prompt lengths vary. ``SpyreAllPool`` avoids it the same way.
+        The gather keeps its input's row count: a width tracking the real token count adds
+        a ``torch.compile`` specialization per distinct total, recompiling nearly every
+        step once prompt lengths vary.
         """
         grid = self._encoder_grid
         if grid is None:
@@ -1308,10 +1293,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             "Either all or none of the requests in a batch must be pooling request"
         )
 
-        # Re-compact the dense grid on device before pooling: the poolers address
-        # rows by the cursor's cumsum of real lengths, so the inter-sequence pad
-        # rows must be gone. One index_select per step, against three per layer
-        # under the old ragged-pack scheme.
+        # The poolers address rows by the cursor's cumsum of real lengths, so the
+        # inter-sequence pad rows must be gone before they run.
         hidden_states = convert(hidden_states, self._spyre_device)
         hidden_states = self._unpad_encoder_hidden(hidden_states, num_scheduled_tokens)
 

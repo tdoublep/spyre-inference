@@ -43,8 +43,7 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
 # because these tests are pretty slow.
 pytestmark = [pytest.mark.attention, pytest.mark.encoder_attention]
 
-# Small declared shapes so the tests stay fast. The ladders cross, and each gains its
-# own limit, so these give (64|128) x (2|4).
+# The ladders cross and each gains its own limit, so these give (64|128) x (2|4).
 _TEST_MAX_MODEL_LEN = 128
 _TEST_MAX_NUM_SEQS = 4
 
@@ -139,8 +138,7 @@ def _build_metadata(
 def _make_impl(num_query_heads: int, num_kv_heads: int, head_size: int):
     from vllm.config import get_current_vllm_config
 
-    # The shapes come from the engine limits crossed with the two ladders above, so the
-    # limits have to be the test's, not the default model's.
+    # Shapes cross the engine limits with the ladders above, so pin the limits too.
     cfg = get_current_vllm_config()
     cfg.model_config.max_model_len = _TEST_MAX_MODEL_LEN
     cfg.scheduler_config.max_num_seqs = _TEST_MAX_NUM_SEQS

@@ -14,8 +14,7 @@
 
 """``_warmup_pooling_bucket_shapes`` traces exactly one dummy per declared ``(L, B)``.
 
-Driven with a stub self: the method's whole surface is ``_encoder_shapes``,
-``scheduler_config.max_num_seqs``, ``_spyre_kv_caches`` and the two dummy runs.
+Driven with a stub self; the method's whole surface is four attributes.
 """
 
 from types import SimpleNamespace
@@ -91,9 +90,8 @@ class TestDecoderTypeTextTower:
     """A pooling model with a real KV cache (e.g. CLIP's text tower).
 
     Upstream's ``_dummy_run`` broadcasts one aggregate ``seq_lens`` across a uniform
-    multi-request batch, overestimating ``num_blocks`` for a paged KV layer. Those
-    variants are recorded by ``_record_attention_graphs`` instead, so multi-request
-    shapes must not force attention here.
+    multi-request batch, overestimating ``num_blocks`` for a paged KV layer, so those
+    variants go to ``_record_attention_graphs`` instead.
     """
 
     def test_multi_request_shapes_skip_force_attention(self):

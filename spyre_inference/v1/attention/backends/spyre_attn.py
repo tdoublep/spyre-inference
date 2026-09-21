@@ -327,14 +327,11 @@ class SpyreAttentionMetadata(AttentionMetadata):
     mask_by_chunk_cpu: torch.Tensor | None = None  # [num_chunks, entries * KV, 1, block] fp16
     mask_by_chunk_dev: torch.Tensor | None = None
 
-    # Declared encoder grid for this step: the body arrives as exactly ``B * L``
-    # rows (each sequence already padded to ``L`` by the runner), so attention
-    # reshapes rather than packs. Filled on the first layer of a step and reused by
-    # the rest (page_index_tables pattern); ``None`` until then.
+    # Declared encoder grid for this step. Filled on the first layer and reused by the
+    # rest (page_index_tables pattern); ``None`` until then.
     encoder_pack_batch: int | None = None
     encoder_pack_len: int | None = None
-    # Host-built additive key-pad ``[B, 1, 1, L]`` on the target device, broadcast
-    # over the head and query axes by SDPA itself.
+    # Additive key-pad ``[B, 1, 1, L]``; SDPA broadcasts the head and query axes.
     encoder_key_pad_mask: torch.Tensor | None = None
 
     @property

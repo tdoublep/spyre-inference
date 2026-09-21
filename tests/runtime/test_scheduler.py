@@ -133,9 +133,8 @@ def test_higher_cap_admits_more_prefills(monkeypatch):
 def test_pooling_runner_is_exempt():
     """Pooling never decodes, so serialising its prefills only gives up batching.
 
-    The limits are the pooling path's, not the decoder's: a declared shape is ``B * L``
-    dense rows, so the token budget has to hold the whole batch or the platform lowers
-    ``max_num_seqs`` to what fits and nothing batches.
+    Pooling limits, not the decoder's: the budget must hold the whole ``B * L`` batch or
+    the platform lowers ``max_num_seqs`` to what fits and nothing batches.
     """
     scheduler = _scheduler(runner_type="pooling", max_model_len=256, max_num_batched_tokens=4 * 256)
     assert scheduler.max_num_partial_prefills == 0

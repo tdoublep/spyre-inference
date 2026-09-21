@@ -18,10 +18,8 @@ Decoder: sorted ``compile_sizes`` token counts; pad the packed batch to the near
 bucket.
 
 Pooling: ``(prompt_length, batch_size)`` shapes, the cross product of
-``SPYRE_ATTN_QUERY_BUCKETS`` and ``SPYRE_ATTN_NUM_SEQS_BUCKETS`` -- the same two ladders
-the decoder attention bucketer uses. Both default to a single entry, so the default is one
-graph of ``max_num_seqs * max_model_len`` rows. Every sequence is padded to ``L`` before
-the model runs, so the body sees exactly ``B * L`` rows.
+``SPYRE_ATTN_QUERY_BUCKETS`` and ``SPYRE_ATTN_NUM_SEQS_BUCKETS``, both defaulting to one
+entry. Every sequence is padded to ``L`` before the model, so the body sees ``B * L`` rows.
 """
 
 from __future__ import annotations
@@ -65,10 +63,8 @@ def _resolve_encoder_buckets(
 ) -> list[int]:
     """One encoder ladder: the override, else the env list, else just ``limit``.
 
-    Same clamping as ``SpyreAttnBucketer``: entries above ``limit`` are unreachable and
-    dropped, and ``limit`` itself is appended when missing so the widest admissible batch
-    always has a shape. ``align`` rounds lengths up to a stick, which ``limit`` is exempt
-    from -- ``max_model_len`` is not ours to raise.
+    ``limit`` is appended when missing so the widest admissible batch always has a shape,
+    and is exempt from ``align`` because ``max_model_len`` is not ours to raise.
     """
     if override is not None:
         raw = [int(v) for v in override]
@@ -97,20 +93,15 @@ def encoder_warmup_shapes(
     length_buckets: Sequence[int] | None = None,
     num_seqs_buckets: Sequence[int] | None = None,
 ) -> list[tuple[int, int]]:
-    """Declared ``(prompt_length, batch_size)`` shapes, sorted by ``(B, L)``.
+    """Declared ``(prompt_length, batch_size)`` shapes, cheapest covering shape first.
 
-    The cross product of the two ladders, each defaulting to a single entry, so an
-    unconfigured run compiles exactly one ``max_num_seqs * max_model_len`` graph. Sorting
-    by width makes ``pick_encoder_shape`` prefer the cheapest covering shape.
-
-    ``max_num_batched_tokens`` is what bounds a shape's width: a shape puts ``B * L`` dense
-    rows through the body, so the budget caps how many sequences a bucket can hold. The
-    caller is expected to write the resulting width back to ``max_num_seqs`` -- see
-    ``TorchSpyrePlatform._apply_pooling_shape_defaults`` -- which makes this idempotent.
+    A shape puts ``B * L`` dense rows through the body, so ``max_num_batched_tokens``
+    bounds the width. Idempotent once the caller writes that width back to
+    ``max_num_seqs`` (``TorchSpyrePlatform._apply_pooling_shape_defaults``).
     """
     max_model_len = int(vllm_config.model_config.max_model_len)
-    # A max-length pooling request must fit one batch: encoder prefill cannot be chunked,
-    # so a budget below max_model_len head-of-line blocks the scheduler forever.
+    # Encoder prefill cannot be chunked, so a budget under max_model_len head-of-line
+    # blocks the scheduler forever.
     budget = max(int(vllm_config.scheduler_config.max_num_batched_tokens), max_model_len)
 
     lengths = _resolve_encoder_buckets(
@@ -141,8 +132,8 @@ def pick_encoder_shape(
 ) -> tuple[int, int] | None:
     """First declared ``(L, B)`` covering the batch, or ``None``.
 
-    ``None`` needs no fallback: the scheduler gate and vLLM's ``max_model_len`` check
-    both reject such a batch before it reaches the runner.
+    ``None`` needs no fallback: the scheduler gate and vLLM's ``max_model_len`` check both
+    reject such a batch before it reaches the runner.
     """
     if num_seqs < 1 or max_len < 1:
         return None

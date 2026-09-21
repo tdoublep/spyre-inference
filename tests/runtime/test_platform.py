@@ -210,9 +210,7 @@ def test_apply_config_pins_pooling_config_to_the_declared_shapes(monkeypatch):
     """``max_model_len`` is an input; the width and the budget are written back.
 
     The ladders cross, so ``SPYRE_ATTN_QUERY_BUCKETS=64`` against ``max_model_len=512``
-    and ``max_num_seqs=32`` gives ``(64, 32)`` and ``(512, 32)``. The body's
-    ``compile_sizes`` are the distinct ``B * L`` products, because every sequence is
-    padded to ``L`` before the model runs.
+    and ``max_num_seqs=32`` gives ``(64, 32)`` and ``(512, 32)``.
     """
     from unittest.mock import MagicMock
 

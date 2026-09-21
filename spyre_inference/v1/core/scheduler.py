@@ -70,9 +70,8 @@ class TorchSpyreScheduler(Scheduler):
 class PoolingSpyreScheduler(TorchSpyreScheduler):
     """Only admit pooling batches a declared compile shape covers.
 
-    Constraining the batch is what removes the runtime fallback: ``pick_encoder_shape``
-    cannot miss, so nothing compiles mid-request. A request longer than every declared
-    length is rejected earlier by vLLM's ``max_model_len`` check.
+    This is what removes the runtime fallback: ``pick_encoder_shape`` cannot miss, so
+    nothing compiles mid-request.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -93,11 +92,7 @@ class PoolingSpyreScheduler(TorchSpyreScheduler):
         ]
 
     def schedule(self, *args, **kwargs) -> SchedulerOutput:
-        """Admit a shape-compatible batch, then delegate to the base scheduler.
-
-        The waiting queue is drained into a holdback deque so the base scheduler only sees
-        requests sharing a shape; the rest are returned with priority order intact.
-        """
+        """Admit a shape-compatible batch, then delegate to the base scheduler."""
         # `pop_request` / `add_request`, not deque ops: `self.waiting` is a
         # RequestQueue, and PriorityRequestQueue is not a deque.
         holdback_queue: deque[Request] = deque()
@@ -122,9 +117,8 @@ class PoolingSpyreScheduler(TorchSpyreScheduler):
                     last_available = available
                     continue
 
-                # No shape holds this request alongside the ones already admitted.
-                # If the widest surviving shape still has room, skip past it and try
-                # the next request; otherwise the batch is full.
+                # No shape holds this request alongside those already admitted. Skip it
+                # if the widest surviving shape still has room; otherwise the batch is full.
                 max_batch = max(batch for _, batch in last_available)
                 if len(self.waiting) < max_batch:
                     available = last_available
@@ -138,10 +132,8 @@ class PoolingSpyreScheduler(TorchSpyreScheduler):
                 len(holdback_queue) + len(skip_queue),
             )
 
-        # Upstream's own waiting loop admits on `max_num_running_reqs`, which comes from
-        # `max_num_seqs` -- the widest declared shape. It can exceed what the gate above
-        # approved for *this* batch, and the extra request reaches the runner with no
-        # shape covering it. Pin the cap to exactly the approved set.
+        # Upstream's waiting loop admits on `max_num_running_reqs` independently of the
+        # gate above, and anything extra reaches the runner with no shape covering it.
         max_num_running_reqs = self.max_num_running_reqs
         self.max_num_running_reqs = min(max_num_running_reqs, len(self.running) + len(self.waiting))
         try:

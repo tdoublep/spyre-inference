@@ -332,10 +332,8 @@ class TorchSpyrePlatform(CpuPlatform):
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
         """Pin the pooling engine config to the declared ``(L, B)`` shapes.
 
-        ``max_model_len``, ``max_num_seqs`` and ``max_num_batched_tokens`` are the inputs;
-        only the latter two are written back, and only downwards, so that the scheduler
-        admits exactly the batches a compiled shape covers. Every sequence is padded to
-        ``L`` before the model, so the body's token count is exactly ``B * L``.
+        All three limits are inputs; ``max_num_seqs`` and ``max_num_batched_tokens`` are
+        written back, downwards only, so the scheduler admits only what a shape covers.
         """
         from spyre_inference.v1.worker.spyre_shape_bucketer import (
             encoder_body_sizes,

@@ -36,8 +36,7 @@ def _req(num_prompt_tokens: int, name: str = ""):
 def _run(shapes, waiting, running=(), monkeypatch=None, max_num_running_reqs=None):
     """Return (admitted, left_waiting) for one ``schedule()`` call.
 
-    The stub base admits up to ``max_num_running_reqs``, as upstream's waiting loop does,
-    so the clamp ``PoolingSpyreScheduler`` puts around it is actually exercised.
+    The stub base admits up to ``max_num_running_reqs``, as upstream's waiting loop does.
     """
     sched = PoolingSpyreScheduler.__new__(PoolingSpyreScheduler)
     sched.spyre_warmup_shapes = list(shapes)
@@ -153,11 +152,9 @@ def test_admitted_count_never_exceeds_the_widest_declared_batch(num_reqs, monkey
 class TestUpstreamAdmissionIsClampedToTheGate:
     """The gate's approved set is pinned into ``max_num_running_reqs`` for the base call.
 
-    Upstream's waiting loop admits on ``max_num_running_reqs``, which comes from
-    ``max_num_seqs`` -- the widest declared shape, not the widest one covering *this*
-    batch's length. Anything it admits past the gate reaches the runner with no shape
-    covering it, so the cap is lowered for the duration of the base call and restored
-    after. Same pattern as ``TorchSpyreScheduler``'s partial-prefill cap.
+    Upstream admits on ``max_num_seqs``, the widest declared shape rather than the widest
+    covering *this* batch's length, so anything past the gate reaches the runner with no
+    shape covering it.
     """
 
     SHAPES = [(512, 2), (256, 8), (64, 32)]
