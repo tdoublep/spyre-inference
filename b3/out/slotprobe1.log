@@ -1,0 +1,20 @@
+Invalid -W option ignored: invalid module name: 'torch_spyre.ops.fallbacks'
+INFO 09-18 15:01:45 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 09-18 15:01:45 [__init__.py:54] - spyre_inference -> spyre_inference:register
+INFO 09-18 15:01:45 [__init__.py:66] Loading plugin spyre_inference
+INFO 09-18 15:01:45 [__init__.py:254] Platform plugin spyre_inference is activated
+INFO 09-18 15:01:48 [importing.py:88] Triton not installed or not compatible; certain GPU-related functions will not be available.
+device=spyre  extent=512 heads=12 head_size=64 dtype=torch.float16
+Traceback (most recent call last):
+  File "/home/senuser/spyre-inference/.claude/worktrees/s3c-b3-fusion/b3/slot_kernel_probe.py", line 148, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/home/senuser/spyre-inference/.claude/worktrees/s3c-b3-fusion/b3/slot_kernel_probe.py", line 95, in main
+    out = convert(torch.zeros_like(q), dev)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/senuser/spyre-inference/.claude/worktrees/s3c-b3-fusion/spyre_inference/custom_ops/utils.py", line 111, in convert
+    return torch.ops.vllm.spyre_convert(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/senuser/spyre-inference/.venv/lib64/python3.12/site-packages/torch/_ops.py", line 1392, in __getattr__
+    raise AttributeError(
+AttributeError: '_OpNamespace' 'vllm' object has no attribute 'spyre_convert'

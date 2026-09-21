@@ -1,0 +1,29 @@
+INFO 09-18 15:02:44 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 09-18 15:02:44 [__init__.py:54] - spyre_inference -> spyre_inference:register
+INFO 09-18 15:02:44 [__init__.py:66] Loading plugin spyre_inference
+INFO 09-18 15:02:44 [__init__.py:254] Platform plugin spyre_inference is activated
+INFO 09-18 15:02:47 [importing.py:88] Triton not installed or not compatible; certain GPU-related functions will not be available.
+[WARNING] [spyre.inductor.assign_dim_hints] spyre_hint on [buf9, buf10, buf11, buf12, buf13, buf14, buf15, buf16, buf17, buf18, buf19, buf20, buf21, buf22, buf23, buf24, buf25, buf26, buf27]: no op iterates over the hinted dimension — hint ignored
+device=spyre  extent=512 heads=12 head_size=64 dtype=torch.float16
+
+group=1 rows=512
+  vs isolated      max|d|=0.00610 rel=0.0074   (real rows: 0.00610 rel=0.0074)
+  vs contaminated  max|d|=0.00610 rel=0.0074   (real rows: 0.00610 rel=0.0074)
+  vs nomask                                  (real rows: 0.32550 rel=0.5216)
+  -> MATCHES CONTAMINATED (batch dim collapsed)
+[WARNING] [spyre.inductor.assign_dim_hints] spyre_hint on [buf9, buf10, buf11, buf12, buf13, buf14, buf15, buf16, buf17, buf18, buf19, buf20, buf21, buf22, buf23, buf24, buf25, buf26, buf27]: no op iterates over the hinted dimension — hint ignored
+
+group=2 rows=1024
+  vs isolated      max|d|=0.00830 rel=0.0120   (real rows: 0.00830 rel=0.0120)
+  vs contaminated  max|d|=0.47925 rel=0.9013   (real rows: 0.47925 rel=0.9013)
+  vs nomask                                  (real rows: 0.55464 rel=0.9734)
+  -> MATCHES ISOLATED (correct)
+[WARNING] [spyre.inductor.assign_dim_hints] spyre_hint on [buf9, buf10, buf11, buf12, buf13, buf14, buf15, buf16, buf17, buf18, buf19, buf20, buf21, buf22, buf23, buf24, buf25, buf26, buf27, buf28, buf29, buf30, buf31, buf32, buf33, buf34, buf35, buf36, buf37, buf38, buf39, buf40, buf41, buf42, buf43, buf44]: no op iterates over the hinted dimension — hint ignored
+
+group=4 rows=2048
+  vs isolated      max|d|=0.00586 rel=0.0058   (real rows: 0.00586 rel=0.0058)
+  vs contaminated  max|d|=0.66553 rel=1.4831   (real rows: 0.61304 rel=1.3662)
+  vs nomask                                  (real rows: 0.51001 rel=0.5885)
+  -> MATCHES ISOLATED (correct)
+
+SLOT_PROBE PASS (0 group size(s) wrong)

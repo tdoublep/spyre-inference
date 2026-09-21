@@ -1,0 +1,45 @@
+# hostprobe installed: wrapped=['_update_states', '_prepare_inputs', '_get_slot_mappings', '_build_attention_metadata', '_determine_batch_execution_and_padding', '_preprocess', '_pool', '_sync_device', '_execute_mm_encoder', '_compute_cascade_attn_prefix_lens', '_gather_mm_embeddings', '_model_forward', '_allow_microbatching', '_get_cumsum_and_arange', '_plan_slots', 'embed_input_ids', 'embed_multimodal', 'add_request', 'remove_request', 'condense', 'refresh_metadata', '_register_add_request', 'commit_block_table', 'append_row', 'add_row', 'compute_slot_mapping', 'execute_model'] missing=['_extract_encoder_inputs', '_maybe_add_model_args', 'make_pooling_metadata', 'make_sampling_metadata']
+=== steps=5 tag= t=1789749531.233
+execute_model	755.194459	5
+_model_forward	754.151463	4
+_pool	1.039194	4
+OUTSIDE_execute_model(engine+ipc)	0.009672	4
+_prepare_inputs	0.001326	4
+_update_states	0.001092	5
+_build_attention_metadata	0.000443	4
+_sync_device	0.000395	4
+input_batch.refresh_metadata	0.000332	5
+input_batch.add_request	0.000283	8
+_get_cumsum_and_arange	0.000162	4
+_get_slot_mappings	0.000113	4
+_preprocess	0.000079	4
+_determine_batch_execution_and_padding	0.000074	4
+input_batch.remove_request	0.000056	5
+input_batch._register_add_request	0.000028	8
+_allow_microbatching	0.000015	4
+input_batch.condense	0.000013	5
+block_table.add_row	0.000008	8
+block_table.compute_slot_mapping	0.000005	4
+block_table.commit_block_table	0.000003	4
+=== steps=10 tag= t=1789750098.778
+execute_model	1322.726203	10
+_model_forward	1321.672186	7
+_pool	1.047347	7
+OUTSIDE_execute_model(engine+ipc)	0.023371	9
+_prepare_inputs	0.002194	7
+_update_states	0.001996	10
+_build_attention_metadata	0.000789	7
+input_batch.refresh_metadata	0.000603	10
+_sync_device	0.000476	7
+input_batch.add_request	0.000463	13
+_get_cumsum_and_arange	0.000282	7
+_get_slot_mappings	0.000204	7
+_determine_batch_execution_and_padding	0.000140	7
+_preprocess	0.000138	7
+input_batch.remove_request	0.000124	12
+input_batch._register_add_request	0.000042	13
+input_batch.condense	0.000031	10
+_allow_microbatching	0.000024	7
+block_table.add_row	0.000017	13
+block_table.compute_slot_mapping	0.000008	7
+block_table.commit_block_table	0.000008	7
