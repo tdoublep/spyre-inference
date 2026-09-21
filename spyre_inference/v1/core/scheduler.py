@@ -70,19 +70,9 @@ class TorchSpyreScheduler(Scheduler):
 class PoolingSpyreScheduler(TorchSpyreScheduler):
     """Only admit pooling batches a declared compile shape covers.
 
-    Encoder attention runs on a dense ``[B, L]`` grid whose ``(L, B)`` pairs are
-    declared up front (``SPYRE_WARMUP_PROMPT_LENS`` / ``SPYRE_WARMUP_BATCH_SIZES``).
-    Rather than pick a shape after the fact and compile whatever the scheduler
-    happened to batch, this constrains the batch so a declared shape always fits --
-    which is what removes the runtime fallback: ``pick_encoder_shape`` cannot miss,
-    so nothing compiles mid-request.
-
-    A request longer than every declared length never reaches here:
-    ``max_model_len`` is derived from the longest shape, so vLLM's own length check
-    rejects it.
-
-    The base class's partial-prefill cap is already inert for pooling runners, so
-    inheriting it only keeps the class hierarchy in one place.
+    Constraining the batch is what removes the runtime fallback: ``pick_encoder_shape``
+    cannot miss, so nothing compiles mid-request. A request longer than every declared
+    length is rejected earlier by vLLM's ``max_model_len`` check.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -105,13 +95,14 @@ class PoolingSpyreScheduler(TorchSpyreScheduler):
     def schedule(self, *args, **kwargs) -> SchedulerOutput:
         """Admit a shape-compatible batch, then delegate to the base scheduler.
 
-        The whole waiting queue is drained into a holdback deque first so the base
-        scheduler only ever sees requests that share a shape. Anything held back is
-        returned afterwards with its priority order intact.
+        The waiting queue is drained into a holdback deque so the base scheduler only sees
+        requests sharing a shape; the rest are returned with priority order intact.
         """
+        # `pop_request` / `add_request`, not deque ops: `self.waiting` is a
+        # RequestQueue, and PriorityRequestQueue is not a deque.
         holdback_queue: deque[Request] = deque()
         while self.waiting:
-            holdback_queue.append(self.waiting.popleft())
+            holdback_queue.append(self.waiting.pop_request())
 
         # Requests that fit no surviving shape but might fit a later batch.
         skip_queue: deque[Request] = deque()
@@ -127,7 +118,7 @@ class PoolingSpyreScheduler(TorchSpyreScheduler):
                 available = self._fitting_shapes(request, available, len(self.waiting))
 
                 if available:
-                    self.waiting.append(holdback_queue.popleft())
+                    self.waiting.add_request(holdback_queue.popleft())
                     last_available = available
                     continue
 
@@ -151,8 +142,8 @@ class PoolingSpyreScheduler(TorchSpyreScheduler):
 
         # Skipped first, then never-considered: preserves the original priority.
         while skip_queue:
-            self.waiting.append(skip_queue.popleft())
+            self.waiting.add_request(skip_queue.popleft())
         while holdback_queue:
-            self.waiting.append(holdback_queue.popleft())
+            self.waiting.add_request(holdback_queue.popleft())
 
         return outputs

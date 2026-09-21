@@ -332,14 +332,9 @@ class TorchSpyrePlatform(CpuPlatform):
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
         """Derive the pooling engine config from the declared ``(L, B)`` shapes.
 
-        The shapes are the single source of truth, so ``max_model_len`` and
-        ``max_num_seqs`` are *overridden* from them rather than constraining them.
-        Every sequence is padded to ``L`` before the model, so the body's token
-        count is exactly ``B * L`` and ``compile_sizes`` is the set of products.
-
-        The budget is the widest product, so it never binds: encoder prefill cannot
-        be chunked, and ``PoolingSpyreScheduler`` already guarantees every batch
-        fits a declared shape.
+        The shapes are the source of truth, so ``max_model_len`` and ``max_num_seqs`` are
+        overridden from them. Every sequence is padded to ``L`` before the model, so the
+        body's token count is exactly ``B * L`` and the budget never binds.
         """
         from spyre_inference.v1.worker.spyre_shape_bucketer import (
             encoder_body_sizes,
@@ -354,8 +349,7 @@ class TorchSpyrePlatform(CpuPlatform):
         model_config = vllm_config.model_config
         scheduler_config = vllm_config.scheduler_config
 
-        # Raises if the declared length exceeds what the checkpoint supports, so a
-        # typo in the env is a startup error rather than garbage embeddings.
+        # Raises if the declared length exceeds what the checkpoint supports.
         model_config.get_and_verify_max_len(max_model_len=max_len)
         model_config.max_model_len = max_len
         scheduler_config.max_num_seqs = max_batch
@@ -363,7 +357,9 @@ class TorchSpyrePlatform(CpuPlatform):
         # Set only to pass vLLM's max_model_len check earlier in startup.
         scheduler_config.enable_chunked_prefill = False
         scheduler_config.scheduler_cls = "spyre_inference.v1.core.scheduler.PoolingSpyreScheduler"
-        vllm_config.compilation_config.compile_sizes = compile_sizes
+        # Widened explicitly: compile_sizes is declared list[int | str] | None.
+        widened_sizes: list[int | str] = list(compile_sizes)
+        vllm_config.compilation_config.compile_sizes = widened_sizes
 
         logger.info(
             "Pooling compile shapes (prompt_len, batch_size): %s; derived "

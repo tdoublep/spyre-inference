@@ -14,11 +14,10 @@
 
 """Every shape the pooling path hands downstream must be content-independent.
 
-This is the invariant a 15x throughput regression violated: the boundary gather
-re-compacted the dense grid to ``[sum(query_lens), hidden]``, so its first
-dimension tracked the real token count and recompiled the pooler on nearly every
-step once prompt lengths varied. Uniform-length tests cannot see that, which is
-why these cases deliberately use ragged lengths.
+A throughput regression violated this: the boundary gather re-compacted the dense grid to
+``[sum(query_lens), hidden]``, whose first dimension tracked the real token count and so
+recompiled the pooler on nearly every step once lengths varied. Uniform-length tests
+cannot see that, hence the ragged cases here.
 """
 
 from types import SimpleNamespace

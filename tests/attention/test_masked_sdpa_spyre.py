@@ -12,20 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Does compiled SDPA on Spyre honour an additive key-pad ``attn_mask``?
+"""Compiled SDPA on Spyre honours an additive key-pad ``attn_mask``.
 
-``spyre_encoder_attn`` asserts in four docstrings that it does not, and hand-rolls
-a two-graph softmax to avoid it. No test ever checked. Meanwhile
-``multimodal/utils.py::padded_sdpa`` passes ``attn_mask`` straight into
-``F.scaled_dot_product_attention`` on Spyre for Pixtral and gemma-4 vision, and
-those models work.
+The encoder path previously hand-rolled a two-graph softmax on the belief that the mask
+was dropped, and nothing tested it. These cases pin it at the text-encoder shapes with a
+live pad (``real_len < L``).
 
-This settles it at the text-encoder shapes, with a *live* pad (``real_len < L``),
-which is the case the encoder path claims is broken.
-
-SDPA is compile-only on Spyre: eager raises
-``_scaled_dot_product_fused_attention_overrideable not implemented``. So the
-device side is always compiled and the reference side is eager CPU.
+SDPA is compile-only on Spyre, so the device side is compiled and the reference eager CPU.
 """
 
 from __future__ import annotations

@@ -708,11 +708,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _create_shape_bucketer(self) -> SpyreShapeBucketer | None:
         """Create the 1D body bucketer.
 
-        Pooling's body token count is exactly ``B * L`` for a declared shape, and
-        the platform set ``compile_sizes`` to those products, so both runners use
-        the same 1D lookup. Pooling keeps a bucketer in eager too, because the
-        dense expansion must happen regardless of compilation; the decoder skips
-        one when eager because its 1D pad exists only to hit compiled graphs.
+        Pooling's body token count is exactly ``B * L``, one of the products the platform
+        put in ``compile_sizes``, so both runners share the 1D lookup. Pooling keeps a
+        bucketer when eager too: the dense expansion is needed either way.
         """
         if self.model_config.runner_type == "pooling":
             return SpyreShapeBucketer(self.vllm_config)
@@ -815,10 +813,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         logits/sampler run at each *sampled-row* width so the lm_head compiles here
         rather than mid-request. The two bucket sets differ: body buckets are packed
         token counts, rows are at most ``max_num_reqs``.
-        Pooling: one dummy per declared ``(L, B)`` shape. There is no second ladder
-        to walk -- the body token count *is* ``B * L`` -- so a single run per shape
-        traces the body, attention and the pooler together.
-        Upstream dummy skips encoder attention unless ``force_attention=True``.
+        Pooling: one dummy per declared ``(L, B)`` shape, which traces body, attention and
+        pooler together. Upstream skips encoder attention unless ``force_attention=True``.
         """
         is_pooling = self.model_config.runner_type == "pooling"
         # Before the first trace: see allocate_staging_buffers.
@@ -827,8 +823,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if is_pooling and not self.vllm_config.model_config.enforce_eager:
             logger.info("Warming up model...")
             t0 = time.time()
-            # Dense expansion keys off the warmed bucketer, so claim it before the
-            # dummies: they must take the same path a real step does.
+            # The dense expansion keys off the warmed bucketer, so claim it first.
+
             if self.spyre_shape_bucketer is not None:
                 self.spyre_shape_bucketer.mark_warmed_up()
             with _set_spyre_compilation_settings(self.vllm_config):
@@ -1052,11 +1048,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
     ) -> BatchDescriptor | None:
         """Padded ``BatchDescriptor``, or None to fall through to upstream.
 
-        Pooling pads to ``B * L`` of the declared shape covering this batch, and
-        stashes the grid for ``_preprocess`` so the two cannot disagree. It must
-        come from the *shape*, not from the token sum: with shapes
-        ``[(64,32), (256,8), (512,2)]`` a batch of eight 100-token prompts needs
-        ``(256, 8) = 2048`` rows, while its 800-token sum would round to 1024.
+        Pooling pads to ``B * L`` of the covering shape and stashes the grid for
+        ``_preprocess``. It must come from the shape, not the token sum: with shapes
+        ``[(64,32), (256,8), (512,2)]`` eight 100-token prompts need ``(256, 8) = 2048``
+        rows, while their 800-token sum would round to 1024.
         """
         bucketer = self.spyre_shape_bucketer
         if bucketer is None or not bucketer.is_warmed_up:
@@ -1079,20 +1074,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _preprocess(self, *args, **kwargs):
         """Expand the ragged body into the dense ``B * L`` grid for pooling.
 
-        Upstream ``_prepare_inputs`` has already written token rows contiguously,
-        and the padding hook above can only set the *trailing* pad count, so the
-        interior per-sequence padding has to happen here -- after upstream has
-        filled its buffers, before the model sees them.
+        Upstream ``_prepare_inputs`` has already written rows contiguously and the padding
+        hook above only sets the trailing pad count, so interior per-sequence padding has
+        to happen here.
 
-        ``query_start_loc`` and ``seq_lens`` are deliberately left describing the
-        real ragged lengths: attention needs the true lengths for its key-pad mask,
-        and pooling reads nothing else off them (no logits, and encoder-only layers
-        skip ``unified_kv_cache_update``).
+        ``query_start_loc`` and ``seq_lens`` keep the real ragged lengths: attention needs
+        them for its key-pad mask and pooling reads nothing else off them.
 
-        ``_dummy_run`` does not route through here -- it slices
-        ``self.input_ids.gpu[:num_tokens_padded]`` itself -- but warmup still traces
-        the right graphs, because ``num_tokens_padded`` is already ``B * L`` and
-        compilation keys on shape, not content.
+        ``_dummy_run`` bypasses this and slices its own buffers, which still traces the
+        right graphs because ``num_tokens_padded`` is already ``B * L``.
         """
         out = super()._preprocess(*args, **kwargs)
         grid = self._encoder_grid
@@ -1135,9 +1125,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _warmup_pooling_bucket_shapes(self) -> None:
         """One dummy per declared ``(L, B)`` shape.
 
-        ``max_num_seqs`` is pinned to the shape's width so upstream's dummy builds
-        exactly ``B`` requests of ``L`` tokens: that is what the dense expansion and
-        ``pick_encoder_shape`` then see, so the traced graph is the serving graph.
+        ``max_num_seqs`` is pinned to the shape's width so upstream's dummy builds exactly
+        ``B`` requests of ``L`` tokens, making the traced graph the serving graph.
         """
         shapes = encoder_warmup_shapes()
         saved_max_num_seqs = self.scheduler_config.max_num_seqs
@@ -1203,16 +1192,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
         ``build_pooling_cursor`` addresses rows by ``cumsum(num_scheduled_tokens)``,
         which is correct again once the pad rows between sequences are dropped.
 
-        Do *not* instead report padded lengths to make the cursor land on ``s*L`` --
-        that makes ``PoolingCursor.is_partial_prefill()`` true and ``SpyreCLSPool``
-        raise.
+        Reporting padded lengths instead, to make the cursor land on ``s*L``, makes
+        ``PoolingCursor.is_partial_prefill()`` true and ``SpyreCLSPool`` raise.
 
         The gather keeps its input's row count rather than shrinking to
-        ``sum(query_lens)``: an output shape that tracked the real token count would
-        add a ``torch.compile`` specialization per distinct total, which is a
-        recompile on nearly every step once prompt lengths vary. ``SpyreAllPool``
-        avoids the same hazard the same way. Rows past ``sum(query_lens)`` are
-        filler -- the cursor's cumsum never addresses them.
+        ``sum(query_lens)``: a width that tracked the real token count adds a
+        ``torch.compile`` specialization per distinct total, so nearly every step
+        recompiles once prompt lengths vary. ``SpyreAllPool`` avoids it the same way.
         """
         grid = self._encoder_grid
         if grid is None:

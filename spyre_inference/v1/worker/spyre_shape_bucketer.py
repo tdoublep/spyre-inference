@@ -12,21 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Spyre shape bucketer for compilation warmup and runtime dispatch.
+"""Shape bucketing for compilation warmup and runtime dispatch.
 
-Two unrelated schemes live here.
+Decoder: sorted ``compile_sizes`` token counts; pad the packed batch to the nearest
+bucket.
 
-**Decoder (1D).** Sorted ``compile_sizes`` token counts; pad the packed batch to
-the nearest bucket ``>=`` actual ``num_tokens``. Linear / LN compile on ``[T, …]``.
-
-**Pooling / encoder (2D, declared).** The operator declares ``(prompt_length,
-batch_size)`` pairs through ``SPYRE_WARMUP_PROMPT_LENS`` and
-``SPYRE_WARMUP_BATCH_SIZES``, zipped pairwise. ``max_model_len``,
-``max_num_seqs`` and the token budget are derived *from* those shapes rather than
-the other way round, and every sequence is padded to ``L`` before the model runs,
-so the body sees exactly ``B * L`` rows and attention's grid is a reshape. The
-scheduler (``v1/core/scheduler.py``) only admits batches a declared shape covers,
-so dispatch never misses and nothing compiles mid-request.
+Pooling: ``(prompt_length, batch_size)`` pairs declared through
+``SPYRE_WARMUP_PROMPT_LENS`` / ``SPYRE_WARMUP_BATCH_SIZES``, zipped pairwise.
+``max_model_len``, ``max_num_seqs`` and the token budget are derived from them, and every
+sequence is padded to ``L`` before the model runs, so the body sees exactly ``B * L`` rows.
 """
 
 from __future__ import annotations
@@ -43,8 +37,7 @@ from spyre_inference import envs
 
 logger = init_logger(__name__)
 
-# Spyre stick (64 fp16 elements). Declared prompt lengths must land on it so
-# Inductor never enters insert_bmm_padding.
+# Spyre stick, in fp16 elements. Declared prompt lengths must be a multiple of it.
 ENCODER_SEQ_ALIGNMENT = 64
 
 
@@ -69,11 +62,9 @@ def encoder_warmup_shapes(
 ) -> list[tuple[int, int]]:
     """Declared ``(prompt_length, batch_size)`` pairs, sorted by ``(B, L)``.
 
-    The two env lists are **zipped**, not crossed: index ``i`` is one compiled
-    graph. Sorted so the narrowest shape wins ties in ``pick_encoder_shape`` --
-    a single request should land on a batch-1 shape if one was declared.
-
-    Args are for tests; production reads the env.
+    The two env lists are zipped, not crossed: index ``i`` is one compiled graph. Sorting
+    by width makes ``pick_encoder_shape`` prefer the cheapest covering shape. Args are for
+    tests; production reads the env.
     """
     lens = list(envs.SPYRE_WARMUP_PROMPT_LENS if prompt_lens is None else prompt_lens)
     batches = list(envs.SPYRE_WARMUP_BATCH_SIZES if batch_sizes is None else batch_sizes)
@@ -109,11 +100,8 @@ def pick_encoder_shape(
 ) -> tuple[int, int] | None:
     """First declared ``(L, B)`` covering the batch, or ``None``.
 
-    ``shapes`` is sorted by ``(B, L)``, so "first" is the narrowest batch that
-    fits and then the shortest length -- the cheapest graph for this step.
-
-    ``None`` means a request longer than every declared length, which the
-    scheduler and vLLM's own ``max_model_len`` check should both have stopped.
+    ``None`` needs no fallback: the scheduler gate and vLLM's ``max_model_len`` check
+    both reject such a batch before it reaches the runner.
     """
     if num_seqs < 1 or max_len < 1:
         return None
@@ -124,11 +112,7 @@ def pick_encoder_shape(
 
 
 def encoder_body_sizes(shapes: Sequence[tuple[int, int]]) -> list[int]:
-    """Distinct ``B * L`` token counts -- the body's 1D ``compile_sizes``.
-
-    The body is flat ``[B*L, hidden]``, so it keys on the product alone: equal-area
-    shapes share one graph.
-    """
+    """Distinct ``B * L`` counts: the body is flat, so equal-area shapes share a graph."""
     return sorted({length * batch for length, batch in shapes})
 
 
