@@ -294,49 +294,18 @@ class TorchSpyrePlatform(CpuPlatform):
             if all(s not in vllm_config.compilation_config.custom_ops for s in ("all", "none")):
                 vllm_config.compilation_config.custom_ops.append("all")
 
-            # Body: 1D compile_sizes (packed token counts). Attention (B, L)
-            # is independent — see SpyreEncoderAttentionImpl gather-pack.
-            # Honor a user-set list (#638); otherwise generate defaults.
-            if vllm_config.compilation_config.compile_sizes:
-                compile_sizes = vllm_config.compilation_config.compile_sizes
+            if vllm_config.model_config.runner_type == "pooling":
+                cls._apply_pooling_shape_defaults(vllm_config)
             else:
-                # Largest default bucket: scheduler limit and 512 (Spyre max).
-                # Pooling has no 512 limit -- encoder attention compiles (B, L) cells,
-                # not a 512-token body. 2048 is the measured throughput argmax across
-                # pooling models; they regress above it.
-                is_pooling = vllm_config.model_config.runner_type == "pooling"
-                max_capture_size = min(
-                    vllm_config.scheduler_config.max_num_batched_tokens,
-                    2048 if is_pooling else 512,
-                )
-                if is_pooling:
-                    # A max-length request must fit the budget or it is never admitted:
-                    # encoder prefill cannot be chunked, so the scheduler head-of-line
-                    # blocks forever. vLLM's verify_max_model_len checks this in
-                    # SchedulerConfig.__post_init__, before this hook, so the cap below
-                    # would slip past it.
-                    model_len = vllm_config.model_config.max_model_len
-                    if max_capture_size < model_len:
-                        logger.warning(
-                            "Raising pooling token budget %d -> %d to fit max_model_len; "
-                            "encoder prefill cannot be chunked.",
-                            max_capture_size,
-                            model_len,
-                        )
-                        max_capture_size = model_len
-
-                    from spyre_inference.v1.worker.spyre_shape_bucketer import (
-                        default_encoder_len_buckets,
-                    )
-
-                    compile_sizes = [*default_encoder_len_buckets(max_capture_size)]
-                    logger.info(
-                        "Pooling body token buckets (1D compile_sizes): %s",
-                        compile_sizes,
-                    )
+                # Body: 1D compile_sizes (packed token counts).
+                # Honor a user-set list (#638); otherwise generate defaults.
+                if vllm_config.compilation_config.compile_sizes:
+                    compile_sizes = vllm_config.compilation_config.compile_sizes
                 else:
+                    # Largest default bucket: scheduler limit and 512 (Spyre max).
                     # Decode packs one token per running sequence; prefill lands on
                     # the single largest bucket. Denser sizes only cost warmup time.
+                    max_capture_size = min(vllm_config.scheduler_config.max_num_batched_tokens, 512)
                     num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
                     sizes = {max_capture_size, num_seqs}
                     size = 1
@@ -344,20 +313,75 @@ class TorchSpyrePlatform(CpuPlatform):
                         sizes.add(size)
                         size *= 2
                     compile_sizes = sorted(sizes)
-                vllm_config.compilation_config.compile_sizes = compile_sizes
+                    vllm_config.compilation_config.compile_sizes = compile_sizes
 
-            max_capture_size = max(int(s) for s in compile_sizes)
-            # Scheduler must not send more tokens than the largest body bucket.
-            vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
-            logger.warning(
-                "Capping max_num_batched_tokens to %d ",
-                max_capture_size,
-            )
+                max_capture_size = max(int(s) for s in compile_sizes)
+                # Scheduler must not send more tokens than the largest body bucket.
+                vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
+                logger.warning(
+                    "Capping max_num_batched_tokens to %d ",
+                    max_capture_size,
+                )
 
         # In check_and_update_config we assert the dtype is one Spyre supports.
         # This must be set here as the default, otherwise all usage (including test fixtures) would
         # require setting the dtype.
         vllm_config.model_config.dtype = torch.float16
+
+    @classmethod
+    def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
+        """Derive the pooling engine config from the declared ``(L, B)`` shapes.
+
+        The shapes are the single source of truth, so ``max_model_len`` and
+        ``max_num_seqs`` are *overridden* from them rather than constraining them.
+        Every sequence is padded to ``L`` before the model, so the body's token
+        count is exactly ``B * L`` and ``compile_sizes`` is the set of products.
+
+        The budget is the widest product, so it never binds: encoder prefill cannot
+        be chunked, and ``PoolingSpyreScheduler`` already guarantees every batch
+        fits a declared shape.
+        """
+        from spyre_inference.v1.worker.spyre_shape_bucketer import (
+            encoder_body_sizes,
+            encoder_warmup_shapes,
+        )
+
+        shapes = encoder_warmup_shapes()
+        max_len = max(length for length, _ in shapes)
+        max_batch = max(batch for _, batch in shapes)
+        compile_sizes = encoder_body_sizes(shapes)
+
+        model_config = vllm_config.model_config
+        scheduler_config = vllm_config.scheduler_config
+
+        # Raises if the declared length exceeds what the checkpoint supports, so a
+        # typo in the env is a startup error rather than garbage embeddings.
+        model_config.get_and_verify_max_len(max_model_len=max_len)
+        model_config.max_model_len = max_len
+        scheduler_config.max_num_seqs = max_batch
+        scheduler_config.max_num_batched_tokens = compile_sizes[-1]
+        # Set only to pass vLLM's max_model_len check earlier in startup.
+        scheduler_config.enable_chunked_prefill = False
+        scheduler_config.scheduler_cls = "spyre_inference.v1.core.scheduler.PoolingSpyreScheduler"
+        vllm_config.compilation_config.compile_sizes = compile_sizes
+
+        logger.info(
+            "Pooling compile shapes (prompt_len, batch_size): %s; derived "
+            "max_model_len=%d, max_num_seqs=%d, max_num_batched_tokens=%d, "
+            "body compile_sizes=%s",
+            shapes,
+            max_len,
+            max_batch,
+            compile_sizes[-1],
+            compile_sizes,
+        )
+        if all(batch > 1 for _, batch in shapes):
+            logger.warning(
+                "Every declared pooling shape has batch_size > 1, so a single "
+                "request is padded to %d rows. Declare a batch_size=1 shape if "
+                "single-request latency matters.",
+                min(batch for _, batch in shapes) * min(length for length, _ in shapes),
+            )
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:

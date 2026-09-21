@@ -262,11 +262,24 @@ def test_spyre_all_pool_rounds_onto_the_length_ladder():
     assert [c.shape[0] for c in without] == [320]
 
 
-def test_configure_pooling_threads_max_model_len_into_the_ladder():
-    """The ladder reaches SpyreAllPool from configure, not from a contextvar."""
-    model = _model_with_pooler(_token_pooler(AllPool))
-    assert configure_pooling_for_spyre(model, _SPYRE, 512) is True
-    assert model.pooler.pooling.len_ladder == _LADDER
+def test_configure_pooling_threads_declared_lengths_into_the_ladder(monkeypatch):
+    """The ladder reaches SpyreAllPool from configure, not from a contextvar.
+
+    It is the *declared* prompt lengths now, not a derived power-of-two ladder:
+    those are the only widths a request can be padded to.
+    """
+    from spyre_inference import envs
+
+    monkeypatch.setenv("SPYRE_WARMUP_PROMPT_LENS", "64,256,512")
+    monkeypatch.setenv("SPYRE_WARMUP_BATCH_SIZES", "32,8,2")
+    envs.clear_env_cache()
+    try:
+        model = _model_with_pooler(_token_pooler(AllPool))
+        assert configure_pooling_for_spyre(model, _SPYRE, 512) is True
+        assert model.pooler.pooling.len_ladder == [64, 256, 512]
+    finally:
+        # Memoized values would leak the patched env into later tests.
+        envs.clear_env_cache()
 
 
 def test_configure_pooling_without_max_model_len_leaves_the_ladder_empty():
