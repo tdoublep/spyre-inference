@@ -12,21 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Scheduler that only admits pooling batches a declared compile shape covers.
-
-Encoder attention runs on a dense ``[B, L]`` grid whose ``(L, B)`` pairs are
-declared up front (``SPYRE_WARMUP_PROMPT_LENS`` / ``SPYRE_WARMUP_BATCH_SIZES``).
-Rather than pick a shape after the fact and compile whatever the scheduler
-happened to batch, this constrains the batch so a declared shape always fits.
-That is what removes the runtime fallback: ``pick_encoder_shape`` cannot miss, so
-nothing compiles mid-request.
-
-A request longer than every declared length never reaches here --
-``max_model_len`` is derived from the longest shape, so vLLM's own length check
-rejects it.
-"""
-
-from __future__ import annotations
+# SPDX-License-Identifier: Apache-2.0
 
 from collections import deque
 
@@ -35,13 +21,69 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request
 
+from spyre_inference import envs
 from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_warmup_shapes
 
 logger = init_logger(__name__)
 
 
-class PoolingSpyreScheduler(Scheduler):
-    """Gate admission so every batch matches one declared ``(L, B)`` shape."""
+class TorchSpyreScheduler(Scheduler):
+    """V1 scheduler that caps how many sequences may prefill in one batch.
+
+    Attention runs one kernel per sequence, padding each to its own query bucket, so
+    the short leftover chunk upstream uses to top up a batch costs a full-width
+    prefill however few tokens it carries.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # Pooling runners never decode, so there is no leftover chunk to avoid and
+        # serialising their prefills only gives up batching.
+        self.max_num_partial_prefills = (
+            0
+            if self.vllm_config.model_config.runner_type == "pooling"
+            else envs.SPYRE_MAX_NUM_PARTIAL_PREFILLS
+        )
+
+    def schedule(self, *args, **kwargs) -> SchedulerOutput:
+        if self.max_num_partial_prefills <= 0:
+            return super().schedule(*args, **kwargs)
+
+        prefilling = sum(
+            request.num_computed_tokens < request.num_prompt_tokens for request in self.running
+        )
+        free_slots = max(self.max_num_partial_prefills - prefilling, 0)
+        # The waiting loop re-reads this every iteration and appends one request per
+        # admission, so a lowered cap stops it after `free_slots` of them while still
+        # letting it skip candidates. Steps that preempt skip the loop entirely.
+        max_num_running_reqs = self.max_num_running_reqs
+        self.max_num_running_reqs = min(
+            max_num_running_reqs,
+            len(self.running) + self.num_waiting_for_streaming_input + free_slots,
+        )
+        try:
+            return super().schedule(*args, **kwargs)
+        finally:
+            self.max_num_running_reqs = max_num_running_reqs
+
+
+class PoolingSpyreScheduler(TorchSpyreScheduler):
+    """Only admit pooling batches a declared compile shape covers.
+
+    Encoder attention runs on a dense ``[B, L]`` grid whose ``(L, B)`` pairs are
+    declared up front (``SPYRE_WARMUP_PROMPT_LENS`` / ``SPYRE_WARMUP_BATCH_SIZES``).
+    Rather than pick a shape after the fact and compile whatever the scheduler
+    happened to batch, this constrains the batch so a declared shape always fits --
+    which is what removes the runtime fallback: ``pick_encoder_shape`` cannot miss,
+    so nothing compiles mid-request.
+
+    A request longer than every declared length never reaches here:
+    ``max_model_len`` is derived from the longest shape, so vLLM's own length check
+    rejects it.
+
+    The base class's partial-prefill cap is already inert for pooling runners, so
+    inheriting it only keeps the class hierarchy in one place.
+    """
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -60,7 +102,7 @@ class PoolingSpyreScheduler(Scheduler):
             if request.num_prompt_tokens <= length and current_batch_size < batch
         ]
 
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+    def schedule(self, *args, **kwargs) -> SchedulerOutput:
         """Admit a shape-compatible batch, then delegate to the base scheduler.
 
         The whole waiting queue is drained into a holdback deque first so the base
@@ -105,7 +147,7 @@ class PoolingSpyreScheduler(Scheduler):
                 len(holdback_queue) + len(skip_queue),
             )
 
-        outputs = super().schedule(throttle_prefills=throttle_prefills)
+        outputs = super().schedule(*args, **kwargs)
 
         # Skipped first, then never-considered: preserves the original priority.
         while skip_queue:

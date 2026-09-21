@@ -177,25 +177,28 @@ def _ensure_encoder_grid(
         return
 
     num_seqs = attn_metadata.num_seqs
-    kv_lens = attn_metadata.seq_lens.cpu().tolist()[:num_seqs]
+    # ``query_start_loc``, not ``seq_lens``: this is bidirectional self-attention so
+    # query length *is* kv length, and upstream's ``_dummy_run`` leaves ``seq_lens``
+    # carrying the whole padded token count rather than the per-sequence length.
+    qsl = attn_metadata.query_start_loc.cpu()
+    kv_lens = torch.diff(qsl).tolist()[:num_seqs]
     max_len = max(kv_lens, default=0)
 
-    pair = pick_encoder_shape(num_seqs, max_len, shapes)
+    # Pin the grid to the shape the runner padded to: its product is the row count we
+    # were handed. Re-deriving it from metadata alone lets the two disagree.
+    pair = pick_encoder_shape(
+        num_seqs,
+        max_len,
+        [(length, batch) for length, batch in shapes if length * batch == padded_tokens],
+    )
     if pair is None:
         raise ValueError(
             f"No declared encoder shape covers {num_seqs} sequences of up to "
-            f"{max_len} tokens (shapes={shapes}). PoolingSpyreScheduler should have "
-            "prevented this batch; see SPYRE_WARMUP_PROMPT_LENS / "
-            "SPYRE_WARMUP_BATCH_SIZES."
+            f"{max_len} tokens in {padded_tokens} rows (shapes={shapes}). "
+            "PoolingSpyreScheduler should have prevented this batch; see "
+            "SPYRE_WARMUP_PROMPT_LENS / SPYRE_WARMUP_BATCH_SIZES."
         )
     aligned_len, batch = pair
-
-    if padded_tokens != batch * aligned_len:
-        raise ValueError(
-            f"Encoder body has {padded_tokens} rows but the chosen shape "
-            f"(B={batch}, L={aligned_len}) needs {batch * aligned_len}. The runner's "
-            "dense expansion and this dispatch must agree."
-        )
 
     # Batch-pad sequences get one attendable key rather than none: an all-masked
     # query row NaNs inside SDPA's online softmax. Their output is never read.
