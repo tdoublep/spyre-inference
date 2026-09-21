@@ -206,27 +206,43 @@ def test_num_gpu_blocks_override_skipped_for_pooling():
     assert vllm_config.cache_config.num_gpu_blocks_override is None
 
 
-def test_apply_config_sets_pooling_compile_sizes_from_token_cap():
-    """Pooling body T lives on compile_sizes; attention L is independent."""
+def test_apply_config_derives_pooling_config_from_declared_shapes(monkeypatch):
+    """The declared ``(L, B)`` shapes are the single source of truth for pooling.
+
+    ``max_model_len`` and ``max_num_seqs`` are *overridden* from them rather than
+    constraining them, and the body's ``compile_sizes`` are the distinct ``B * L``
+    products, because every sequence is padded to ``L`` before the model runs.
+    """
     from unittest.mock import MagicMock
 
     from vllm.config import CompilationMode
 
+    from spyre_inference import envs
     from spyre_inference.platform import TorchSpyrePlatform
 
-    vllm_config = MagicMock()
-    vllm_config.model_config.enforce_eager = False
-    vllm_config.model_config.runner_type = "pooling"
-    vllm_config.model_config.max_model_len = 512
-    vllm_config.scheduler_config.max_num_batched_tokens = 512
-    vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
-    vllm_config.compilation_config.custom_ops = ["all"]
-    # Empty list is falsy, so the platform generates pooling defaults.
-    # A MagicMock here is truthy and would skip that path (#638).
-    vllm_config.compilation_config.compile_sizes = []
-    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
-    assert vllm_config.compilation_config.compile_sizes == [64, 128, 256, 512]
-    assert vllm_config.scheduler_config.max_num_batched_tokens == 512
+    monkeypatch.setenv("SPYRE_WARMUP_PROMPT_LENS", "64,512")
+    monkeypatch.setenv("SPYRE_WARMUP_BATCH_SIZES", "32,2")
+    envs.clear_env_cache()
+    try:
+        vllm_config = MagicMock()
+        vllm_config.model_config.enforce_eager = False
+        vllm_config.model_config.runner_type = "pooling"
+        vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+        vllm_config.compilation_config.custom_ops = ["all"]
+        vllm_config.compilation_config.compile_sizes = []
+        TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+        # (64, 32) = 2048 and (512, 2) = 1024 -- equal-area shapes would share one.
+        assert vllm_config.compilation_config.compile_sizes == [1024, 2048]
+        assert vllm_config.model_config.max_model_len == 512
+        assert vllm_config.scheduler_config.max_num_seqs == 32
+        # The widest product, so the token budget never binds.
+        assert vllm_config.scheduler_config.max_num_batched_tokens == 2048
+        assert vllm_config.scheduler_config.scheduler_cls == (
+            "spyre_inference.v1.core.scheduler.PoolingSpyreScheduler"
+        )
+    finally:
+        envs.clear_env_cache()
 
 
 def _fake_pad_config(head_dim=64, num_heads=8, *, transformers_backend=False, **rope_attrs):
