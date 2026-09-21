@@ -295,7 +295,6 @@ class TestNextBucket:
         assert next_bucket(0, [64]) == 64
 
 
-
 class TestLogitsRowBuckets:
     def test_clips_prefill_bucket_to_max_num_reqs(self):
         # The 512-token prefill bucket samples at most max_num_seqs rows.

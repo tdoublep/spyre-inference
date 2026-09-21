@@ -12,21 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Encoder-only (bidirectional) self-attention for Spyre without a KV cache.
+"""Encoder-only (bidirectional) self-attention for Spyre, without a KV cache.
 
-Selected by ``TorchSpyrePlatform.get_attn_backend_cls`` for ENCODER/ENCODER_ONLY
-layers.
+Selected by ``TorchSpyrePlatform.get_attn_backend_cls`` for ENCODER/ENCODER_ONLY layers.
 
-The runner pads every sequence to the declared ``L`` and the batch to ``B`` before
-the model runs, so Q/K/V arrive as exactly ``B * L`` rows with sequence ``s`` at
-rows ``s*L .. s*L+L``. Attention is therefore a reshape, one SDPA call and a
-reshape back -- no packing, no workspace, no index tensors.
-
-``attn_mask`` is honoured by compiled SDPA on Spyre (verified against eager CPU by
-``tests/attention/test_masked_sdpa_spyre.py``). An earlier version of this file
-claimed the mask was dropped and hand-rolled a two-graph softmax to avoid it; the
-real bug behind that was layout (torch-spyre#3770, non-zero storage offsets read
-as offset 0), which is why the transposes below must materialise.
+The runner pads every sequence to ``L`` and the batch to ``B`` before the model runs, so
+Q/K/V arrive as exactly ``B * L`` rows with sequence ``s`` at rows ``s*L``. Attention is a
+reshape, one SDPA call and a reshape back.
 """
 
 from __future__ import annotations
@@ -54,10 +46,8 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
 
 logger = init_logger(__name__)
 
-# Pad the head dim to the Spyre stick (64 fp16 elements) so QKᵀ's reduction dim is
-# stick-aligned and Inductor never enters insert_bmm_padding (torch-spyre raises
-# KeyError: 'val' padding MiniLM's head_size=32). The sequence axis needs no
-# padding: declared prompt lengths are validated as multiples of 64.
+# Head dim is padded to the Spyre stick (64 fp16 elements) so QKᵀ's reduction dim is
+# aligned; Inductor's insert_bmm_padding raises KeyError: 'val' on MiniLM's head_size=32.
 ENCODER_SEQ_ALIGNMENT = 64
 
 
@@ -73,15 +63,11 @@ def build_key_pad_mask(
 ) -> torch.Tensor:
     """Additive key-pad ``[B, 1, 1, L]``: 0 on real keys, a large negative on pad.
 
-    Built on the host: Spyre cannot produce bool from an int32 ``lt``, and cannot
-    broadcast ``where`` into a 2D grid (no stick-scatter). SDPA broadcasts the
-    singleton head and query axes itself, so only the KV axis is materialised.
+    Built on the host: Spyre cannot produce bool from an int32 ``lt``, nor broadcast
+    ``where`` into a 2D grid.
 
-    ``finfo.min / 2`` rather than ``finfo.min`` or ``-inf``: the torch-spyre SDPA
-    decomposition computes ``amax`` then ``exp(scores - max)``, so a fully masked
-    query row would yield ``-inf - -inf`` = NaN. Halving keeps the row finite while
-    still driving ``exp`` to zero. Batch-pad sequences are given ``kv_len >= 1`` by
-    the caller for the same reason.
+    ``finfo.min / 2``, not ``finfo.min`` or ``-inf``: the torch-spyre SDPA decomposition
+    does ``amax`` then ``exp(scores - max)``, so a fully masked row yields NaN.
     """
     if num_seqs != len(kv_lens):
         raise ValueError(f"num_seqs={num_seqs} != len(kv_lens)={len(kv_lens)}")
@@ -116,9 +102,8 @@ _compiled_kernels: dict[Callable[..., torch.Tensor], _CompiledFn] = {}
 def _compile_if_spyre(kernel: _CompiledFn, device_type: str) -> _CompiledFn:
     """Compile ``kernel`` once on Spyre. CPU always runs ``kernel``.
 
-    Not gated on ``enforce_eager``: SDPA has no eager Spyre kernel at all
-    (``_scaled_dot_product_fused_attention_overrideable not implemented``), so the
-    device path must be compiled even in an otherwise-eager run.
+    Not gated on ``enforce_eager``: SDPA has no eager Spyre kernel, so the device path
+    must be compiled even in an otherwise-eager run.
     """
     if device_type != "spyre":
         return kernel
@@ -155,9 +140,8 @@ def _sdpa_kernel_gqa(
 def _to_grid(flat: torch.Tensor, batch: int, aligned_len: int, head_size_padded: int):
     """``[B*L, H, D]`` → ``[B, H, L, Dp]``.
 
-    The reshape is a view; the transpose is not, and a non-zero storage offset is
-    read as offset 0 on Spyre (torch-spyre#3770), so it must materialise. Same
-    reason ``padded_sdpa`` forces ``contiguous`` for the vision towers.
+    The transpose must materialise: a non-zero storage offset reads as offset 0 on Spyre
+    (torch-spyre#3770).
     """
     flat = _pad_head_dim_to_stick(flat, head_size_padded)
     num_heads = flat.shape[1]
@@ -217,9 +201,8 @@ def _ensure_encoder_grid(
 class SpyreEncoderAttentionImpl(AttentionImpl):
     """Bidirectional encoder self-attention on a dense ``[B, L]`` grid.
 
-    Subclasses vLLM's ``AttentionImpl`` rather than ``SpyreAttentionImpl``: there
-    is no KV cache to page, and inheriting the decoder's ``do_kv_cache_update`` /
-    staging buffers only created machinery that had to be guarded off again.
+    Subclasses ``AttentionImpl``, not ``SpyreAttentionImpl``: inheriting the decoder's
+    ``do_kv_cache_update`` would scatter into an unbound cache.
     """
 
     def __init__(
@@ -257,7 +240,7 @@ class SpyreEncoderAttentionImpl(AttentionImpl):
         self._shapes = encoder_warmup_shapes()
 
     def record_graphs(self, *args, **kwargs) -> int:
-        """Nothing to page. Warmup traces ``forward`` once per declared shape."""
+        """Nothing to page; warmup traces ``forward`` once per declared shape."""
         return 0
 
     def forward(  # ty: ignore[invalid-method-override]

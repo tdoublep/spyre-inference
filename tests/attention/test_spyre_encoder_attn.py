@@ -14,13 +14,9 @@
 
 """Dense-grid encoder attention: reshape, one SDPA call, reshape back.
 
-The runner pads every sequence to ``L`` and the batch to ``B`` before the model
-runs, so ``forward`` receives exactly ``B * L`` rows with sequence ``s`` at rows
-``s*L ..``. These tests feed that layout directly.
-
-Kernel-level proof that compiled SDPA honours the pad mask lives in
-``test_masked_sdpa_spyre.py``; this file covers the wiring around it -- grid
-choice, mask construction, per-step caching and the write-back.
+``forward`` receives exactly ``B * L`` rows with sequence ``s`` at rows ``s*L``, so these
+tests feed that layout directly. ``test_masked_sdpa_spyre.py`` covers the kernel itself;
+this file covers grid choice, mask construction, per-step caching and the write-back.
 """
 
 from unittest.mock import Mock

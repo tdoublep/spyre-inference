@@ -14,19 +14,15 @@
 
 """``PoolingSpyreScheduler`` admits only batches a declared ``(L, B)`` shape covers.
 
-That guarantee is what lets the attention impl drop its runtime fallback: if a
-batch reaching the runner always fits a compiled shape, ``pick_encoder_shape``
-cannot miss and nothing compiles mid-request.
-
-Host-only. The base ``Scheduler`` is expensive to construct, so these drive the
-override directly with a stub self and a recording base ``schedule``.
+That guarantee is what lets the attention impl drop its runtime fallback. The base
+``Scheduler`` is expensive to construct, so these drive the override with a stub self.
 """
 
-from collections import deque
 from types import SimpleNamespace
 from typing import cast
 
 import pytest
+from vllm.v1.core.sched.request_queue import FCFSRequestQueue
 
 from spyre_inference.v1.core.scheduler import PoolingSpyreScheduler, TorchSpyreScheduler
 
@@ -42,14 +38,15 @@ def _run(shapes, waiting, running=(), monkeypatch=None):
     """Return (admitted, left_waiting) for one ``schedule()`` call."""
     sched = PoolingSpyreScheduler.__new__(PoolingSpyreScheduler)
     sched.spyre_warmup_shapes = list(shapes)
-    sched.waiting = deque(waiting)
+    # The real queue type, so the RequestQueue API is exercised rather than deque ops.
+    sched.waiting = FCFSRequestQueue(waiting)
     sched.running = list(running)
 
     admitted: list = []
 
     def _record(self, *args, **kwargs):
-        admitted.extend(self.waiting)
-        self.waiting.clear()
+        while self.waiting:
+            admitted.append(self.waiting.pop_request())
         return "scheduler-output"
 
     monkeypatch.setattr(TorchSpyreScheduler, "schedule", _record)
@@ -123,9 +120,7 @@ class TestAdmission:
 
     def test_a_single_declared_shape_still_batches(self, monkeypatch):
         """The default config is one shape; it must not degrade to one per step."""
-        admitted, left = _run(
-            [(512, 8)], [_req(400) for _ in range(8)], monkeypatch=monkeypatch
-        )
+        admitted, left = _run([(512, 8)], [_req(400) for _ in range(8)], monkeypatch=monkeypatch)
         assert len(admitted) == 8
         assert left == []
 

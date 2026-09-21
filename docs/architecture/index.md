@@ -329,7 +329,6 @@ is a reshape rather than a gather:
 Warmup is one dummy run per declared shape, which traces body, attention and pooler
 together — there is no second bucket ladder to walk and no separate pack-graph pass.
 
-
 ## Encoder / embedding models: target state
 
 !!! warning "Superseded — diagram not yet regenerated"
