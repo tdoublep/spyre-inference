@@ -289,44 +289,68 @@ Key constraints:
 
 Encoder-only (embedding) models take a separate path. For `ENCODER`/`ENCODER_ONLY`
 layers, `TorchSpyrePlatform.get_attn_backend_cls` selects `SpyreEncoderAttentionBackend`
-→ `SpyreEncoderAttentionImpl` (both subclass the decoder backend/impl in
-`spyre_encoder_attn.py`). This path has **no KV cache** — attention is bidirectional over
-the full sequence — so it skips the paged-cache machinery entirely and instead:
+→ `SpyreEncoderAttentionImpl` (`spyre_encoder_attn.py`). The impl subclasses vLLM's
+`AttentionImpl` directly rather than the paged decoder one: there is **no KV cache** —
+attention is bidirectional over the full sequence — and inheriting the decoder's
+`do_kv_cache_update` and staging buffers only created machinery that had to be guarded
+off again.
 
-1. Builds the pack **indices** and the additive mask on CPU (Spyre can't produce the bool
-   mask or broadcast the `where`), then scatters ragged Q/K/V into the dense
-   `[num_seqs, H, L, Dp]` batch **on Spyre** with a compiled `index_copy_`. Sequence length
-   `L` padding to the `ENCODER_SEQ_ALIGNMENT = 64` stick is structural (the zero rows of
-   the on-device workspace); head dim `D` is padded to the stick only when it isn't already
-   aligned — a host `F.pad` round-trip for MiniLM's `head_size=32`, a no-op for `D=64`.
-2. Runs the attention **on Spyre**: a fused `F.scaled_dot_product_attention` on the B=1,
-   no-live-pad path, or — on the additive-mask path — a compiled QK matmul, an on-device
-   (eager) mask add, and a compiled P·V. The matmuls are kept separate so Inductor can't
-   fuse them into `F.sdpa`, which drops the additive mask on Spyre.
-3. Unpacks with an on-Spyre `index_select` and writes back with `output.copy_` on Spyre. A
-   CPU round-trip remains only for non-stick-aligned head dims (MiniLM `D=32`), which slice
-   `D` back on the host.
+Pooling runs on **one** set of compile shapes, declared as `(prompt_length, batch_size)`
+pairs through `SPYRE_WARMUP_PROMPT_LENS` / `SPYRE_WARMUP_BATCH_SIZES` and zipped pairwise.
+`--max-model-len`, `--max-num-seqs`, `--max-num-batched-tokens` and `compile_sizes` are all
+derived *from* those shapes. Because the runner pads every sequence to `L` and the batch to
+`B` **before the model runs**, the body sees exactly `B × L` token rows, so attention's grid
+is a reshape rather than a gather:
+
+1. `PoolingSpyreScheduler` (`v1/core/scheduler.py`) admits only batches a declared shape
+   covers, holding the rest back. That is what removes the runtime fallback:
+   `pick_encoder_shape` cannot miss, so nothing compiles mid-request.
+2. The runner's `_preprocess` override rewrites `input_ids` / `positions` into the dense
+   `B × L` layout (`expand_packed_to_encoder_bucket`). `query_start_loc` and `seq_lens`
+   deliberately keep the **real ragged** lengths — attention needs them for its key-pad
+   mask, and pooling reads nothing else off them.
+3. Attention reshapes `[B*L, H, D]` → `[B, H, L, Dp]` and calls
+   `F.scaled_dot_product_attention` **with an additive `[B, 1, 1, L]` key-pad mask**, which
+   compiled Spyre SDPA honours (pinned by `tests/attention/test_masked_sdpa_spyre.py`). The
+   transposes must materialize: a non-zero storage offset reads as offset 0
+   (torch-spyre#3770), the same reason `multimodal/utils.py::padded_sdpa` forces
+   `contiguous`. Head dim `D` is padded to the `ENCODER_SEQ_ALIGNMENT = 64` stick only when
+   not already aligned — a host `F.pad` round-trip for MiniLM's `head_size=32`, a no-op for
+   `D=64`. `L` needs no padding: declared prompt lengths are validated as multiples of 64.
+   The mask uses `finfo.min / 2` and gives batch-pad sequences one attendable key, because
+   a fully masked query row NaNs inside SDPA's online softmax.
+4. Before pooling, `_unpad_encoder_hidden` gathers the real rows to the front of the grid
+   with a single `index_select`, so the pooling cursor's `cumsum` addressing is correct and
+   nothing in `v1/pool/` needs to know about the dense layout. The gather keeps its input's
+   row count rather than shrinking to `sum(query_lens)`: an output shape that tracked the
+   real token count adds a `torch.compile` specialization per distinct total, which is a
+   recompile on nearly every step once prompt lengths vary.
+
+Warmup is one dummy run per declared shape, which traces body, attention and pooler
+together — there is no second bucket ladder to walk and no separate pack-graph pass.
+
 
 ## Encoder / embedding models: target state
 
-Everything above describes what is implemented today. The diagram below is a **target
-state** — where the encoder path is heading once the compile-mode work lands, and not a
-description of current behaviour.
+!!! warning "Superseded — diagram not yet regenerated"
 
-The shape of that target: the model body compiled once per token bucket, attention
-shape-managed separately behind the opaque custom-op boundary, and a warmup that walks
-both sets of shape buckets so nothing compiles on the first request.
+    This diagram describes the **two-axis** design that the declared-shape work replaced.
+    Its premise no longer holds: there is one shape set, not two independent ladders, and
+    attention is handed a reshaped tensor rather than gathering rows into a grid — which is
+    exactly the convergence the caption lists as future work. `encoder-ideal-state.d2` and
+    its rendered `.svg` still need updating; `d2` was not available to re-render them here,
+    so the stale figure is left in place rather than half-edited. See
+    [Encoder-only attention](#encoder-only-attention) above for the implemented design.
 
 <figure markdown="span">
-  ![Encoder target state](encoder-ideal-state.svg){: style="width: 140%; max-width: 1400px; margin-left: -20%" }
+  ![Encoder target state (superseded)](encoder-ideal-state.svg){: style="width: 140%; max-width: 1400px; margin-left: -20%" }
   <figcaption>
-    Target architecture for encoder / embedding models under
-    <code>STOCK_TORCH_COMPILE</code>. Two shape axes are bucketed independently: the
-    token count <code>T</code> for the model body, and <code>(S, L)</code> for
-    attention's dense grid — they are decoupled because attention builds its grid by
-    gathering rows rather than by being handed a reshaped tensor. The foot of the
-    diagram contrasts today's dense-grid strategy with the planned flash-style variant,
-    which would collapse the second axis and converge on the upstream design.
+    <strong>Superseded.</strong> The earlier target architecture, in which two shape axes
+    were bucketed independently: the token count <code>T</code> for the model body and
+    <code>(S, L)</code> for attention's dense grid, decoupled because attention built its
+    grid by gathering rows. Both axes are now one declared
+    <code>(prompt_length, batch_size)</code> set, and <code>S × L == T</code> by
+    construction.
   </figcaption>
 </figure>
 
