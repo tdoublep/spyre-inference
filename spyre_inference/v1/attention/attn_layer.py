@@ -23,7 +23,7 @@ cannot be captured with ``fullgraph=True``.
 import types
 import weakref
 from collections.abc import Iterable
-from typing import cast
+from typing import Any, cast
 
 import torch
 from vllm.logger import init_logger
@@ -143,6 +143,85 @@ def _spyre_attention_forward(
     if buffers is not None:
         output.copy_(out_buf[:rows])
     return output.view(-1, hidden_size)
+
+
+class EncoderStepMetadata:
+    """This step's encoder attention metadata, shared by every encoder layer.
+
+    Deliberately *not* reached via ``layer_name``. vLLM's ``get_attention_context``
+    resolves metadata with ``attn_metadata_raw[layer_name]``, and per-block compile
+    shares one code object across all blocks, so reading that string inside the traced
+    region makes Dynamo specialize the block graph per layer -- one recompile each. An
+    encoder-only model has a single attention group, so every layer wants the same
+    object anyway.
+    """
+
+    def __init__(self) -> None:
+        self.metadata: Any = None
+
+    def publish(self, metadata: Any) -> None:
+        self.metadata = metadata
+
+
+_encoder_step = EncoderStepMetadata()
+
+
+def encoder_step_metadata() -> EncoderStepMetadata:
+    return _encoder_step
+
+
+def _spyre_encoder_attention_forward(
+    self: Attention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output_shape: torch.Size | None = None,
+    output_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Call the encoder impl directly, so the block graph can absorb attention.
+
+    No ``layer_name``, no custom op, no forward-context lookup: the impl is pure tensor
+    ops once the runner has pinned the grid, so everything here traces.
+    """
+    if output_dtype is None:
+        output_dtype = query.dtype
+    if output_shape is None:
+        output_shape = torch.Size((query.shape[0], self.num_heads * self.head_size_v))
+    output = torch.empty(output_shape, dtype=output_dtype, device=query.device)
+    hidden_size = output_shape[-1]
+
+    query = query.view(-1, self.num_heads, self.head_size)
+    output = output.view(-1, self.num_heads, self.head_size_v)
+    key = key.view(-1, self.num_kv_heads, self.head_size)
+    value = value.view(-1, self.num_kv_heads, self.head_size_v)
+
+    self.impl.forward(
+        self,  # ty: ignore[invalid-argument-type]
+        query,
+        key,
+        value,
+        None,  # ty: ignore[invalid-argument-type]
+        _encoder_step.metadata,
+        output,
+    )
+    return output.view(-1, hidden_size)
+
+
+def _is_encoder(layer: Attention) -> bool:
+    """Encoder impls drop ``do_kv_cache_update``, so having no cache to scatter marks them."""
+    return not hasattr(layer.impl, "do_kv_cache_update")
+
+
+def install_encoder(layers: Iterable[Attention]) -> EncoderStepMetadata:
+    """Bind the direct-call encoder forward; returns the shared per-step holder."""
+    encoder = [layer for layer in layers if _is_encoder(layer)]
+    for layer in encoder:
+        layer.forward = types.MethodType(  # ty: ignore[invalid-assignment]
+            _spyre_encoder_attention_forward, layer
+        )
+    if encoder:
+        logger.info("Tracing encoder attention inside the outer graph for %d layers.", len(encoder))
+    return _encoder_step
 
 
 def _can_split(layer: Attention) -> bool:

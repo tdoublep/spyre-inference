@@ -200,7 +200,7 @@ def _call_kernel(label: str, fn, *args):
     a single-tenant serving process; if it ever stops holding, the cost is a spurious
     warning, not a wrong result.
     """
-    if not _warmup_complete:
+    if not _warmup_complete or torch.compiler.is_compiling():
         return fn(*args)
     before = counters["stats"]["unique_graphs"]
     result = fn(*args)
@@ -392,9 +392,11 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
         self._zero_tiles: dict[int, torch.Tensor] = {}
 
         static_ctx = vllm_config.compilation_config.static_forward_context
-        self._slot_mapping = attn_layer.install(
-            static_ctx[name] for name in layer_names if name in static_ctx
-        )
+        own_layers = [static_ctx[name] for name in layer_names if name in static_ctx]
+        self._slot_mapping = attn_layer.install(own_layers)
+        # Encoder layers take the other branch: their impl traces, so it is called
+        # directly and the block graph absorbs it.
+        self._encoder_step = attn_layer.install_encoder(own_layers)
 
         # record_graphs() enumerates this same instance, so the buckets warmup
         # compiles are exactly the ones build() can round onto.

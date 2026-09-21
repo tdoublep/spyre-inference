@@ -105,7 +105,7 @@ def _compile_if_spyre(kernel: _CompiledFn, device_type: str) -> _CompiledFn:
     Not gated on ``enforce_eager``: SDPA has no eager Spyre kernel, so the device path
     must be compiled even in an otherwise-eager run.
     """
-    if device_type != "spyre":
+    if device_type != "spyre" or torch.compiler.is_compiling():
         return kernel
     compiled = _compiled_kernels.get(kernel)
     if compiled is None:
@@ -184,33 +184,36 @@ def _encoder_attn_kernel_out(
     return out
 
 
-def _ensure_encoder_grid(
-    attn_metadata: SpyreAttentionMetadata,
-    *,
-    padded_tokens: int,
-    query: torch.Tensor,
-    target_device: torch.device,
-    shapes: list[tuple[int, int]],
-) -> None:
-    """Resolve ``(B, L)`` and build the key-pad mask once per step."""
-    if attn_metadata.encoder_pack_batch is not None:
-        return
+def build_encoder_grid(
+    num_seqs: int,
+    query_start_loc: torch.Tensor,
+    dtype: torch.dtype,
+    device: torch.device,
+    shapes: list[tuple[int, int]] | None = None,
+    padded_tokens: int | None = None,
+) -> tuple[int, int, torch.Tensor]:
+    """``(B, L, key_pad_mask)`` for one step, built on the host.
 
-    num_seqs = attn_metadata.num_seqs
+    Called from the runner so that by the time a layer runs, ``forward`` is pure
+    tensor ops and can be traced into the enclosing block graph.
+    """
+    if shapes is None:
+        shapes = encoder_warmup_shapes()
     # ``query_start_loc``, not ``seq_lens``: this is bidirectional self-attention so
     # query length *is* kv length, and upstream's ``_dummy_run`` leaves ``seq_lens``
     # carrying the whole padded token count rather than the per-sequence length.
-    qsl = attn_metadata.query_start_loc.cpu()
+    qsl = query_start_loc.cpu()
     kv_lens = torch.diff(qsl).tolist()[:num_seqs]
     max_len = max(kv_lens, default=0)
 
-    # Pin the grid to the shape the runner padded to: its product is the row count we
-    # were handed. Re-deriving it from metadata alone lets the two disagree.
-    pair = pick_encoder_shape(
-        num_seqs,
-        max_len,
-        [(length, batch) for length, batch in shapes if length * batch == padded_tokens],
+    # Pin the grid to the shape the runner padded to: its product is the row count
+    # attention is handed. Re-deriving it freely lets the two disagree.
+    candidates = (
+        shapes
+        if padded_tokens is None
+        else [(length, batch) for length, batch in shapes if length * batch == padded_tokens]
     )
+    pair = pick_encoder_shape(num_seqs, max_len, candidates)
     if pair is None:
         raise ValueError(
             f"No declared encoder shape covers {num_seqs} sequences of up to "
@@ -223,12 +226,34 @@ def _ensure_encoder_grid(
     # Batch-pad sequences get one attendable key rather than none: an all-masked
     # query row NaNs inside SDPA's online softmax. Their output is never read.
     padded_kv_lens = kv_lens + [1] * (batch - num_seqs)
-    key_pad = build_key_pad_mask(batch, aligned_len, padded_kv_lens, dtype=query.dtype)
-    if target_device.type == "spyre":
-        key_pad = convert(key_pad, target_device)
+    key_pad = build_key_pad_mask(batch, aligned_len, padded_kv_lens, dtype=dtype)
+    if device.type == "spyre":
+        key_pad = convert(key_pad, device)
     else:
-        key_pad = key_pad.to(target_device)
+        key_pad = key_pad.to(device)
+    return batch, aligned_len, key_pad
 
+
+def _ensure_encoder_grid(
+    attn_metadata: SpyreAttentionMetadata,
+    *,
+    padded_tokens: int,
+    query: torch.Tensor,
+    target_device: torch.device,
+    shapes: list[tuple[int, int]],
+) -> None:
+    """Resolve ``(B, L)`` and the key-pad mask, unless the runner already did."""
+    if attn_metadata.encoder_pack_batch is not None:
+        return
+
+    batch, aligned_len, key_pad = build_encoder_grid(
+        attn_metadata.num_seqs,
+        attn_metadata.query_start_loc,
+        query.dtype,
+        target_device,
+        shapes=shapes,
+        padded_tokens=padded_tokens,
+    )
     attn_metadata.encoder_pack_batch = batch
     attn_metadata.encoder_pack_len = aligned_len
     attn_metadata.encoder_key_pad_mask = key_pad

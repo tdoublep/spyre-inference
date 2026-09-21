@@ -87,11 +87,13 @@ from spyre_inference.multimodal import apply_multimodal_patches
 from spyre_inference.v1.attention import attn_layer
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionImpl,
+    SpyreAttentionMetadata,
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     allocate_staging_buffers,
     mark_warmup_complete,
 )
+from spyre_inference.v1.attention.backends.spyre_encoder_attn import build_encoder_grid
 from spyre_inference.v1.pool import (
     configure_pooling_for_spyre,
     copy_pooler_output_to_cpu,
@@ -1115,6 +1117,42 @@ class TorchSpyreModelRunner(GPUModelRunner):
             convert(pos, positions.device),
             *rest,
         )
+
+    def _build_attention_metadata(self, *args, **kwargs):
+        """Pin the encoder grid here, so attention's ``forward`` is pure tensor ops.
+
+        This is the only place that knows both the padded row count and
+        ``_spyre_device``: the metadata builder's ``device`` is CPU by design.
+        """
+        out = super()._build_attention_metadata(*args, **kwargs)
+        if self.model_config.runner_type != "pooling":
+            return out
+
+        per_layer = out[0] if isinstance(out, tuple) else out
+        grid = self._encoder_grid
+        padded_tokens = grid[1] * grid[0] if grid is not None else None
+        seen: set[int] = set()
+        for md in per_layer.values() if isinstance(per_layer, dict) else []:
+            if not isinstance(md, SpyreAttentionMetadata) or id(md) in seen:
+                continue
+            seen.add(id(md))
+            if md.encoder_pack_batch is not None:
+                continue
+            batch, aligned_len, key_pad = build_encoder_grid(
+                md.num_seqs,
+                md.query_start_loc,
+                self._model_dtype(),
+                self._spyre_device,
+                padded_tokens=padded_tokens,
+            )
+            md.encoder_pack_batch = batch
+            md.encoder_pack_len = aligned_len
+            md.encoder_key_pad_mask = key_pad
+            # Publish to the holder rather than letting the layer look itself up by
+            # name: vLLM's get_attention_context does attn_metadata[layer_name], and
+            # that string makes Dynamo specialize the shared block graph per layer.
+            attn_layer.encoder_step_metadata().publish(md)
+        return out
 
     def _encoder_pad_token_id(self) -> int:
         """Pad id for dense filler tokens; their outputs are masked and dropped."""
