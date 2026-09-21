@@ -114,38 +114,74 @@ def _compile_if_spyre(kernel: _CompiledFn, device_type: str) -> _CompiledFn:
     return compiled
 
 
-def _sdpa_kernel(
+def _encoder_attn_kernel(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     mask: torch.Tensor,
     scale: float,
+    batch: int,
+    aligned_len: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size_padded: int,
+    enable_gqa: bool,
 ) -> torch.Tensor:
-    """``[B, H, L, Dp]`` bidirectional attention with an additive key-pad mask."""
-    return F.scaled_dot_product_attention(query, key, value, attn_mask=mask, scale=scale)
+    """Grid, attend and un-grid in one graph: ``[B*L, H, Dp]`` → ``[B*L, H, Dp]``.
 
+    The reshapes stay inside the graph so the layout change is the matmul's problem
+    rather than five standalone d2d copies; these kernels are dispatch-bound, so the
+    launch count is what matters. Needs torch-spyre#4685 to accept the transposed
+    operands without a materialising ``contiguous()``.
 
-def _sdpa_kernel_gqa(
-    query: torch.Tensor,
-    key: torch.Tensor,
-    value: torch.Tensor,
-    mask: torch.Tensor,
-    scale: float,
-) -> torch.Tensor:
-    return F.scaled_dot_product_attention(
-        query, key, value, attn_mask=mask, scale=scale, enable_gqa=True
-    )
-
-
-def _to_grid(flat: torch.Tensor, batch: int, aligned_len: int, head_size_padded: int):
-    """``[B*L, H, D]`` → ``[B, H, L, Dp]``.
-
-    The transpose must materialise: a non-zero storage offset reads as offset 0 on Spyre
-    (torch-spyre#3770).
+    ``enable_gqa`` lets SDPA broadcast the KV heads itself, keeping operands 4-D: the
+    rank-5 tensor an explicit expand would build is rejected by
+    ``insert_restickify_padding``.
     """
-    flat = _pad_head_dim_to_stick(flat, head_size_padded)
-    num_heads = flat.shape[1]
-    return flat.view(batch, aligned_len, num_heads, head_size_padded).transpose(1, 2).contiguous()
+    q = query.view(batch, aligned_len, num_heads, head_size_padded).transpose(1, 2)
+    k = key.view(batch, aligned_len, num_kv_heads, head_size_padded).transpose(1, 2)
+    v = value.view(batch, aligned_len, num_kv_heads, head_size_padded).transpose(1, 2)
+    attn = F.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, scale=scale, is_causal=False, enable_gqa=enable_gqa
+    )
+    return attn.transpose(1, 2).reshape(batch * aligned_len, num_heads, head_size_padded)
+
+
+def _encoder_attn_kernel_out(
+    out: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    mask: torch.Tensor,
+    scale: float,
+    batch: int,
+    aligned_len: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_size_padded: int,
+    enable_gqa: bool,
+) -> torch.Tensor:
+    """As above, writing the layer's output buffer inside the same graph.
+
+    Only valid when ``head_size`` is already a stick, so no prefix crop stands between
+    the kernel and ``out``.
+    """
+    out.copy_(
+        _encoder_attn_kernel(
+            query,
+            key,
+            value,
+            mask,
+            scale,
+            batch,
+            aligned_len,
+            num_heads,
+            num_kv_heads,
+            head_size_padded,
+            enable_gqa,
+        )
+    )
+    return out
 
 
 def _ensure_encoder_grid(
@@ -283,22 +319,39 @@ class SpyreEncoderAttentionImpl(AttentionImpl):
             key = convert(key, target_device.type)
             value = convert(value, target_device.type)
 
-        q = _to_grid(query, batch, aligned_len, head_size_padded)
-        k = _to_grid(key, batch, aligned_len, head_size_padded)
-        v = _to_grid(value, batch, aligned_len, head_size_padded)
+        # Head-dim padding stays outside the graph: MiniLM's D=32 F.pad needs a host
+        # round trip, and it is a no-op whenever head_size is already a stick.
+        q = _pad_head_dim_to_stick(query, head_size_padded)
+        k = _pad_head_dim_to_stick(key, head_size_padded)
+        v = _pad_head_dim_to_stick(value, head_size_padded)
 
-        kernel = _compile_if_spyre(
-            _sdpa_kernel_gqa if num_kv_heads != num_heads else _sdpa_kernel,
-            q.device.type,
+        args = (
+            key_pad_mask,
+            self.scale,
+            batch,
+            aligned_len,
+            num_heads,
+            num_kv_heads,
+            head_size_padded,
+            num_kv_heads != num_heads,
         )
-        attn_out = _call_kernel("encoder SDPA", kernel, q, k, v, key_pad_mask, self.scale)
+
+        # Stick-aligned heads need no prefix crop, so the output write joins the
+        # attention graph instead of costing its own dispatch.
+        if head_size == head_size_padded and output.dtype == query.dtype:
+            kernel = _compile_if_spyre(_encoder_attn_kernel_out, q.device.type)
+            _call_kernel("encoder attention", kernel, output, q, k, v, *args)
+            return output
+
+        kernel = _compile_if_spyre(_encoder_attn_kernel, q.device.type)
+        attn_out = _call_kernel("encoder attention", kernel, q, k, v, *args)
 
         # Offset-0 prefix crop, so torch-spyre#3770 cannot bite.
         if attn_out.shape[-1] != head_size:
             if attn_out.device.type == "spyre":
                 attn_out = convert(attn_out, "cpu")
             attn_out = attn_out[..., :head_size]
-        result = attn_out.transpose(1, 2).reshape(padded_tokens, num_heads, head_size)
+        result = attn_out.reshape(padded_tokens, num_heads, head_size)
 
         if result.dtype != output.dtype:
             result = convert(result, dtype=output.dtype)
