@@ -24,7 +24,6 @@ reshape, one SDPA call and a reshape back.
 from __future__ import annotations
 
 from collections.abc import Callable
-from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -39,6 +38,7 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyrePagedKVCache,
     _call_kernel,
 )
+from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_warmup_shapes,
     pick_encoder_shape,
@@ -109,8 +109,9 @@ def _compile_if_spyre(kernel: _CompiledFn, device_type: str) -> _CompiledFn:
         return kernel
     compiled = _compiled_kernels.get(kernel)
     if compiled is None:
-        compiled = cast(_CompiledFn, torch.compile(kernel, dynamic=False))
+        compiled = torch.compile(kernel, dynamic=False)
         _compiled_kernels[kernel] = compiled
+        compile_guard.watch(kernel, f"encoder attention kernel {kernel.__name__}")
     return compiled
 
 
