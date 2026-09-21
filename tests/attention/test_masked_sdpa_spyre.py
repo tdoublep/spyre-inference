@@ -48,13 +48,21 @@ def _isolate_dynamo():
     Every case compiles the same ``_sdpa`` code object at a different shape, and
     with ``dynamic=False`` the second entry trips "Guard failed on the same frame
     it was created". Production never sees this: each shape is warmed once.
+
+    The default device is cleared too. ``set_default_device`` pushes a
+    torch-function mode, so a sibling test file that leaves one behind makes a
+    guard created under one mode stack fail its check under another
+    (``___check_torch_function_mode_stack``). Normalising here keeps this file
+    order-independent.
     """
+    torch.set_default_device(None)
     torch._dynamo.reset()
     original = torch._dynamo.config.accumulated_recompile_limit
     torch._dynamo.config.accumulated_recompile_limit = 1024
     yield
     torch._dynamo.config.accumulated_recompile_limit = original
     torch._dynamo.reset()
+    torch.set_default_device(None)
 
 
 def _sdpa(q, k, v, mask, scale):

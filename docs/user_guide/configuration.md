@@ -59,31 +59,52 @@ no shape reaches the lm_head uncompiled. Pad rows are dropped before sampling.
 ## Encoder / pooling compile buckets
 
 Spyre compile is on by default (`STOCK_TORCH_COMPILE`, `dynamic=False`). Pass
-`--enforce-eager` to disable it. Body and attention are bucketed independently:
+`--enforce-eager` to disable it.
 
-- **Body** (Linear / LN): pad the packed token count to the next 1D
-  `compile_sizes` bucket `T` (same dispatch as the decoder).
-- **Attention** (SDPA): gather into a dense `(B, L)` grid. This is the Spyre
-  workaround until flash-style attention lands; the body is not rewritten to
-  `T = B × L`.
-
-`compile_sizes` for pooling is the body `T` buckets (`64, 128, …` up to the
-token cap). Attention `L` comes from `--max-model-len` (`64, 128, …`).
-Attention `B` is powers of two up to `--max-num-seqs` (same as decoder).
-
-A 3-seq × 30-token request with `--max-num-seqs 4` pads the body to `T=128`
-and attention to `(B=4, L=64)`. Masks and pooling still use the real lengths.
-
-Compiled pooling warmup dummies 1D body sizes, then each attention `(B, L)`
-at full size. Eager pooling uses one short dummy, then runtime still
-1D-pads the body.
-
-Example:
+Pooling has **one** set of compile shapes, declared as `(prompt_length, batch_size)`
+pairs. Every sequence is padded to `L` and the batch to `B` before the model runs, so
+the body sees exactly `B × L` token rows and attention is a reshape plus one SDPA call.
 
 ```bash
-vllm serve ibm-granite/granite-embedding-125m-english \
-  --runner pooling --max-num-seqs 4 --max-model-len 512
+SPYRE_WARMUP_PROMPT_LENS=64,256,512 \
+SPYRE_WARMUP_BATCH_SIZES=32,8,2 \
+vllm serve ibm-granite/granite-embedding-125m-english --runner pooling
 ```
+
+The two lists are **zipped pairwise, not crossed**: that example declares three graphs —
+`(64, 32)`, `(256, 8)` and `(512, 2)` — not nine. Each prompt length must be a multiple
+of 64 (the Spyre stick). Defaults are `512` and `8`, i.e. a single `(512, 8)` shape.
+
+The shapes are the source of truth, so the engine config is derived *from* them:
+
+| setting | value |
+| --- | --- |
+| `--max-model-len` | largest declared `L` |
+| `--max-num-seqs` | largest declared `B` |
+| `--max-num-batched-tokens` | largest `B × L`, so the token budget never binds |
+| `compile_sizes` | the distinct `B × L` products (equal-area shapes share a body graph) |
+
+Passing `--max-model-len` or `--max-num-seqs` has no effect on a pooling run; change the
+shapes instead. A prompt longer than every declared `L` is rejected by vLLM's own length
+check. `PoolingSpyreScheduler` admits only batches a declared shape covers, so no request
+ever compiles a new shape mid-serve, and warmup runs one dummy per declared shape.
+
+### Choosing shapes
+
+A batch is padded up to its shape's width, so the shape list is the main throughput and
+latency control:
+
+- A batch of 3 requests of 30 tokens against `(512, 8)` still computes `8 × 512 = 4096`
+  rows. Declare a short shape (`64`) to avoid paying for 512 columns.
+- A single request against `(512, 8)` computes 8 rows' worth. Declare a `batch_size=1`
+  shape as well if single-request latency matters — the narrowest covering shape wins, so
+  `SPYRE_WARMUP_PROMPT_LENS=512,512` with `SPYRE_WARMUP_BATCH_SIZES=1,8` lets a lone
+  request land on `(512, 1)`.
+- Because the lists zip, a length only offers the width paired with it: with
+  `(512, 2)` declared, 300-token requests batch at most 2 at a time however many are
+  queued.
+
+Masks and pooling always use the real, unpadded lengths.
 
 ## Tuning buckets for padding
 
