@@ -262,27 +262,19 @@ def test_spyre_all_pool_rounds_onto_the_length_ladder():
     assert [c.shape[0] for c in without] == [320]
 
 
-def test_configure_pooling_threads_declared_lengths_into_the_ladder(monkeypatch):
+def test_configure_pooling_threads_declared_lengths_into_the_ladder():
     """The ladder reaches SpyreAllPool from configure, not from a contextvar.
 
-    It is the *declared* prompt lengths now, not a derived power-of-two ladder:
-    those are the only widths a request can be padded to.
+    It is the *declared* prompt lengths, not a derived power-of-two ladder: those are
+    the only widths a request can be padded to. Deduplicated and sorted, because the
+    shapes cross the length ladder with every batch width.
     """
-    from spyre_inference import envs
-
-    monkeypatch.setenv("SPYRE_WARMUP_PROMPT_LENS", "64,256,512")
-    monkeypatch.setenv("SPYRE_WARMUP_BATCH_SIZES", "32,8,2")
-    envs.clear_env_cache()
-    try:
-        model = _model_with_pooler(_token_pooler(AllPool))
-        assert configure_pooling_for_spyre(model, _SPYRE, 512) is True
-        assert model.pooler.pooling.len_ladder == [64, 256, 512]
-    finally:
-        # Memoized values would leak the patched env into later tests.
-        envs.clear_env_cache()
+    model = _model_with_pooler(_token_pooler(AllPool))
+    assert configure_pooling_for_spyre(model, _SPYRE, [512, 64, 256, 64]) is True
+    assert model.pooler.pooling.len_ladder == [64, 256, 512]
 
 
-def test_configure_pooling_without_max_model_len_leaves_the_ladder_empty():
+def test_configure_pooling_without_a_ladder_leaves_it_empty():
     """Degrades to stick alignment rather than raising; configure warns."""
     model = _model_with_pooler(_token_pooler(AllPool))
     assert configure_pooling_for_spyre(model, _SPYRE) is True
@@ -376,7 +368,7 @@ def _dispatch_metadata(counts: list[int], tasks: list[str]):
 def test_configure_pooling_installs_spyre_dispatch_pooler():
     pooler = DispatchPooler({"embed": _embed_pooler(MeanPool())})
     model = _model_with_pooler(pooler)
-    assert configure_pooling_for_spyre(model, _SPYRE, 512) is True
+    assert configure_pooling_for_spyre(model, _SPYRE, [512]) is True
     assert type(model.pooler) is SpyreDispatchPooler
 
 
@@ -446,5 +438,5 @@ def test_mixed_dispatch_pooler_is_not_swapped():
     pooler = DispatchPooler({"embed": _embed_pooler(MeanPool()), "encode": _UnrecognisedPooler()})
     model = _model_with_pooler(pooler)
 
-    assert configure_pooling_for_spyre(model, _SPYRE, 512) is False
+    assert configure_pooling_for_spyre(model, _SPYRE, [512]) is False
     assert type(model.pooler) is DispatchPooler

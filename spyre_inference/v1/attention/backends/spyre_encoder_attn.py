@@ -217,7 +217,7 @@ def _ensure_encoder_grid(
             f"No declared encoder shape covers {num_seqs} sequences of up to "
             f"{max_len} tokens in {padded_tokens} rows (shapes={shapes}). "
             "PoolingSpyreScheduler should have prevented this batch; see "
-            "SPYRE_WARMUP_PROMPT_LENS / SPYRE_WARMUP_BATCH_SIZES."
+            "SPYRE_ATTN_QUERY_BUCKETS / SPYRE_ATTN_NUM_SEQS_BUCKETS."
         )
     aligned_len, batch = pair
 
@@ -274,7 +274,7 @@ class SpyreEncoderAttentionImpl(AttentionImpl):
             )
         # `== STOCK`, not `!= NONE`: a bare CompilationConfig leaves mode unset.
         self._compile_attn = cfg.compilation_config.mode == CompilationMode.STOCK_TORCH_COMPILE
-        self._shapes = encoder_warmup_shapes()
+        self._shapes = encoder_warmup_shapes(cfg)
 
     def record_graphs(self, *args, **kwargs) -> int:
         """Nothing to page; warmup traces ``forward`` once per declared shape."""

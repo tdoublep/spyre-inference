@@ -295,12 +295,14 @@ attention is bidirectional over the full sequence — and inheriting the decoder
 `do_kv_cache_update` and staging buffers only created machinery that had to be guarded
 off again.
 
-Pooling runs on **one** set of compile shapes, declared as `(prompt_length, batch_size)`
-pairs through `SPYRE_WARMUP_PROMPT_LENS` / `SPYRE_WARMUP_BATCH_SIZES` and zipped pairwise.
-`--max-model-len`, `--max-num-seqs`, `--max-num-batched-tokens` and `compile_sizes` are all
-derived *from* those shapes. Because the runner pads every sequence to `L` and the batch to
-`B` **before the model runs**, the body sees exactly `B × L` token rows, so attention's grid
-is a reshape rather than a gather:
+Pooling runs on **one** set of compile shapes: `(prompt_length, batch_size)` pairs, the
+cross product of `SPYRE_ATTN_QUERY_BUCKETS` and `SPYRE_ATTN_NUM_SEQS_BUCKETS` — the same
+two ladders the decoder attention bucketer uses. Both default to a single entry, so an
+unconfigured run compiles one `max_num_seqs × max_model_len` graph. `--max-num-batched-tokens`
+caps a shape's width, and `--max-num-seqs` / `compile_sizes` are written back from the
+result. Because the runner pads every sequence to `L` and the batch to `B` **before the
+model runs**, the body sees exactly `B × L` token rows, so attention's grid is a reshape
+rather than a gather:
 
 1. `PoolingSpyreScheduler` (`v1/core/scheduler.py`) admits only batches a declared shape
    covers, holding the rest back. That is what removes the runtime fallback:

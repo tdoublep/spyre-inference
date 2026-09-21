@@ -42,8 +42,6 @@ if TYPE_CHECKING:
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
-    SPYRE_WARMUP_PROMPT_LENS: list[int] = [512]
-    SPYRE_WARMUP_BATCH_SIZES: list[int] = [8]
 
 _cache: dict[str, Any] = {}
 
@@ -81,9 +79,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SPYRE_ATTN_KV_BUCKETS": lambda: os.getenv("SPYRE_ATTN_KV_BUCKETS"),
     # Comma-separated query_len buckets to record, unset uses the default buckets
     # [1] + multiples of min(512, max_num_batched_tokens) up to max_num_batched_tokens.
+    # Pooling reuses this for its declared prompt lengths, where unset means a single
+    # bucket of max_model_len.
     "SPYRE_ATTN_QUERY_BUCKETS": lambda: os.getenv("SPYRE_ATTN_QUERY_BUCKETS"),
     # Comma-separated num_seqs buckets for the batched decode kernel, unset uses the
-    # default buckets of powers of two from 4 up to max_num_seqs.
+    # default buckets of powers of two from 4 up to max_num_seqs. Pooling reuses this for
+    # its declared batch widths, where unset means a single bucket of max_num_seqs.
     "SPYRE_ATTN_NUM_SEQS_BUCKETS": lambda: os.getenv("SPYRE_ATTN_NUM_SEQS_BUCKETS"),
     # Which KV cache layout the decoder attention backend uses, within a page:
     #  - "token_major": [num_blocks, block_size, num_kv_heads, head_size] (default)
@@ -113,19 +114,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # friends) to the detected budget to avoid thread oversubscription in
     # CPU-limited containers. Set to "0" to leave them untouched and only warn.
     "SPYRE_UPDATE_THREAD_CONFIG": lambda: bool(int(os.getenv("SPYRE_UPDATE_THREAD_CONFIG", "1"))),
-    # Pooling/encoder compile shapes, zipped pairwise with SPYRE_WARMUP_BATCH_SIZES:
-    # index i declares one (prompt_length, batch_size) graph. Not a cross product.
-    # Each length must be a multiple of 64 (the Spyre stick). These override
-    # --max-model-len and --max-num-seqs, which are derived from them.
-    "SPYRE_WARMUP_PROMPT_LENS": lambda: [
-        int(p) for p in os.getenv("SPYRE_WARMUP_PROMPT_LENS", "512").split(",") if p.strip()
-    ],
-    # Batch width for each declared prompt length. Same length as the list above.
-    # A batch is padded up to its shape's width, so declare a narrow shape
-    # (batch size 1) as well if single-request latency matters.
-    "SPYRE_WARMUP_BATCH_SIZES": lambda: [
-        int(b) for b in os.getenv("SPYRE_WARMUP_BATCH_SIZES", "8").split(",") if b.strip()
-    ],
 }
 # --8<-- [end:env-vars-definition]
 

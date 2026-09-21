@@ -77,7 +77,7 @@ class PoolingSpyreScheduler(TorchSpyreScheduler):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.spyre_warmup_shapes: list[tuple[int, int]] = encoder_warmup_shapes()
+        self.spyre_warmup_shapes: list[tuple[int, int]] = encoder_warmup_shapes(self.vllm_config)
 
     def _fitting_shapes(
         self,
@@ -138,7 +138,16 @@ class PoolingSpyreScheduler(TorchSpyreScheduler):
                 len(holdback_queue) + len(skip_queue),
             )
 
-        outputs = super().schedule(*args, **kwargs)
+        # Upstream's own waiting loop admits on `max_num_running_reqs`, which comes from
+        # `max_num_seqs` -- the widest declared shape. It can exceed what the gate above
+        # approved for *this* batch, and the extra request reaches the runner with no
+        # shape covering it. Pin the cap to exactly the approved set.
+        max_num_running_reqs = self.max_num_running_reqs
+        self.max_num_running_reqs = min(max_num_running_reqs, len(self.running) + len(self.waiting))
+        try:
+            outputs = super().schedule(*args, **kwargs)
+        finally:
+            self.max_num_running_reqs = max_num_running_reqs
 
         # Skipped first, then never-considered: preserves the original priority.
         while skip_queue:

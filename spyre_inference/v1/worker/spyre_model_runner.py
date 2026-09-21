@@ -544,7 +544,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # step. The grid is written by _spyre_bucket_batch_descriptor and read by
         # _preprocess and _pool, which all run once per step in that order.
         self._encoder_shapes: list[tuple[int, int]] = (
-            encoder_warmup_shapes() if vllm_config.model_config.runner_type == "pooling" else []
+            encoder_warmup_shapes(vllm_config)
+            if vllm_config.model_config.runner_type == "pooling"
+            else []
         )
         self._encoder_grid: tuple[int, int, list[int]] | None = None
 
@@ -640,7 +642,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._pooling_on_spyre = False
         if self.model_config.runner_type == "pooling":
             self._pooling_on_spyre = configure_pooling_for_spyre(
-                self.model, self._spyre_device, self.model_config.max_model_len
+                self.model, self._spyre_device, [length for length, _ in self._encoder_shapes]
             )
 
         logger.info("Spyre-native layer weights moved to %s", self._spyre_device)
@@ -1134,7 +1136,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         ``max_num_seqs`` is pinned to the shape's width so upstream's dummy builds exactly
         ``B`` requests of ``L`` tokens, making the traced graph the serving graph.
         """
-        shapes = encoder_warmup_shapes()
+        shapes = self._encoder_shapes
         saved_max_num_seqs = self.scheduler_config.max_num_seqs
         # Same condition that guards _record_attention_graphs below: only a
         # genuine decoder-type layer has a KV cache here.

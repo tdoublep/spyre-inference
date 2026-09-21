@@ -42,10 +42,15 @@ BLOCK_SIZE = 64
 NUM_BLOCKS = 512
 
 
-def _scheduler(runner_type: str = "generate", max_num_seqs: int = 4) -> TorchSpyreScheduler:
+def _scheduler(
+    runner_type: str = "generate",
+    max_num_seqs: int = 4,
+    max_model_len: int = 2048,
+    max_num_batched_tokens: int = MAX_NUM_BATCHED_TOKENS,
+) -> TorchSpyreScheduler:
     model_config = ModelConfig(
         model="Qwen/Qwen3-0.6B",
-        max_model_len=2048,
+        max_model_len=max_model_len,
         dtype=torch.float16,
         trust_remote_code=True,
     )
@@ -57,8 +62,8 @@ def _scheduler(runner_type: str = "generate", max_num_seqs: int = 4) -> TorchSpy
         cache_config=cache_config,
         scheduler_config=SchedulerConfig(
             max_num_seqs=max_num_seqs,
-            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
-            max_model_len=2048,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=max_model_len,
             enable_chunked_prefill=True,
             is_encoder_decoder=False,
         ),
@@ -126,8 +131,13 @@ def test_higher_cap_admits_more_prefills(monkeypatch):
 
 
 def test_pooling_runner_is_exempt():
-    """Pooling never decodes, so serialising its prefills only gives up batching."""
-    scheduler = _scheduler(runner_type="pooling")
+    """Pooling never decodes, so serialising its prefills only gives up batching.
+
+    The limits are the pooling path's, not the decoder's: a declared shape is ``B * L``
+    dense rows, so the token budget has to hold the whole batch or the platform lowers
+    ``max_num_seqs`` to what fits and nothing batches.
+    """
+    scheduler = _scheduler(runner_type="pooling", max_model_len=256, max_num_batched_tokens=4 * 256)
     assert scheduler.max_num_partial_prefills == 0
     assert max(_prefills_per_step(scheduler)) > 1
 

@@ -206,12 +206,13 @@ def test_num_gpu_blocks_override_skipped_for_pooling():
     assert vllm_config.cache_config.num_gpu_blocks_override is None
 
 
-def test_apply_config_derives_pooling_config_from_declared_shapes(monkeypatch):
-    """The declared ``(L, B)`` shapes are the single source of truth for pooling.
+def test_apply_config_pins_pooling_config_to_the_declared_shapes(monkeypatch):
+    """``max_model_len`` is an input; the width and the budget are written back.
 
-    ``max_model_len`` and ``max_num_seqs`` are *overridden* from them rather than
-    constraining them, and the body's ``compile_sizes`` are the distinct ``B * L``
-    products, because every sequence is padded to ``L`` before the model runs.
+    The ladders cross, so ``SPYRE_ATTN_QUERY_BUCKETS=64`` against ``max_model_len=512``
+    and ``max_num_seqs=32`` gives ``(64, 32)`` and ``(512, 32)``. The body's
+    ``compile_sizes`` are the distinct ``B * L`` products, because every sequence is
+    padded to ``L`` before the model runs.
     """
     from unittest.mock import MagicMock
 
@@ -220,29 +221,56 @@ def test_apply_config_derives_pooling_config_from_declared_shapes(monkeypatch):
     from spyre_inference import envs
     from spyre_inference.platform import TorchSpyrePlatform
 
-    monkeypatch.setenv("SPYRE_WARMUP_PROMPT_LENS", "64,512")
-    monkeypatch.setenv("SPYRE_WARMUP_BATCH_SIZES", "32,2")
+    monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "64")
     envs.clear_env_cache()
     try:
         vllm_config = MagicMock()
         vllm_config.model_config.enforce_eager = False
         vllm_config.model_config.runner_type = "pooling"
+        vllm_config.model_config.max_model_len = 512
+        vllm_config.scheduler_config.max_num_seqs = 32
+        vllm_config.scheduler_config.max_num_batched_tokens = 16384
         vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
         vllm_config.compilation_config.custom_ops = ["all"]
         vllm_config.compilation_config.compile_sizes = []
         TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
-        # (64, 32) = 2048 and (512, 2) = 1024 -- equal-area shapes would share one.
-        assert vllm_config.compilation_config.compile_sizes == [1024, 2048]
+        # (64, 32) = 2048 and (512, 32) = 16384.
+        assert vllm_config.compilation_config.compile_sizes == [2048, 16384]
+        # Never overridden: the shapes are derived from it, not the other way round.
         assert vllm_config.model_config.max_model_len == 512
         assert vllm_config.scheduler_config.max_num_seqs == 32
-        # The widest product, so the token budget never binds.
-        assert vllm_config.scheduler_config.max_num_batched_tokens == 2048
+        assert vllm_config.scheduler_config.max_num_batched_tokens == 16384
         assert vllm_config.scheduler_config.scheduler_cls == (
             "spyre_inference.v1.core.scheduler.PoolingSpyreScheduler"
         )
     finally:
         envs.clear_env_cache()
+
+
+def test_apply_config_lowers_pooling_max_num_seqs_to_the_token_budget():
+    """The budget is what bounds a shape's width, so ``max_num_seqs`` follows it down."""
+    from unittest.mock import MagicMock
+
+    from vllm.config import CompilationMode
+
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = MagicMock()
+    vllm_config.model_config.enforce_eager = False
+    vllm_config.model_config.runner_type = "pooling"
+    vllm_config.model_config.max_model_len = 512
+    vllm_config.scheduler_config.max_num_seqs = 256
+    vllm_config.scheduler_config.max_num_batched_tokens = 2048
+    vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
+    vllm_config.compilation_config.custom_ops = ["all"]
+    vllm_config.compilation_config.compile_sizes = []
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    # 2048 tokens hold four 512-token sequences, so one (512, 4) graph.
+    assert vllm_config.compilation_config.compile_sizes == [2048]
+    assert vllm_config.scheduler_config.max_num_seqs == 4
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 2048
 
 
 def _fake_pad_config(head_dim=64, num_heads=8, *, transformers_backend=False, **rope_attrs):

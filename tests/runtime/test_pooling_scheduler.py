@@ -19,7 +19,6 @@ That guarantee is what lets the attention impl drop its runtime fallback. The ba
 """
 
 from types import SimpleNamespace
-from typing import cast
 
 import pytest
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue
@@ -34,24 +33,34 @@ def _req(num_prompt_tokens: int, name: str = ""):
     return SimpleNamespace(num_prompt_tokens=num_prompt_tokens, name=name)
 
 
-def _run(shapes, waiting, running=(), monkeypatch=None):
-    """Return (admitted, left_waiting) for one ``schedule()`` call."""
+def _run(shapes, waiting, running=(), monkeypatch=None, max_num_running_reqs=None):
+    """Return (admitted, left_waiting) for one ``schedule()`` call.
+
+    The stub base admits up to ``max_num_running_reqs``, as upstream's waiting loop does,
+    so the clamp ``PoolingSpyreScheduler`` puts around it is actually exercised.
+    """
     sched = PoolingSpyreScheduler.__new__(PoolingSpyreScheduler)
     sched.spyre_warmup_shapes = list(shapes)
     # The real queue type, so the RequestQueue API is exercised rather than deque ops.
     sched.waiting = FCFSRequestQueue(waiting)
     sched.running = list(running)
+    sched.max_num_running_reqs = (
+        max(batch for _, batch in shapes) if max_num_running_reqs is None else max_num_running_reqs
+    )
 
     admitted: list = []
 
     def _record(self, *args, **kwargs):
-        while self.waiting:
+        while self.waiting and len(self.running) + len(admitted) < self.max_num_running_reqs:
             admitted.append(self.waiting.pop_request())
         return "scheduler-output"
 
     monkeypatch.setattr(TorchSpyreScheduler, "schedule", _record)
-    out = PoolingSpyreScheduler.schedule(cast(PoolingSpyreScheduler, sched))
+    out = PoolingSpyreScheduler.schedule(sched)
     assert out == "scheduler-output"
+    assert sched.max_num_running_reqs == (
+        max(batch for _, batch in shapes) if max_num_running_reqs is None else max_num_running_reqs
+    ), "the clamp must be restored"
     return admitted, list(sched.waiting)
 
 
@@ -139,3 +148,67 @@ def test_pooling_scheduler_keeps_the_partial_prefill_base(monkeypatch):
 def test_admitted_count_never_exceeds_the_widest_declared_batch(num_reqs, monkeypatch):
     admitted, _left = _run(SHAPES, [_req(10) for _ in range(num_reqs)], monkeypatch=monkeypatch)
     assert len(admitted) <= max(batch for _, batch in SHAPES)
+
+
+class TestUpstreamAdmissionIsClampedToTheGate:
+    """The gate's approved set is pinned into ``max_num_running_reqs`` for the base call.
+
+    Upstream's waiting loop admits on ``max_num_running_reqs``, which comes from
+    ``max_num_seqs`` -- the widest declared shape, not the widest one covering *this*
+    batch's length. Anything it admits past the gate reaches the runner with no shape
+    covering it, so the cap is lowered for the duration of the base call and restored
+    after. Same pattern as ``TorchSpyreScheduler``'s partial-prefill cap.
+    """
+
+    SHAPES = [(512, 2), (256, 8), (64, 32)]
+
+    def _observed_cap(self, waiting, running, monkeypatch, max_num_running_reqs=32):
+        sched = PoolingSpyreScheduler.__new__(PoolingSpyreScheduler)
+        sched.spyre_warmup_shapes = list(self.SHAPES)
+        sched.waiting = FCFSRequestQueue(waiting)
+        sched.running = list(running)
+        sched.max_num_running_reqs = max_num_running_reqs
+        seen: list[int] = []
+
+        def _peek(self, *args, **kwargs):
+            seen.append(self.max_num_running_reqs)
+            return "scheduler-output"
+
+        monkeypatch.setattr(TorchSpyreScheduler, "schedule", _peek)
+        PoolingSpyreScheduler.schedule(sched)
+        assert sched.max_num_running_reqs == max_num_running_reqs, "cap not restored"
+        return seen[0]
+
+    def test_the_cap_matches_the_approved_batch_not_max_num_seqs(self, monkeypatch):
+        # Five 512-token requests: only (512, 2) fits, so the gate approves 2. Left at
+        # 32, upstream would admit five and the runner would have no shape for them.
+        assert self._observed_cap([_req(512) for _ in range(5)], [], monkeypatch) == 2
+
+    def test_a_wide_short_batch_keeps_its_full_width(self, monkeypatch):
+        assert self._observed_cap([_req(10) for _ in range(10)], [], monkeypatch) == 10
+
+    def test_nothing_is_admitted_while_a_batch_is_in_flight(self, monkeypatch):
+        # The gate is skipped and waiting is held back, so the cap is just the running set.
+        running = [_req(10), _req(10)]
+        assert self._observed_cap([_req(10) for _ in range(4)], running, monkeypatch) == 2
+
+    def test_an_already_lower_cap_is_not_raised(self, monkeypatch):
+        cap = self._observed_cap(
+            [_req(10) for _ in range(10)], [], monkeypatch, max_num_running_reqs=3
+        )
+        assert cap == 3
+
+    def test_the_cap_is_restored_even_when_the_base_raises(self, monkeypatch):
+        sched = PoolingSpyreScheduler.__new__(PoolingSpyreScheduler)
+        sched.spyre_warmup_shapes = list(self.SHAPES)
+        sched.waiting = FCFSRequestQueue([_req(10)])
+        sched.running = []
+        sched.max_num_running_reqs = 32
+
+        def _boom(self, *args, **kwargs):
+            raise RuntimeError("upstream blew up")
+
+        monkeypatch.setattr(TorchSpyreScheduler, "schedule", _boom)
+        with pytest.raises(RuntimeError, match="upstream blew up"):
+            PoolingSpyreScheduler.schedule(sched)
+        assert sched.max_num_running_reqs == 32

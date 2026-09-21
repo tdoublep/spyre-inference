@@ -15,12 +15,14 @@
 """Unit tests for SpyreShapeBucketer."""
 
 from dataclasses import FrozenInstanceError
+from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
+from vllm.config import VllmConfig
 
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
-    EncoderBucketDescriptor,
     SpyreShapeBucketer,
     encoder_body_sizes,
     encoder_bucket_valid_row_indices,
@@ -127,64 +129,82 @@ class TestEdgeCases:
         assert b.bucket_sizes == [1, 2, 4, 8, 16]
 
 
-class TestEncoderWarmupShapes:
-    """Declared ``(L, B)`` pairs, zipped pairwise rather than crossed."""
+def _pooling_config(max_model_len=512, max_num_seqs=8, max_num_batched_tokens=4096):
+    return cast(
+        VllmConfig,
+        SimpleNamespace(
+            model_config=SimpleNamespace(max_model_len=max_model_len),
+            scheduler_config=SimpleNamespace(
+                max_num_seqs=max_num_seqs, max_num_batched_tokens=max_num_batched_tokens
+            ),
+        ),
+    )
 
-    def test_zips_pairwise_and_sorts_by_batch_then_length(self):
+
+class TestEncoderWarmupShapes:
+    """``(L, B)`` shapes from ``max_model_len`` / ``max_num_seqs`` and the two ladders."""
+
+    def test_default_is_a_single_shape_of_max_num_seqs_by_max_model_len(self):
+        assert encoder_warmup_shapes(_pooling_config(512, 8, 4096)) == [(512, 8)]
+
+    def test_the_token_budget_caps_the_width(self):
+        # 2048 tokens hold four 512-token sequences, whatever max_num_seqs says.
+        assert encoder_warmup_shapes(_pooling_config(512, 256, 2048)) == [(512, 4)]
+
+    def test_a_budget_below_max_model_len_still_leaves_one_sequence(self):
+        # Encoder prefill cannot be chunked, so the budget is floored at max_model_len.
+        assert encoder_warmup_shapes(_pooling_config(8192, 32, 2048)) == [(8192, 1)]
+
+    def test_the_ladders_are_crossed_and_sorted_by_batch_then_length(self):
         # Sorted by (B, L) so pick_encoder_shape's first match is the cheapest graph.
-        assert encoder_warmup_shapes([64, 256, 512], [32, 8, 2]) == [
-            (512, 2),
+        shapes = encoder_warmup_shapes(
+            _pooling_config(512, 8, 4096), length_buckets=[64, 256], num_seqs_buckets=[1, 4]
+        )
+        # Each ladder gains its own limit (512 and 8), so 3 x 3 = 9 shapes.
+        assert shapes == [
+            (64, 1),
+            (256, 1),
+            (512, 1),
+            (64, 4),
+            (256, 4),
+            (512, 4),
+            (64, 8),
             (256, 8),
-            (64, 32),
+            (512, 8),
         ]
 
-    def test_is_not_a_cross_product(self):
-        # Three lengths and three batches give three shapes, not nine.
-        assert len(encoder_warmup_shapes([64, 128, 512], [1, 2, 4])) == 3
+    def test_lengths_round_up_to_the_stick(self):
+        shapes = encoder_warmup_shapes(_pooling_config(512, 2, 1024), length_buckets=[100])
+        assert [length for length, _ in shapes] == [128, 512]
 
-    def test_deduplicates_repeated_pairs(self):
-        assert encoder_warmup_shapes([64, 64], [2, 2]) == [(64, 2)]
+    def test_unreachable_entries_are_dropped_and_the_limit_appended(self):
+        shapes = encoder_warmup_shapes(
+            _pooling_config(512, 4, 2048), length_buckets=[64, 9999], num_seqs_buckets=[2, 99]
+        )
+        assert shapes == [(64, 2), (512, 2), (64, 4), (512, 4)]
 
-    def test_rejects_unequal_list_lengths(self):
-        with pytest.raises(ValueError, match="equal length"):
-            encoder_warmup_shapes([64, 128], [2])
+    def test_non_positive_entries_are_ignored(self):
+        assert encoder_warmup_shapes(
+            _pooling_config(512, 8, 4096), length_buckets=[0, -64], num_seqs_buckets=[0]
+        ) == [(512, 8)]
 
-    def test_rejects_a_length_off_the_stick(self):
-        # 100 is not a multiple of 64, so attention's L would need padding the
-        # dense expansion does not do.
-        with pytest.raises(ValueError, match="multiples of 64"):
-            encoder_warmup_shapes([100], [2])
+    def test_is_idempotent_under_the_platform_write_back(self):
+        """The runner, scheduler and attention impl all re-derive post-startup."""
+        for args in [(512, 256, 2048), (512, 8, 8192), (8192, 32, 2048), (384, 6, 2304)]:
+            config = _pooling_config(*args)
+            first = encoder_warmup_shapes(config)
+            config.scheduler_config.max_num_seqs = max(b for _, b in first)
+            config.scheduler_config.max_num_batched_tokens = encoder_body_sizes(first)[-1]
+            assert encoder_warmup_shapes(config) == first, args
 
-    def test_rejects_non_positive_values(self):
-        with pytest.raises(ValueError, match="multiples of 64"):
-            encoder_warmup_shapes([0], [2])
-        with pytest.raises(ValueError, match="must be positive"):
-            encoder_warmup_shapes([64], [0])
-
-    def test_rejects_an_empty_list(self):
-        with pytest.raises(ValueError, match="at least one shape"):
-            encoder_warmup_shapes([], [])
-
-    def test_reads_the_environment_by_default(self, monkeypatch):
+    def test_reads_the_environment(self, monkeypatch):
         from spyre_inference import envs
 
-        monkeypatch.setenv("SPYRE_WARMUP_PROMPT_LENS", "128,256")
-        monkeypatch.setenv("SPYRE_WARMUP_BATCH_SIZES", "4,2")
+        monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "128,256")
+        monkeypatch.setenv("SPYRE_ATTN_NUM_SEQS_BUCKETS", "2")
         envs.clear_env_cache()
         try:
-            assert encoder_warmup_shapes() == [(256, 2), (128, 4)]
-        finally:
-            envs.clear_env_cache()
-
-    def test_default_is_a_single_bucket(self, monkeypatch):
-        """Matches sendnn-inference's default: one (512, 8) graph."""
-        from spyre_inference import envs
-
-        monkeypatch.delenv("SPYRE_WARMUP_PROMPT_LENS", raising=False)
-        monkeypatch.delenv("SPYRE_WARMUP_BATCH_SIZES", raising=False)
-        envs.clear_env_cache()
-        try:
-            assert encoder_warmup_shapes() == [(512, 8)]
+            assert encoder_warmup_shapes(_pooling_config(256, 2, 512)) == [(128, 2), (256, 2)]
         finally:
             envs.clear_env_cache()
 
@@ -267,21 +287,6 @@ class TestDenseExpansion:
 
     def test_valid_row_indices_skip_a_zero_length_sequence(self):
         assert encoder_bucket_valid_row_indices([2, 0, 1], 4) == [0, 1, 8]
-
-
-class TestEncoderBucketDescriptor:
-    def test_padded_tokens_is_the_product(self):
-        desc = EncoderBucketDescriptor(
-            batch_bucket=4, len_bucket=128, actual_num_seqs=3, actual_max_len=100
-        )
-        assert desc.padded_num_tokens == 512
-
-    def test_is_frozen(self):
-        desc = EncoderBucketDescriptor(
-            batch_bucket=1, len_bucket=64, actual_num_seqs=1, actual_max_len=1
-        )
-        with pytest.raises(FrozenInstanceError):
-            desc.batch_bucket = 2
 
 
 class TestNextBucket:

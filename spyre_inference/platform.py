@@ -330,28 +330,27 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
-        """Derive the pooling engine config from the declared ``(L, B)`` shapes.
+        """Pin the pooling engine config to the declared ``(L, B)`` shapes.
 
-        The shapes are the source of truth, so ``max_model_len`` and ``max_num_seqs`` are
-        overridden from them. Every sequence is padded to ``L`` before the model, so the
-        body's token count is exactly ``B * L`` and the budget never binds.
+        ``max_model_len``, ``max_num_seqs`` and ``max_num_batched_tokens`` are the inputs;
+        only the latter two are written back, and only downwards, so that the scheduler
+        admits exactly the batches a compiled shape covers. Every sequence is padded to
+        ``L`` before the model, so the body's token count is exactly ``B * L``.
         """
         from spyre_inference.v1.worker.spyre_shape_bucketer import (
             encoder_body_sizes,
             encoder_warmup_shapes,
         )
 
-        shapes = encoder_warmup_shapes()
-        max_len = max(length for length, _ in shapes)
-        max_batch = max(batch for _, batch in shapes)
-        compile_sizes = encoder_body_sizes(shapes)
-
-        model_config = vllm_config.model_config
         scheduler_config = vllm_config.scheduler_config
+        max_model_len = vllm_config.model_config.max_model_len
+        prev_budget = scheduler_config.max_num_batched_tokens
+        prev_num_seqs = scheduler_config.max_num_seqs
 
-        # Raises if the declared length exceeds what the checkpoint supports.
-        model_config.get_and_verify_max_len(max_model_len=max_len)
-        model_config.max_model_len = max_len
+        shapes = encoder_warmup_shapes(vllm_config)
+        compile_sizes = encoder_body_sizes(shapes)
+        max_batch = max(batch for _, batch in shapes)
+
         scheduler_config.max_num_seqs = max_batch
         scheduler_config.max_num_batched_tokens = compile_sizes[-1]
         # Set only to pass vLLM's max_model_len check earlier in startup.
@@ -362,21 +361,32 @@ class TorchSpyrePlatform(CpuPlatform):
         vllm_config.compilation_config.compile_sizes = widened_sizes
 
         logger.info(
-            "Pooling compile shapes (prompt_len, batch_size): %s; derived "
-            "max_model_len=%d, max_num_seqs=%d, max_num_batched_tokens=%d, "
-            "body compile_sizes=%s",
+            "Pooling compile shapes (prompt_len, batch_size): %s for max_model_len=%d; "
+            "max_num_seqs=%d, max_num_batched_tokens=%d, body compile_sizes=%s",
             shapes,
-            max_len,
+            max_model_len,
             max_batch,
             compile_sizes[-1],
             compile_sizes,
         )
-        if all(batch > 1 for _, batch in shapes):
+        if max_batch < prev_num_seqs:
             logger.warning(
-                "Every declared pooling shape has batch_size > 1, so a single "
-                "request is padded to %d rows. Declare a batch_size=1 shape if "
-                "single-request latency matters.",
-                min(batch for _, batch in shapes) * min(length for length, _ in shapes),
+                "Lowering max_num_seqs %d -> %d: a batch of %d sequences of %d tokens "
+                "needs %d dense rows, over the %d-token budget. Raise "
+                "--max-num-batched-tokens to widen it.",
+                prev_num_seqs,
+                max_batch,
+                prev_num_seqs,
+                max_model_len,
+                prev_num_seqs * max_model_len,
+                prev_budget,
+            )
+        if compile_sizes[-1] > prev_budget:
+            logger.warning(
+                "Raising max_num_batched_tokens %d -> %d to fit max_model_len; "
+                "encoder prefill cannot be chunked.",
+                prev_budget,
+                compile_sizes[-1],
             )
 
     @classmethod

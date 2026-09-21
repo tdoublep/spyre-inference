@@ -17,10 +17,11 @@
 Decoder: sorted ``compile_sizes`` token counts; pad the packed batch to the nearest
 bucket.
 
-Pooling: ``(prompt_length, batch_size)`` pairs declared through
-``SPYRE_WARMUP_PROMPT_LENS`` / ``SPYRE_WARMUP_BATCH_SIZES``, zipped pairwise.
-``max_model_len``, ``max_num_seqs`` and the token budget are derived from them, and every
-sequence is padded to ``L`` before the model runs, so the body sees exactly ``B * L`` rows.
+Pooling: ``(prompt_length, batch_size)`` shapes, the cross product of
+``SPYRE_ATTN_QUERY_BUCKETS`` and ``SPYRE_ATTN_NUM_SEQS_BUCKETS`` -- the same two ladders
+the decoder attention bucketer uses. Both default to a single entry, so the default is one
+graph of ``max_num_seqs * max_model_len`` rows. Every sequence is padded to ``L`` before
+the model runs, so the body sees exactly ``B * L`` rows.
 """
 
 from __future__ import annotations
@@ -28,7 +29,6 @@ from __future__ import annotations
 import bisect
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import NamedTuple
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -37,7 +37,7 @@ from spyre_inference import envs
 
 logger = init_logger(__name__)
 
-# Spyre stick, in fp16 elements. Declared prompt lengths must be a multiple of it.
+# Spyre stick, in fp16 elements. Declared prompt lengths are rounded up to it.
 ENCODER_SEQ_ALIGNMENT = 64
 
 
@@ -56,39 +56,80 @@ def next_bucket(n: int, buckets: list[int]) -> int:
     return _align_up(n)
 
 
-def encoder_warmup_shapes(
-    prompt_lens: Sequence[int] | None = None,
-    batch_sizes: Sequence[int] | None = None,
-) -> list[tuple[int, int]]:
-    """Declared ``(prompt_length, batch_size)`` pairs, sorted by ``(B, L)``.
+def _resolve_encoder_buckets(
+    override: Sequence[int] | None,
+    env_value: str | None,
+    env_name: str,
+    limit: int,
+    align: bool,
+) -> list[int]:
+    """One encoder ladder: the override, else the env list, else just ``limit``.
 
-    The two env lists are zipped, not crossed: index ``i`` is one compiled graph. Sorting
-    by width makes ``pick_encoder_shape`` prefer the cheapest covering shape. Args are for
-    tests; production reads the env.
+    Same clamping as ``SpyreAttnBucketer``: entries above ``limit`` are unreachable and
+    dropped, and ``limit`` itself is appended when missing so the widest admissible batch
+    always has a shape. ``align`` rounds lengths up to a stick, which ``limit`` is exempt
+    from -- ``max_model_len`` is not ours to raise.
     """
-    lens = list(envs.SPYRE_WARMUP_PROMPT_LENS if prompt_lens is None else prompt_lens)
-    batches = list(envs.SPYRE_WARMUP_BATCH_SIZES if batch_sizes is None else batch_sizes)
-
-    if len(lens) != len(batches):
-        raise ValueError(
-            "SPYRE_WARMUP_PROMPT_LENS and SPYRE_WARMUP_BATCH_SIZES must have equal "
-            f"length; got {len(lens)} lengths {lens} and {len(batches)} batch sizes "
-            f"{batches}. They are zipped pairwise, not crossed."
+    if override is not None:
+        raw = [int(v) for v in override]
+    elif env_value:
+        raw = [int(v) for v in env_value.split(",") if v.strip()]
+    else:
+        raw = [limit]
+    values = {_align_up(v) if align else v for v in raw if v > 0}
+    kept = sorted(v for v in values if v <= limit)
+    dropped = sorted(v for v in values if v > limit)
+    if dropped:
+        logger.warning(
+            "%s entries %s exceed %d and are unreachable for a pooling batch; dropping.",
+            env_name,
+            dropped,
+            limit,
         )
-    if not lens:
-        raise ValueError("SPYRE_WARMUP_PROMPT_LENS is empty; at least one shape is required")
-    bad = [length for length in lens if length % ENCODER_SEQ_ALIGNMENT or length <= 0]
-    if bad:
-        raise ValueError(
-            f"All SPYRE_WARMUP_PROMPT_LENS must be positive multiples of "
-            f"{ENCODER_SEQ_ALIGNMENT} (the Spyre stick); got {bad}"
-        )
-    bad_batches = [batch for batch in batches if batch <= 0]
-    if bad_batches:
-        raise ValueError(f"All SPYRE_WARMUP_BATCH_SIZES must be positive; got {bad_batches}")
+    if limit not in kept:
+        kept.append(limit)
+    return kept
 
+
+def encoder_warmup_shapes(
+    vllm_config: VllmConfig,
+    *,
+    length_buckets: Sequence[int] | None = None,
+    num_seqs_buckets: Sequence[int] | None = None,
+) -> list[tuple[int, int]]:
+    """Declared ``(prompt_length, batch_size)`` shapes, sorted by ``(B, L)``.
+
+    The cross product of the two ladders, each defaulting to a single entry, so an
+    unconfigured run compiles exactly one ``max_num_seqs * max_model_len`` graph. Sorting
+    by width makes ``pick_encoder_shape`` prefer the cheapest covering shape.
+
+    ``max_num_batched_tokens`` is what bounds a shape's width: a shape puts ``B * L`` dense
+    rows through the body, so the budget caps how many sequences a bucket can hold. The
+    caller is expected to write the resulting width back to ``max_num_seqs`` -- see
+    ``TorchSpyrePlatform._apply_pooling_shape_defaults`` -- which makes this idempotent.
+    """
+    max_model_len = int(vllm_config.model_config.max_model_len)
+    # A max-length pooling request must fit one batch: encoder prefill cannot be chunked,
+    # so a budget below max_model_len head-of-line blocks the scheduler forever.
+    budget = max(int(vllm_config.scheduler_config.max_num_batched_tokens), max_model_len)
+
+    lengths = _resolve_encoder_buckets(
+        length_buckets,
+        envs.SPYRE_ATTN_QUERY_BUCKETS,
+        "SPYRE_ATTN_QUERY_BUCKETS",
+        limit=max_model_len,
+        align=True,
+    )
+    width_limit = max(1, min(int(vllm_config.scheduler_config.max_num_seqs), budget // lengths[-1]))
+    widths = _resolve_encoder_buckets(
+        num_seqs_buckets,
+        envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
+        "SPYRE_ATTN_NUM_SEQS_BUCKETS",
+        limit=width_limit,
+        align=False,
+    )
     return sorted(
-        {(int(length), int(batch)) for length, batch in zip(lens, batches)},
+        {(length, batch) for length in lengths for batch in widths},
         key=lambda pair: (pair[1], pair[0]),
     )
 
@@ -120,20 +161,6 @@ def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[i
     """Row widths the lm_head can see: each body bucket clipped to ``max_num_reqs``."""
     cap = max(1, max_num_reqs)
     return sorted({min(size, cap) for size in bucket_sizes if size > 0})
-
-
-class EncoderBucketPad(NamedTuple):
-    """Runtime pad of a pooling batch onto a declared ``(B, L)`` shape."""
-
-    batch_bucket: int
-    len_bucket: int
-    orig_query_lens: list[int]
-    orig_num_tokens: int
-    orig_num_reqs: int
-
-    @property
-    def num_tokens(self) -> int:
-        return self.batch_bucket * self.len_bucket
 
 
 def expand_packed_to_encoder_bucket(
@@ -190,20 +217,6 @@ class SpyreBucketDescriptor:
 
     actual_num_tokens: int
     padded_num_tokens: int
-
-
-@dataclass(frozen=True)
-class EncoderBucketDescriptor:
-    """Descriptor for a 2D encoder ``(B, L)`` compilation bucket."""
-
-    batch_bucket: int
-    len_bucket: int
-    actual_num_seqs: int
-    actual_max_len: int
-
-    @property
-    def padded_num_tokens(self) -> int:
-        return self.batch_bucket * self.len_bucket
 
 
 class SpyreShapeBucketer:
