@@ -1206,15 +1206,26 @@ class TorchSpyreModelRunner(GPUModelRunner):
         Do *not* instead report padded lengths to make the cursor land on ``s*L`` --
         that makes ``PoolingCursor.is_partial_prefill()`` true and ``SpyreCLSPool``
         raise.
+
+        The gather keeps its input's row count rather than shrinking to
+        ``sum(query_lens)``: an output shape that tracked the real token count would
+        add a ``torch.compile`` specialization per distinct total, which is a
+        recompile on nearly every step once prompt lengths vary. ``SpyreAllPool``
+        avoids the same hazard the same way. Rows past ``sum(query_lens)`` are
+        filler -- the cursor's cumsum never addresses them.
         """
-        if hidden_states.shape[0] == num_scheduled_tokens:
-            return hidden_states
         grid = self._encoder_grid
         if grid is None:
+            if hidden_states.shape[0] == num_scheduled_tokens:
+                return hidden_states
             rows = list(range(num_scheduled_tokens))
         else:
-            len_bucket, _batch_bucket, query_lens = grid
+            len_bucket, batch_bucket, query_lens = grid
             rows = encoder_bucket_valid_row_indices(query_lens, len_bucket)
+            total_rows = batch_bucket * len_bucket
+            if len(rows) == total_rows:
+                return hidden_states
+            rows = rows + [0] * (total_rows - len(rows))
         return select_rows(hidden_states, torch.tensor(rows, dtype=torch.int64, device="cpu"))
 
     def _dummy_pooler_run_task(
