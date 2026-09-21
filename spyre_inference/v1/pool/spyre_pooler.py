@@ -35,7 +35,7 @@ from vllm.v1.outputs import PoolerOutput
 
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
-    default_encoder_len_buckets,
+    encoder_warmup_shapes,
     next_bucket,
 )
 
@@ -498,7 +498,9 @@ def configure_pooling_for_spyre(
         logger.info("Pooling: model has no pooler; leaving outputs on CPU")
         return False
 
-    len_ladder = default_encoder_len_buckets(max_model_len) if max_model_len else []
+    # The declared prompt lengths are the only widths a request can be padded to,
+    # so they are the right ladder for AllPool's bucketed gather.
+    len_ladder = sorted({length for length, _ in encoder_warmup_shapes()}) if max_model_len else []
     num_patched, unsupported = patch_pooler_for_spyre(pooler, len_ladder)
     if unsupported or num_patched == 0:
         reason = ", ".join(sorted(set(unsupported))) if unsupported else type(pooler).__name__

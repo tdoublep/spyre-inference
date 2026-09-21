@@ -41,6 +41,8 @@ if TYPE_CHECKING:
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
     SPYRE_NUM_CPUS: int = 0
     SPYRE_UPDATE_THREAD_CONFIG: bool = True
+    SPYRE_WARMUP_PROMPT_LENS: list[int] = [512]
+    SPYRE_WARMUP_BATCH_SIZES: list[int] = [8]
 
 _cache: dict[str, Any] = {}
 
@@ -99,6 +101,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # friends) to the detected budget to avoid thread oversubscription in
     # CPU-limited containers. Set to "0" to leave them untouched and only warn.
     "SPYRE_UPDATE_THREAD_CONFIG": lambda: bool(int(os.getenv("SPYRE_UPDATE_THREAD_CONFIG", "1"))),
+    # Pooling/encoder compile shapes, zipped pairwise with SPYRE_WARMUP_BATCH_SIZES:
+    # index i declares one (prompt_length, batch_size) graph. Not a cross product.
+    # Each length must be a multiple of 64 (the Spyre stick). These override
+    # --max-model-len and --max-num-seqs, which are derived from them.
+    "SPYRE_WARMUP_PROMPT_LENS": lambda: [
+        int(p) for p in os.getenv("SPYRE_WARMUP_PROMPT_LENS", "512").split(",") if p.strip()
+    ],
+    # Batch width for each declared prompt length. Same length as the list above.
+    # A batch is padded up to its shape's width, so declare a narrow shape
+    # (batch size 1) as well if single-request latency matters.
+    "SPYRE_WARMUP_BATCH_SIZES": lambda: [
+        int(b) for b in os.getenv("SPYRE_WARMUP_BATCH_SIZES", "8").split(",") if b.strip()
+    ],
 }
 # --8<-- [end:env-vars-definition]
 

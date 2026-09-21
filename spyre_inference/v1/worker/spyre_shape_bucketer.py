@@ -14,14 +14,19 @@
 
 """Spyre shape bucketer for compilation warmup and runtime dispatch.
 
-Body (1D, decoder and pooling): sorted ``compile_sizes`` token counts; pad the
-packed batch to the nearest bucket ``>=`` actual ``num_tokens``. Linear / LN
-compile on ``[T, …]``.
+Two unrelated schemes live here.
 
-Attention (encoder only): warmed ``(B, L)`` cells for SDPA ``[B, H, L, D]``.
-The attention backend gathers rows into that grid; the body is not rewritten
-to ``T = B × L``. ``L`` comes from ``max_model_len``, not ``compile_sizes``.
-``B`` is powers of two up to ``--max-num-seqs``, same as decoder attention.
+**Decoder (1D).** Sorted ``compile_sizes`` token counts; pad the packed batch to
+the nearest bucket ``>=`` actual ``num_tokens``. Linear / LN compile on ``[T, …]``.
+
+**Pooling / encoder (2D, declared).** The operator declares ``(prompt_length,
+batch_size)`` pairs through ``SPYRE_WARMUP_PROMPT_LENS`` and
+``SPYRE_WARMUP_BATCH_SIZES``, zipped pairwise. ``max_model_len``,
+``max_num_seqs`` and the token budget are derived *from* those shapes rather than
+the other way round, and every sequence is padded to ``L`` before the model runs,
+so the body sees exactly ``B * L`` rows and attention's grid is a reshape. The
+scheduler (``v1/core/scheduler.py``) only admits batches a declared shape covers,
+so dispatch never misses and nothing compiles mid-request.
 """
 
 from __future__ import annotations
@@ -34,48 +39,13 @@ from typing import NamedTuple
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
+from spyre_inference import envs
+
 logger = init_logger(__name__)
 
-# Spyre stick (64 fp16 elements). Length buckets and MiniLM head-dim padding
-# both align to this so Inductor never enters insert_bmm_padding.
+# Spyre stick (64 fp16 elements). Declared prompt lengths must land on it so
+# Inductor never enters insert_bmm_padding.
 ENCODER_SEQ_ALIGNMENT = 64
-
-# How far an encoder attention cell may exceed the scheduler's token budget.
-#
-# The scheduler admits by token *sum*, encoder attention pays for ``B * L_bucket``, and
-# those agree only at uniform prompt lengths. Five 400-token prompts inside the pooling
-# default of 2048 have no covering in-budget cell at all: ``(5, 512) = 2560``. So warming
-# only in-budget cells and never compiling while serving are mutually exclusive.
-#
-# The slack goes to the *exact* widths the dispatcher would fall back to, not the next
-# power of two: warming ``(8, 512)`` instead wins the 5-sequence step and burns 4096
-# slots where 2560 would do. 2x stops the band -- going wider removed no serving-path
-# compile in simulation, since a step wide enough to need it already dropped a length
-# bucket.
-ENCODER_CELL_BUDGET_SLACK = 2
-
-
-def encoder_cell_budget(max_num_batched_tokens: int) -> int:
-    """Largest ``B * L`` a cell may occupy; see ``ENCODER_CELL_BUDGET_SLACK``."""
-    return max(1, int(max_num_batched_tokens)) * ENCODER_CELL_BUDGET_SLACK
-
-
-def default_encoder_len_buckets(max_model_len: int) -> list[int]:
-    """Stick-aligned prompt-length buckets from 64 up to ``max_model_len``.
-
-    Powers of two through the last value that still fits, then ``max_model_len``
-    rounded down to a stick if that is not already a bucket.
-    """
-    cap = max(1, int(max_model_len))
-    buckets: list[int] = []
-    size = ENCODER_SEQ_ALIGNMENT
-    while size < cap:
-        buckets.append(size)
-        size *= 2
-    aligned_cap = max(ENCODER_SEQ_ALIGNMENT, (cap // ENCODER_SEQ_ALIGNMENT) * ENCODER_SEQ_ALIGNMENT)
-    if aligned_cap <= cap and aligned_cap not in buckets:
-        buckets.append(aligned_cap)
-    return buckets or [ENCODER_SEQ_ALIGNMENT]
 
 
 def _align_up(n: int, align: int = ENCODER_SEQ_ALIGNMENT) -> int:
@@ -93,127 +63,73 @@ def next_bucket(n: int, buckets: list[int]) -> int:
     return _align_up(n)
 
 
-def len_buckets(
-    max_model_len: int,
-    compile_sizes: Sequence[int] | None = None,
-) -> list[int]:
-    """Attention ``L`` buckets from ``max_model_len``.
-
-    Optional ``compile_sizes`` overrides ``L`` in tests. Platform
-    ``compile_sizes`` are body token counts and must not be passed here.
-    """
-    if compile_sizes:
-        aligned = sorted({_align_up(int(v)) for v in compile_sizes if int(v) > 0})
-        fitted = [v for v in aligned if v <= max_model_len]
-        if fitted:
-            return fitted
-    return default_encoder_len_buckets(max_model_len)
-
-
-def batch_buckets(max_num_seqs: int) -> list[int]:
-    """Powers of two in ``[1, max_num_seqs]``, plus ``max_num_seqs`` itself."""
-    # TODO need to concile with the batching bucketting in spyre_attn_bucketer.py
-    cap = max(1, max_num_seqs)
-    out: list[int] = []
-    size = 1
-    while size < cap:
-        out.append(size)
-        size *= 2
-    if cap not in out:
-        out.append(cap)
-    return out
-
-
-def encoder_len_bucket(max_len: int, buckets: list[int] | None = None) -> int:
-    """Nearest length bucket for encoder SDPA ``L`` (always ≥ stick size)."""
-    return next_bucket(max(max_len, 1), buckets or [])
-
-
-def pick_encoder_attention_shape(
-    num_seqs: int,
-    max_query_len: int,
-    encoder_shapes: Sequence[tuple[int, int]],
-    max_num_seqs: int,
-    max_model_len: int,
-    max_num_batched_tokens: int,
-) -> tuple[int, int] | None:
-    """Smallest warmed ``(B, L)`` covering the batch, or None.
-
-    Prefer smallest ``T = B × L``, then smallest ``B``, then smallest ``L``.
-    """
-    if num_seqs < 1 or max_query_len < 1 or not encoder_shapes:
-        return None
-    candidates = [
-        (batch, length)
-        for batch, length in encoder_shapes
-        if batch >= num_seqs
-        and length >= max_query_len
-        and batch <= max_num_seqs
-        and length <= max_model_len
-        and batch * length <= encoder_cell_budget(max_num_batched_tokens)
-    ]
-    if not candidates:
-        return None
-    return min(candidates, key=lambda pair: (pair[0] * pair[1], pair[0], pair[1]))
-
-
-def encoder_batch_bucket(num_seqs: int, max_num_seqs: int) -> int:
-    """Nearest batch bucket for encoder SDPA ``B`` (≤ ``max_num_seqs``)."""
-    cap = max(1, max_num_seqs)
-    n = min(max(num_seqs, 1), cap)
-    return min(next_bucket(n, batch_buckets(cap)), cap)
-
-
-def pooling_warmup_shapes(
-    max_num_seqs: int,
-    max_model_len: int,
-    max_num_batched_tokens: int,
-    len_bucket: Sequence[int] | None = None,
+def encoder_warmup_shapes(
+    prompt_lens: Sequence[int] | None = None,
+    batch_sizes: Sequence[int] | None = None,
 ) -> list[tuple[int, int]]:
-    """``(batch_size, prompt_len)`` pairs to dummy at serve start.
+    """Declared ``(prompt_length, batch_size)`` pairs, sorted by ``(B, L)``.
 
-    Three groups: the power-of-two ``B`` ladder within the token budget, the *exact*
-    widths just above it at the longest length (see ``ENCODER_CELL_BUDGET_SLACK``), and
-    a rescue cell for any batch bucket that no length fits within the budget (#775).
+    The two env lists are **zipped**, not crossed: index ``i`` is one compiled
+    graph. Sorted so the narrowest shape wins ties in ``pick_encoder_shape`` --
+    a single request should land on a batch-1 shape if one was declared.
 
-    The last two groups can exceed ``max_num_batched_tokens``, which upstream
-    ``_dummy_run`` asserts against, so they need the runner's skewed-batch warmup
-    rather than a uniform ``B * L`` fill; see ``_warmup_pooling_bucket_shapes``.
+    Args are for tests; production reads the env.
     """
-    budget = max(1, int(max_num_batched_tokens))
-    cell_budget = encoder_cell_budget(max_num_batched_tokens)
-    lengths = [
-        prompt_len
-        for prompt_len in len_buckets(max_model_len, len_bucket)
-        if prompt_len <= max_model_len
-    ]
-    batches = batch_buckets(max_num_seqs)
+    lens = list(envs.SPYRE_WARMUP_PROMPT_LENS if prompt_lens is None else prompt_lens)
+    batches = list(envs.SPYRE_WARMUP_BATCH_SIZES if batch_sizes is None else batch_sizes)
 
-    shapes: set[tuple[int, int]] = {
-        (batch_size, prompt_len)
-        for batch_size in batches
-        for prompt_len in lengths
-        if batch_size * prompt_len <= budget
-    }
-
-    if lengths:
-        longest = lengths[-1]
-        overflow_widths = range(
-            budget // longest + 1, min(max_num_seqs, cell_budget // longest) + 1
+    if len(lens) != len(batches):
+        raise ValueError(
+            "SPYRE_WARMUP_PROMPT_LENS and SPYRE_WARMUP_BATCH_SIZES must have equal "
+            f"length; got {len(lens)} lengths {lens} and {len(batches)} batch sizes "
+            f"{batches}. They are zipped pairwise, not crossed."
         )
-        shapes.update((batch_size, longest) for batch_size in overflow_widths)
-
-    for batch_size in batches:
-        if any(batch_size * prompt_len <= budget for prompt_len in lengths):
-            continue
-        rescue = next(
-            (prompt_len for prompt_len in lengths if batch_size * prompt_len <= cell_budget),
-            None,
+    if not lens:
+        raise ValueError("SPYRE_WARMUP_PROMPT_LENS is empty; at least one shape is required")
+    bad = [length for length in lens if length % ENCODER_SEQ_ALIGNMENT or length <= 0]
+    if bad:
+        raise ValueError(
+            f"All SPYRE_WARMUP_PROMPT_LENS must be positive multiples of "
+            f"{ENCODER_SEQ_ALIGNMENT} (the Spyre stick); got {bad}"
         )
-        if rescue is not None:
-            shapes.add((batch_size, rescue))
+    bad_batches = [batch for batch in batches if batch <= 0]
+    if bad_batches:
+        raise ValueError(f"All SPYRE_WARMUP_BATCH_SIZES must be positive; got {bad_batches}")
 
-    return sorted(shapes)
+    return sorted(
+        {(int(length), int(batch)) for length, batch in zip(lens, batches)},
+        key=lambda pair: (pair[1], pair[0]),
+    )
+
+
+def pick_encoder_shape(
+    num_seqs: int,
+    max_len: int,
+    shapes: Sequence[tuple[int, int]],
+) -> tuple[int, int] | None:
+    """First declared ``(L, B)`` covering the batch, or ``None``.
+
+    ``shapes`` is sorted by ``(B, L)``, so "first" is the narrowest batch that
+    fits and then the shortest length -- the cheapest graph for this step.
+
+    ``None`` means a request longer than every declared length, which the
+    scheduler and vLLM's own ``max_model_len`` check should both have stopped.
+    """
+    if num_seqs < 1 or max_len < 1:
+        return None
+    for length, batch in shapes:
+        if batch >= num_seqs and length >= max_len:
+            return length, batch
+    return None
+
+
+def encoder_body_sizes(shapes: Sequence[tuple[int, int]]) -> list[int]:
+    """Distinct ``B * L`` token counts -- the body's 1D ``compile_sizes``.
+
+    The body is flat ``[B*L, hidden]``, so it keys on the product alone: equal-area
+    shapes share one graph.
+    """
+    return sorted({length * batch for length, batch in shapes})
 
 
 def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[int]:
@@ -223,7 +139,7 @@ def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[i
 
 
 class EncoderBucketPad(NamedTuple):
-    """Runtime pad of a pooling batch onto a warmed ``(B, L)`` shape."""
+    """Runtime pad of a pooling batch onto a declared ``(B, L)`` shape."""
 
     batch_bucket: int
     len_bucket: int
@@ -307,74 +223,30 @@ class EncoderBucketDescriptor:
 
 
 class SpyreShapeBucketer:
-    """Dispatches runtime batches to pre-compiled bucket sizes.
+    """Dispatches runtime batches to pre-compiled 1D bucket sizes.
 
-    1D (``compile_sizes``): body token count ``>=`` actual ``num_tokens``.
-    2D (``encoder_shapes``): attention ``(B, L)`` covering the batch.
+    Pooling shares this: with every sequence padded to ``L`` before the model, the
+    body's token count is exactly ``B * L``, which is one of the declared shapes'
+    products, so the same 1D lookup serves both runners.
     """
 
-    def __init__(
-        self,
-        vllm_config: VllmConfig,
-        *,
-        encoder_shapes: Sequence[tuple[int, int]] | None = None,
-    ) -> None:
-        if encoder_shapes is not None:
-            self._encoder_shapes: list[tuple[int, int]] = list(encoder_shapes)
-            self._bucket_sizes: list[int] = sorted(
-                {batch * length for batch, length in self._encoder_shapes}
-            )
-        else:
-            self._encoder_shapes = []
-            compilation_config = vllm_config.compilation_config
-            sizes: list[int] = [int(s) for s in (compilation_config.compile_sizes or [])]
-            self._bucket_sizes = sorted(sizes)
+    def __init__(self, vllm_config: VllmConfig) -> None:
+        compilation_config = vllm_config.compilation_config
+        sizes: list[int] = [int(s) for s in (compilation_config.compile_sizes or [])]
+        self._bucket_sizes = sorted(set(sizes))
         self._max_bucket_size = self._bucket_sizes[-1] if self._bucket_sizes else 0
         self._is_warmed_up = False
 
-        if self._encoder_shapes:
-            logger.info(
-                "SpyreShapeBucketer initialized with %d encoder (B, L) shapes: %s",
-                len(self._encoder_shapes),
-                self._encoder_shapes,
-            )
-        else:
-            logger.info(
-                "SpyreShapeBucketer initialized with %d bucket sizes: min=%d, max=%d",
-                len(self._bucket_sizes),
-                self._bucket_sizes[0] if self._bucket_sizes else 0,
-                self._max_bucket_size,
-            )
-
-    @classmethod
-    def for_pooling(cls, vllm_config: VllmConfig) -> SpyreShapeBucketer | None:
-        """Pooling bucketer: 1D body ``compile_sizes`` plus attention ``(B, L)``."""
-        model_config = vllm_config.model_config
-        if getattr(model_config, "runner_type", None) != "pooling":
-            return None
-        scheduler = vllm_config.scheduler_config
-        compile_sizes = [int(s) for s in (vllm_config.compilation_config.compile_sizes or [])]
-        shapes = pooling_warmup_shapes(
-            max_num_seqs=scheduler.max_num_seqs,
-            max_model_len=model_config.max_model_len,
-            max_num_batched_tokens=scheduler.max_num_batched_tokens,
-            len_bucket=default_encoder_len_buckets(model_config.max_model_len),
+        logger.info(
+            "SpyreShapeBucketer initialized with %d bucket sizes: min=%d, max=%d",
+            len(self._bucket_sizes),
+            self._bucket_sizes[0] if self._bucket_sizes else 0,
+            self._max_bucket_size,
         )
-        if not shapes and not compile_sizes:
-            return None
-        inst = cls(vllm_config, encoder_shapes=shapes or None)
-        if compile_sizes:
-            inst._bucket_sizes = sorted(set(compile_sizes))
-            inst._max_bucket_size = inst._bucket_sizes[-1] if inst._bucket_sizes else 0
-        return inst
 
     @property
     def bucket_sizes(self) -> list[int]:
         return self._bucket_sizes
-
-    @property
-    def encoder_shapes(self) -> list[tuple[int, int]]:
-        return list(self._encoder_shapes)
 
     @property
     def max_bucket_size(self) -> int:
@@ -411,48 +283,4 @@ class SpyreShapeBucketer:
         return SpyreBucketDescriptor(
             actual_num_tokens=num_tokens,
             padded_num_tokens=padded,
-        )
-
-    def find_encoder_bucket(
-        self,
-        num_seqs: int,
-        max_query_len: int,
-        max_num_seqs: int,
-        max_model_len: int,
-        max_num_batched_tokens: int,
-    ) -> tuple[int, int] | None:
-        """Smallest warmed attention ``(B, L)`` that covers the batch, or None."""
-        return pick_encoder_attention_shape(
-            num_seqs,
-            max_query_len,
-            self._encoder_shapes,
-            max_num_seqs,
-            max_model_len,
-            max_num_batched_tokens,
-        )
-
-    def dispatch_encoder(
-        self,
-        num_seqs: int,
-        max_query_len: int,
-        max_num_seqs: int,
-        max_model_len: int,
-        max_num_batched_tokens: int,
-    ) -> EncoderBucketDescriptor | None:
-        """Pad descriptor for encoder SDPA, or None if no warmed cell fits."""
-        pair = self.find_encoder_bucket(
-            num_seqs,
-            max_query_len,
-            max_num_seqs,
-            max_model_len,
-            max_num_batched_tokens,
-        )
-        if pair is None:
-            return None
-        batch_bucket, len_bucket = pair
-        return EncoderBucketDescriptor(
-            batch_bucket=batch_bucket,
-            len_bucket=len_bucket,
-            actual_num_seqs=num_seqs,
-            actual_max_len=max_query_len,
         )
