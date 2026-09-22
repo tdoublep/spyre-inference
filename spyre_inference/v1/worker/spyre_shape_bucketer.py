@@ -105,7 +105,7 @@ def encoder_shape_tables(vllm_config: VllmConfig) -> EncoderShapeTables:
 
     lengths = _encoder_lengths(max_model_len)
     budget = encoder_budget_rows(
-        max_model_len, vllm_config.scheduler_config.max_num_batched_tokens
+        max_model_len, vllm_config.scheduler_config.max_num_batched_tokens, max_num_seqs
     )
 
     # `budget // length`, not `min(max_num_seqs, budget // length)`: the rectangle is
@@ -189,16 +189,25 @@ def _encoder_groups(
     return tuple(pairs)
 
 
-def encoder_budget_rows(max_model_len: int, max_num_batched_tokens: int) -> int:
-    """``R``: the token budget, floored at the top of the length ladder.
+def encoder_budget_rows(
+    max_model_len: int, max_num_batched_tokens: int, max_num_seqs: int
+) -> int:
+    """``R``: the pooling body's row count, and the cap on one attention dispatch.
 
-    Encoder prefill cannot be chunked, so a budget below the longest declared length
-    head-of-line blocks the scheduler forever -- and no rectangle would hold even one
-    max-length sequence. Taken as a formula rather than off the tables because
-    ``check_and_update_config`` needs it before the config it would memoise on is
-    final.
+    Floored at the top of the length ladder: encoder prefill cannot be chunked, so a
+    budget below the longest declared length head-of-line blocks the scheduler forever
+    -- and no rectangle would hold even one max-length sequence.
+
+    Capped at ``max_num_seqs`` sequences of that length, which is the most tokens a
+    step can carry. Without it a narrow engine pays the full budget in body rows on
+    every step: one 64-token request against a 2048-token budget would run the body on
+    2048 rows, since a rectangle is always the whole buffer.
+
+    A formula rather than a field on the tables because ``check_and_update_config``
+    needs it before the config the tables memoise on is final.
     """
-    return max(int(max_num_batched_tokens), _align_up(max_model_len))
+    longest = _align_up(max_model_len)
+    return max(longest, min(int(max_num_batched_tokens), max(1, int(max_num_seqs)) * longest))
 
 
 def encoder_len_ladder(vllm_config: VllmConfig) -> list[int]:

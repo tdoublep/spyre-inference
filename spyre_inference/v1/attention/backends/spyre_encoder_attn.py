@@ -68,6 +68,7 @@ from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_fast_path_shape,
     encoder_group_shapes,
+    encoder_group_width_caps,
     encoder_rectangles,
     encoder_shape_tables,
 )
@@ -482,6 +483,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         config = get_current_vllm_config()
         self._rectangles = encoder_rectangles(config)
         self._group_shapes = encoder_group_shapes(config)
+        self._width_caps = encoder_group_width_caps(config)
         self._buffer_rows = encoder_shape_tables(config).budget
         self._warmed = False
 
@@ -576,8 +578,13 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         tensor does not reproduce. Warming therefore writes into the caller's own
         ``output``; safe because the real work right after overwrites every real
         request's rows and the rest is padding.
+
+        A buffer that is not the declared body shape warms nothing: every declared
+        shape is sized against that one buffer, so a smaller one would index out of
+        bounds, and serving never presents a different one -- only a caller that
+        bypasses the runner's bucketing does.
         """
-        if self._warmed:
+        if self._warmed or query.shape[0] != self._buffer_rows:
             return 0
         self._warmed = True
         dtype, device = query.dtype, query.device
@@ -585,18 +592,6 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         traced = 0
 
         for extent, width in self._rectangles:
-            if width * extent != query.shape[0]:
-                # A rectangle is exactly the body buffer by construction; anything
-                # else means the two ladders have drifted apart.
-                logger.warning(
-                    "Encoder rectangle (L=%d, B=%d) is %d rows but the body buffer is "
-                    "%d; skipping, it will compile on first use.",
-                    extent,
-                    width,
-                    width * extent,
-                    query.shape[0],
-                )
-                continue
             mask = convert(encoder_key_pad_mask(extent, [extent] * width, dtype), device)
             self._run_rect(
                 output, query, key, value, mask, width, extent, num_heads, num_kv_heads, head_size
@@ -645,12 +640,6 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         # not silently missed.
         note_unattributed_compiles("model body / pooler")
 
-        plan = attn_metadata.encoder_plan
-        assert plan is not None, (
-            "encoder_plan must be built before the model runs; a step without one "
-            "would silently fall through to the wrong path"
-        )
-
         num_heads = query.shape[1]
         num_kv_heads = key.shape[1]
         head_size = query.shape[2]
@@ -661,6 +650,26 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             query = convert(query, output.device)
             key = convert(key, output.device)
             value = convert(value, output.device)
+
+        plan = attn_metadata.encoder_plan
+        if plan is None:
+            # The runner builds the plan off the traced path; this is the fallback for
+            # a caller that did not (unit tests, and any upstream path that bypasses
+            # the runner override). After the device alignment above, so the row tables
+            # and masks land where the activations are.
+            #
+            # Slow path only, never a rectangle: the grid layout is a contract with
+            # ``_preprocess``, so choosing a rectangle the runner did not lay out would
+            # read the wrong rows rather than merely run slower.
+            plan = build_encoder_plan(
+                attn_metadata,
+                rectangles=(),
+                width_cap_for=self._width_caps,
+                device=query.device,
+                dtype=query.dtype,
+                batched=self._batched_attn,
+            )
+            attn_metadata.encoder_plan = plan
 
         # Sub-stick head sizes: run the whole attention at a stick-aligned head dim
         # on our own buffers, then narrow on the host and write back through the
