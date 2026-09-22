@@ -51,7 +51,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
-from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionLayer
 
 from spyre_inference import envs
@@ -72,8 +71,6 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_rectangles,
     encoder_shape_tables,
 )
-
-logger = init_logger(__name__)
 
 # One Spyre stick of fp16, in tokens. A padded length that is a multiple of this
 # keeps the row-index table stick-aligned and the matmul's contraction dimension
@@ -120,9 +117,7 @@ def encoder_row_table(start: int, query_len: int, extent: int, dtype: torch.dtyp
     return torch.arange(extent, dtype=dtype).clamp(max=query_len - 1) + start
 
 
-def encoder_key_pad_mask(
-    extent: int, kv_lens: Sequence[int], dtype: torch.dtype
-) -> torch.Tensor:
+def encoder_key_pad_mask(extent: int, kv_lens: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
     """Additive key-pad ``[N, 1, 1, extent]``, one row per sequence, on the host.
 
     Head and query axes stay 1 and broadcast: an encoder mask depends only on the KV
@@ -395,7 +390,15 @@ def build_encoder_plan(
         members.append((start, query_len, min(int(seq_lens[seq_idx]), query_len)))
 
     max_len = max((m[1] for m in members), default=0)
-    rect = encoder_fast_path_shape(len(members), max_len, rectangles)
+    # A dropped request would shift every later sequence's lane, and the pooler
+    # addresses rows by its own cumsum over *all* requests -- so the grid would be
+    # silently misaligned rather than merely padded. The packed path indexes by
+    # absolute row and does not care.
+    rect = (
+        encoder_fast_path_shape(len(members), max_len, rectangles)
+        if len(members) == attn_metadata.num_seqs
+        else None
+    )
     if rect is not None:
         extent, width = rect
         # Batch-pad lanes get one attendable key, not zero: an all-masked query row

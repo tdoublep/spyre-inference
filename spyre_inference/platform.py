@@ -310,9 +310,7 @@ class TorchSpyrePlatform(CpuPlatform):
                     # Largest default bucket: scheduler limit and 512 (Spyre max).
                     # Decode packs one token per running sequence; prefill lands on
                     # the single largest bucket. Denser sizes only cost warmup time.
-                    max_capture_size = min(
-                        vllm_config.scheduler_config.max_num_batched_tokens, 512
-                    )
+                    max_capture_size = min(vllm_config.scheduler_config.max_num_batched_tokens, 512)
                     num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
                     sizes = {max_capture_size, num_seqs}
                     size = 1
@@ -400,9 +398,7 @@ class TorchSpyrePlatform(CpuPlatform):
         # above it. `encoder_budget_rows` then floors it at the longest declared length,
         # which vLLM's own verify_max_model_len (run before this hook) cannot do for us,
         # and caps it at what `max_num_seqs` sequences could actually carry.
-        scheduler_config.max_num_batched_tokens = min(
-            prev_budget, cls._POOLING_MAX_BATCHED_TOKENS
-        )
+        scheduler_config.max_num_batched_tokens = min(prev_budget, cls._POOLING_MAX_BATCHED_TOKENS)
 
         # Config normalisation, not scheduling. The shortest length carries the widest
         # rectangle, so this makes the widest declared width equal `max_num_seqs` and no
@@ -458,8 +454,8 @@ class TorchSpyrePlatform(CpuPlatform):
 
     @classmethod
     def get_attn_backend_cls(cls, selected_backend, *args, **kwargs) -> str:
-        # Encoder (pooling) layers have no KV cache and run bidirectional flash
-        # attention; decoders use the paged backend. vLLM passes attn_type via the selector
+        # Encoder (pooling) layers have no KV cache and run bidirectional SDPA;
+        # decoders use the paged backend. vLLM passes attn_type via the selector
         # config, so the choice lives here rather than as a branch in the impl.
         from vllm.v1.attention.backend import AttentionType
 

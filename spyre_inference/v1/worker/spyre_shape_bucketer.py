@@ -189,9 +189,7 @@ def _encoder_groups(
     return tuple(pairs)
 
 
-def encoder_budget_rows(
-    max_model_len: int, max_num_batched_tokens: int, max_num_seqs: int
-) -> int:
+def encoder_budget_rows(max_model_len: int, max_num_batched_tokens: int, max_num_seqs: int) -> int:
     """``R``: the pooling body's row count, and the cap on one attention dispatch.
 
     Floored at the top of the length ladder: encoder prefill cannot be chunked, so a
@@ -335,7 +333,10 @@ class SpyreShapeBucketer:
 
     @classmethod
     def for_pooling(cls, vllm_config: VllmConfig) -> SpyreShapeBucketer | None:
-        """Pooling bucketer: 1D body ``compile_sizes`` only (flash is varlen)."""
+        """Pooling bucketer: the single body shape, ``R`` rows.
+
+        Encoder attention shapes live on the tables above, not here.
+        """
         model_config = vllm_config.model_config
         if getattr(model_config, "runner_type", None) != "pooling":
             return None

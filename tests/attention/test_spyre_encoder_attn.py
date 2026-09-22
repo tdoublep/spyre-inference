@@ -29,11 +29,11 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
 )
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     ENCODER_LEN_ALIGNMENT,
+    EncoderRectPlan,
     SpyreEncoderAttentionImpl,
     _alignment_units_for,
     _encoder_gather_kernel,
     _encoder_sdpa_kernel,
-    EncoderRectPlan,
     build_encoder_plan,
     encoder_index_dtype,
     encoder_key_pad_mask,
@@ -45,6 +45,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_dense_row_ind
 def encoder_mask(extent: int, kv_len: int, dtype: torch.dtype) -> torch.Tensor:
     """Single-sequence mask, the shape these tests were written against."""
     return encoder_key_pad_mask(extent, [kv_len], dtype)
+
 
 # extra `encoder_attention` mark so CI can split this into its own job
 # because these tests are pretty slow.

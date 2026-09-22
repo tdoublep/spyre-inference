@@ -292,43 +292,65 @@ Encoder-only (embedding) models take a separate path. For `ENCODER`/`ENCODER_ONL
 layers, `TorchSpyrePlatform.get_attn_backend_cls` selects `SpyreEncoderAttentionBackend`
 → `SpyreEncoderAttentionImpl` (both subclass the decoder backend/impl in
 `spyre_encoder_attn.py`). This path has **no KV cache** — attention is bidirectional over
-the full sequence — so it skips the paged-cache machinery. The packed `[T, H, D]` list is
-processed one sequence at a time, dense; request boundaries ride in int32 row-index tables
-(offsets are data, not shapes):
+the full sequence — so it skips the paged-cache machinery. There is no online-softmax
+loop either: a sequence's whole K/V fits one tensor, so nothing forces the block-wise walk
+the decoder needs.
 
-1. First encoder layer of the step builds one `EncoderSeqPlan` per request (row table +
-   additive mask) and stashes it on `attn_metadata.encoder_seq_plans` for the rest of the
-   stack.
-2. Three separately compiled functions, not one: `_encoder_gather_kernel` pulls one
-   sequence's rows out of the step's body buffer via `index_select`; the dense
-   `QKᵀ -> +mask -> softmax -> ·V` attention kernel runs on those already-gathered,
-   sequence-sized tensors; `_encoder_store_kernel` scatters the result back with
-   `index_copy_`. There is no online-softmax loop — a sequence's whole K/V already fits in
-   one gathered tensor, so there is no paged cache forcing a block-wise walk the way the
-   decoder needs.
-3. The split matters for compilation, not just structure: under `dynamic=False` Dynamo
-   guards on every argument's shape, including the step's body buffer size. Keeping gather
-   and store (cheap, keyed on that buffer size) separate from the attention math
-   (expensive, keyed only on the sequence's own padded length) means the expensive graph
-   compiles once per distinct sequence length, not once per `(buffer size, length)` pair.
-4. There is no host slice (torch-spyre#3770) and no identity gather (torch-spyre#4033).
-   The only compile axis is the per-request padded length (a power of two, in
-   `ENCODER_LEN_ALIGNMENT = 64` steps). Body `T` stays a 1D `compile_sizes` bucket; there is no
-   dense `(B, L)` grid or `[B, 1, L, L]` mask.
+Everything hangs off one number, `R = encoder_budget_rows(...)`: the token budget, capped
+at 2048, floored at the aligned `max_model_len`, and capped at what `max_num_seqs`
+sequences of that length could carry. **The pooling body is always `R` rows.** Fixing it
+is what reduces the attention kernels' cache keys to the sequence shapes alone — both
+kernels take the body buffer as an argument, so a varying buffer size would multiply every
+attention graph.
+
+On top of that one buffer sit two paths over a single power-of-two length ladder
+(`ENCODER_LEN_ALIGNMENT = 64` steps up to `max_model_len`):
+
+1. **Fast path** — one rectangle per length, `B = R / L`, so a rectangle is exactly the
+   body buffer. The runner pads each sequence to `L` and the batch to `B` in `_preprocess`
+   (host-side, integer tensors only), so Q/K/V *are* the grid: `_encoder_rect_kernel`
+   reshapes, runs one `F.scaled_dot_product_attention`, and stores — no data movement
+   inside the layer. `_unpad_encoder_hidden` compacts the grid back before the pooler, at a
+   fixed row count so the gather does not specialise per token total.
+2. **Slow path** — for a batch too wide for any rectangle. Q/K/V stay packed and requests
+   are grouped by their own padded extent; `_encoder_fused_kernel` does gather, attend and
+   scatter for one group in a single graph, keyed on `(width, extent)`. Request boundaries
+   ride in int32 row-index tables, so a card never does offset arithmetic on *shapes* —
+   offsets are data. A group wider than the widest declared width is chunked into
+   descending powers of two, so every dispatch lands on a warmed pair.
+
+The runner picks between them once per step in `_build_attention_metadata` and records the
+choice as the *type* of `attn_metadata.encoder_plan` (`EncoderRectPlan` versus a list of
+`EncoderGroupPlan`). It has to run there rather than in `forward`: the builder does a D2H
+read and an H2D convert, which inside a traced region become graph nodes. Because both
+paths stay behind the opaque `unified_attention_with_output`, the enclosing block graph is
+identical for either — one shape, shared — so path selection is never a branch inside a
+compiled region nor a dynamo guard.
+
+Three torch-spyre constraints shape the rest: a compiled region reads its arguments from
+offset 0 and ignores `storage_offset` (#3770), so rows are gathered with `index_select`
+rather than sliced; there is no on-device `arange` or `full`, so every index and mask
+tensor is host-built and reaches the device in one `convert` per plan; and SDPA's
+decomposition does `amax` then `exp(scores - max)`, which NaNs a fully masked row — hence
+the `finfo.min / 2` mask fill and the single attendable key a batch-pad lane gets.
 
 ## Encoder / embedding models: compile shape axes
 
-The model body is compiled once per token bucket. Attention is shape-managed separately
-behind the opaque custom-op boundary; its axis is the per-request padded sequence length,
-not a dense `(S, L)` grid.
+The body is compiled once, at `R` rows. Attention is shape-managed separately behind the
+opaque custom-op boundary: one rectangle per declared length on the fast path, one
+`(width, extent)` pair per group on the slow one. With `max_model_len=512`,
+`max_num_seqs=32` and a 2048-token budget that is 23 shapes — one body, four rectangles,
+18 group pairs — and at `max_num_seqs=4` only five, since no batch that narrow can miss
+the fast path.
 
 <figure markdown="span">
   ![Encoder target state](encoder-ideal-state.svg){: style="width: 140%; max-width: 1400px; margin-left: -20%" }
   <figcaption>
-    Architecture for encoder / embedding models under
-    <code>STOCK_TORCH_COMPILE</code>. The body is bucketed on packed token count
-    <code>T</code>. Attention runs dense per-sequence over that packed list, so the second
-    axis is a per-request padded length rather than a dense <code>(S, L)</code> grid.
+    Encoder / embedding models under <code>STOCK_TORCH_COMPILE</code>, <strong>slow path
+    only</strong>: attention over the packed list, grouped by each request's padded
+    extent. Predates the fast path and the single <code>R</code>-row body, so read the
+    body bucketing and the warmup sweep as historical; the grouping and the row-index
+    tables are still current. Regenerating it needs the <code>d2</code> toolchain.
   </figcaption>
 </figure>
 

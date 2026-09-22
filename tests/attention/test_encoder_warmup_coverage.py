@@ -148,14 +148,17 @@ class TestWarmKernelsTracesTheDeclaredSet:
 
         seen_out = []
         real_rect, real_fused = impl._run_rect, impl._run_fused
-        monkeypatch.setattr(
-            impl, "_run_rect", lambda out, *a, **k: (seen_out.append(out), real_rect(out, *a, **k))[1]
-        )
-        monkeypatch.setattr(
-            impl,
-            "_run_fused",
-            lambda out, *a, **k: (seen_out.append(out), real_fused(out, *a, **k))[1],
-        )
+
+        def record_rect(out, *args, **kwargs):
+            seen_out.append(out)
+            return real_rect(out, *args, **kwargs)
+
+        def record_fused(out, *args, **kwargs):
+            seen_out.append(out)
+            return real_fused(out, *args, **kwargs)
+
+        monkeypatch.setattr(impl, "_run_rect", record_rect)
+        monkeypatch.setattr(impl, "_run_fused", record_fused)
         impl.warm_kernels(query, key, value, output, impl.num_heads, impl.num_kv_heads, 64)
 
         assert seen_out, "warmup must exercise the store"
@@ -248,8 +251,7 @@ class TestEveryReachableBatchLandsOnADeclaredShape:
                     else:
                         for group in plan:
                             assert (group.group, group.extent) in declared_groups, (
-                                f"undeclared group {(group.group, group.extent)} for "
-                                f"lens={lens}"
+                                f"undeclared group {(group.group, group.extent)} for lens={lens}"
                             )
                     checked += 1
         assert checked > 50, "too few batches checked -- test is near-vacuous"

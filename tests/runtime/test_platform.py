@@ -206,9 +206,7 @@ def test_num_gpu_blocks_override_skipped_for_pooling():
     assert vllm_config.cache_config.num_gpu_blocks_override is None
 
 
-def _pooling_platform_config(
-    *, max_model_len=512, max_num_seqs=32, max_num_batched_tokens=512
-):
+def _pooling_platform_config(*, max_model_len=512, max_num_seqs=32, max_num_batched_tokens=512):
     from unittest.mock import MagicMock
 
     from vllm.config import CompilationMode

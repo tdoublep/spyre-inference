@@ -59,29 +59,43 @@ no shape reaches the lm_head uncompiled. Pad rows are dropped before sampling.
 ## Encoder / pooling compile buckets
 
 Spyre compile is on by default (`STOCK_TORCH_COMPILE`, `dynamic=False`). Pass
-`--enforce-eager` to disable it. Body and attention are bucketed independently:
+`--enforce-eager` to disable it.
 
-- **Body** (Linear / LN): pad the packed token count to the next 1D
-  `compile_sizes` bucket `T` (same dispatch as the decoder).
-- **Attention**: `F.scaled_dot_product_attention` per group of equal-length
-  requests, gathering their rows via a separately compiled kernel first. There is
-  no dense `(B, L)` grid and no rewrite of body `T`; the compile axes are a
-  request's own padded length (a power of two, `ENCODER_LEN_ALIGNMENT = 64` tokens)
-  and the group size. Requests sharing a padded length are served by one
-  gather/attend/store, since these kernels are dispatch-bound rather than
-  compute-bound. Set `SPYRE_ENCODER_BATCHED_ATTN=0` to serve them one at a time,
-  which shortens warmup at a throughput cost.
+Everything derives from one number, `R` — the token budget. It is
+`--max-num-batched-tokens`, capped at 2048 (the measured throughput argmax across
+pooling models), floored at `--max-model-len`, and capped again at what
+`--max-num-seqs` sequences of that length could carry. `--max-num-seqs` is then
+lowered to `R / 64` if it was higher, since no batch wider than that fits.
 
-`compile_sizes` for pooling is the body `T` buckets (`64, 128, …` up to the
-token cap).
+- **Body** (Linear / LN): one shape, `R` rows. Every pooling step pads to it.
+  Fixing it is what keeps the attention kernels keyed on sequence shapes alone.
+- **Lengths**: powers of two from 64 (one Spyre stick) up to `--max-model-len`.
+  `SPYRE_ATTN_QUERY_BUCKETS` overrides the ladder.
+- **Attention, fast path**: for each length `L`, one rectangle `B = R / L`. The
+  runner pads every sequence to `L` and the batch to `B`, so Q/K/V *are* the grid:
+  one reshape, one `F.scaled_dot_product_attention`, one store, no data movement
+  inside the layer. Taken whenever `num_seqs <= B`.
+- **Attention, slow path**: for a batch too wide for any rectangle, Q/K/V stay
+  packed and requests are grouped by their own padded length; each group is one
+  fused gather/attend/scatter, keyed on `(group width, extent)`. Widths are powers
+  of two up to `B`; a wider group is chunked into descending powers of two.
+  `SPYRE_ENCODER_BATCHED_ATTN=0` serves them one at a time, which shortens warmup
+  at a throughput cost.
 
-A 3-seq × 30-token request with `--max-num-seqs 4` pads the body to `T=128`;
-attention still sees the real per-sequence lengths (one 64-token step each here).
+With `--max-model-len 512 --max-num-seqs 32 --max-num-batched-tokens 2048` that is
+23 shapes: one body, four rectangles (`(64,32) (128,16) (256,8) (512,4)`, each
+exactly 2048 rows), and 18 group pairs. At `--max-num-seqs 4` the group family is
+empty — no batch that narrow can miss the fast path — leaving five shapes.
 
-Compiled pooling warmup dummies each 1D body size; that alone traces every
-sequence-length variant reachable at that size (`force_attention=True`, so
-the dummy run actually reaches the attention kernel). Eager pooling uses one
-short dummy, then runtime still 1D-pads the body.
+Both paths go through the same opaque attention op, so the block graph is identical
+for either and the choice is made once per step from the step's metadata. The
+runner counts them in `spyre_encoder_fast_path_steps` /
+`spyre_encoder_slow_path_steps`.
+
+Compiled pooling warmup runs one dummy at the body shape; the first attention call
+in it traces every declared rectangle and group pair, against that call's own
+tensors (a Spyre tensor's device layout is part of its cache key). Eager pooling
+uses one short dummy and always takes the packed path.
 
 Example:
 

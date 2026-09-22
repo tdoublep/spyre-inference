@@ -91,7 +91,6 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadataBuilder,
     SpyrePagedKVCache,
     allocate_staging_buffers,
-    is_warmup_complete,
     mark_warmup_complete,
 )
 from spyre_inference.v1.pool import (
@@ -120,6 +119,10 @@ logger = init_logger(__name__)
 # (unavailable with VLLM_TARGET_DEVICE=empty).
 
 _PAD_SLOT_ID = -1
+
+# Steps between encoder dispatch-ratio log lines. Often enough to watch a benchmark
+# settle, rare enough not to flood a serving log.
+_ENCODER_DISPATCH_LOG_EVERY = 200
 
 
 def _compute_slot_mapping_impl(
@@ -561,6 +564,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self._encoder_grid: tuple[int, int, list[int]] | None = None
         self.spyre_encoder_fast_path_steps = 0
         self.spyre_encoder_slow_path_steps = 0
+        self.spyre_encoder_real_tokens = 0
+        self.spyre_encoder_body_rows = 0
+        self.spyre_encoder_seqs = 0
 
         # Phase 1: Init with device="cpu" to avoid dtype/device errors.
         # Many components create tensors on self.device during init, and
@@ -718,8 +724,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _create_shape_bucketer(self) -> SpyreShapeBucketer | None:
         """Create SpyreShapeBucketer for 1D body token sizes.
 
-        Decoder and pooling share 1D ``compile_sizes``. Encoder flash is
-        varlen on that packed list (no ``(B, L)`` cells).
+        Decoder and pooling share 1D ``compile_sizes``; pooling's is a single entry,
+        the token budget.
 
         Pooling keeps a bucketer in eager *and* compile so *runtime* always
         1D-pads the body. Warmup still differs: compile dummies each 1D size
@@ -1088,22 +1094,45 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if isinstance(plan, EncoderRectPlan):
             self._encoder_grid = (plan.extent, plan.width, plan.query_lens)
             self.spyre_encoder_fast_path_steps += 1
-            logger.info_once(
-                "Encoder fast path in use: rectangle (L=%d, B=%d).", plan.extent, plan.width
-            )
+            self._record_encoder_dispatch(sum(plan.query_lens), len(plan.query_lens), rows)
         else:
             # Stale grid would silently mislay this step's tokens in `_preprocess`.
             self._encoder_grid = None
             if plan is not None:
                 self.spyre_encoder_slow_path_steps += 1
-                # No per-step detail in the args: info_once dedups on them, and the
-                # group multiset takes thousands of values.
-                logger.info_once(
-                    "Encoder slow path in use: a batch too wide for any rectangle. It "
-                    "costs per-layer data movement; see spyre_encoder_slow_path_steps "
-                    "for how often."
+                self._record_encoder_dispatch(
+                    sum(sum(group.query_lens) for group in plan),
+                    sum(group.group for group in plan),
+                    rows,
                 )
         return out
+
+    def _record_encoder_dispatch(self, real_tokens: int, num_seqs: int, rows: int) -> None:
+        """Accumulate the dispatch ratio and body occupancy, and log them periodically.
+
+        The counters live in the worker process, so a log line is the only way they
+        reach whoever is running a benchmark. Occupancy is the number worth watching:
+        the body is one fixed shape, so a step that is narrow or short pays for rows it
+        does not use, and that is the cost the fast path trades away per-layer data
+        movement for.
+        """
+        self.spyre_encoder_real_tokens += real_tokens
+        self.spyre_encoder_body_rows += rows
+        self.spyre_encoder_seqs += num_seqs
+        steps = self.spyre_encoder_fast_path_steps + self.spyre_encoder_slow_path_steps
+        if steps % _ENCODER_DISPATCH_LOG_EVERY:
+            return
+        logger.info(
+            "Encoder dispatch over %d steps: %d fast, %d slow; mean %.2f seqs/step; "
+            "body occupancy %.1f%% (%d real tokens in %d rows).",
+            steps,
+            self.spyre_encoder_fast_path_steps,
+            self.spyre_encoder_slow_path_steps,
+            self.spyre_encoder_seqs / steps,
+            100.0 * self.spyre_encoder_real_tokens / max(1, self.spyre_encoder_body_rows),
+            self.spyre_encoder_real_tokens,
+            self.spyre_encoder_body_rows,
+        )
 
     def _determine_batch_execution_and_padding(
         self,

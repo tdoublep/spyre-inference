@@ -146,7 +146,7 @@ def _pooling_vllm_config(
 
 
 class TestForPooling:
-    """Encoder attention is varlen flash; pooling gets the same 1D bucketer as decode."""
+    """Pooling gets the same 1D bucketer as decode, with a single entry."""
 
     def test_skips_non_pooling(self):
         assert SpyreShapeBucketer.for_pooling(_pooling_vllm_config(runner_type="generate")) is None
@@ -216,9 +216,7 @@ class TestEncoderBudget:
 
 class TestEncoderRectangles:
     def test_worked_example(self):
-        cfg = _pooling_vllm_config(
-            max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048
-        )
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
         assert encoder_rectangles(cfg) == [(64, 32), (128, 16), (256, 8), (512, 4)]
 
     def test_every_rectangle_is_exactly_the_budget(self):
@@ -231,18 +229,14 @@ class TestEncoderRectangles:
             assert {length * batch for length, batch in encoder_rectangles(cfg)} == {budget}
 
     def test_width_for_is_capped_by_max_num_seqs(self):
-        cfg = _pooling_vllm_config(
-            max_model_len=512, max_num_seqs=4, max_num_batched_tokens=2048
-        )
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=4, max_num_batched_tokens=2048)
         assert encoder_width_for(64, cfg) == 4  # 2048 // 64 = 32, capped
         assert encoder_width_for(512, cfg) == 4
 
 
 class TestEncoderGroupShapes:
     def test_worked_example_is_eighteen_pairs(self):
-        cfg = _pooling_vllm_config(
-            max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048
-        )
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
         groups = encoder_group_shapes(cfg)
         assert len(groups) == 18
         assert encoder_group_width_caps(cfg) == {64: 32, 128: 16, 256: 8, 512: 4}
@@ -254,15 +248,11 @@ class TestEncoderGroupShapes:
     def test_empty_when_the_fast_path_cannot_miss(self):
         """``max_num_seqs`` at or below ``R // longest length`` means every batch fits a
         rectangle, so the group family is unreachable and warming it is pure cost."""
-        cfg = _pooling_vllm_config(
-            max_model_len=512, max_num_seqs=4, max_num_batched_tokens=2048
-        )
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=4, max_num_batched_tokens=2048)
         assert encoder_group_shapes(cfg) == []
 
     def test_declared_shape_count_matches_the_plan(self):
-        cfg = _pooling_vllm_config(
-            max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048
-        )
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
         assert 1 + len(encoder_rectangles(cfg)) + len(encoder_group_shapes(cfg)) == 23
 
 
@@ -270,9 +260,7 @@ class TestEncoderDispatch:
     @pytest.fixture()
     def rectangles(self):
         return encoder_rectangles(
-            _pooling_vllm_config(
-                max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048
-            )
+            _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
         )
 
     @pytest.mark.parametrize(
