@@ -28,6 +28,8 @@ import bisect
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import torch
+
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
@@ -188,52 +190,50 @@ def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[i
     return sorted({min(size, cap) for size in bucket_sizes if size > 0})
 
 
-def expand_packed_to_encoder_bucket(
-    input_ids: list[int],
-    positions: list[int],
-    query_lens: list[int],
+def encoder_dense_row_indices(query_lens: Sequence[int], len_bucket: int) -> torch.Tensor:
+    """Dense row of every packed token: ``seq_idx * L + offset within the sequence``.
+
+    Both directions of the grid need it — the scatter that pads the batch out to
+    ``B * L`` and the gather that compacts the hidden states back — so it is built once
+    per step with tensor ops rather than a Python loop per row.
+    """
+    lens = torch.as_tensor(list(query_lens), dtype=torch.int64)
+    if lens.numel() == 0:
+        return torch.empty(0, dtype=torch.int64)
+    if int(lens.max()) > len_bucket:
+        raise ValueError(f"a query length exceeds len_bucket={len_bucket}: {list(query_lens)}")
+    # Each sequence's rows shift by a constant, so one `repeat_interleave` of the
+    # per-sequence shift beats gathering a start per token.
+    packed_starts = torch.cumsum(lens, 0) - lens
+    shifts = torch.arange(lens.numel(), dtype=torch.int64) * len_bucket - packed_starts
+    packed = torch.arange(int(lens.sum()), dtype=torch.int64)
+    return packed + torch.repeat_interleave(shifts, lens)
+
+
+def expand_packed_to_encoder_grid(
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    query_lens: Sequence[int],
     batch_bucket: int,
     len_bucket: int,
     pad_token_id: int = 0,
-) -> tuple[list[int], list[int]]:
-    """Pad each sequence to ``L`` and the batch to ``B``; return ``[B*L]`` lists.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pad each sequence to ``L`` and the batch to ``B``; return two ``[B*L]`` tensors.
 
-    Real pad tokens continue positions from the true length. Dummy sequences
-    (batch pad) are ``pad_token_id`` with positions ``0 .. L-1``.
+    Real pad tokens continue positions from the true length. Dummy sequences (batch pad)
+    are ``pad_token_id`` with positions ``0 .. L-1``. Both fall out of seeding the
+    position grid with a tiled ``arange`` and scattering the real rows over it.
     """
     if len(query_lens) > batch_bucket:
         raise ValueError(f"num_seqs={len(query_lens)} exceeds batch_bucket={batch_bucket}")
-    if any(length > len_bucket for length in query_lens):
-        raise ValueError(f"a query length exceeds len_bucket={len_bucket}: {query_lens}")
 
+    rows = encoder_dense_row_indices(query_lens, len_bucket)
     total = batch_bucket * len_bucket
-    padded_ids = [int(pad_token_id)] * total
-    padded_pos = [0] * total
-    src = 0
-    for seq_idx, length in enumerate(query_lens):
-        dst = seq_idx * len_bucket
-        padded_ids[dst : dst + length] = list(input_ids[src : src + length])
-        padded_pos[dst : dst + length] = list(positions[src : src + length])
-        for offset in range(length, len_bucket):
-            padded_pos[dst + offset] = offset
-        src += length
-    for seq_idx in range(len(query_lens), batch_bucket):
-        dst = seq_idx * len_bucket
-        for offset in range(len_bucket):
-            padded_pos[dst + offset] = offset
-    return padded_ids, padded_pos
-
-
-def encoder_bucket_valid_row_indices(
-    orig_query_lens: list[int],
-    len_bucket: int,
-) -> list[int]:
-    """Row indices of real tokens inside a ``B×L`` packed hidden state."""
-    indices: list[int] = []
-    for seq_idx, length in enumerate(orig_query_lens):
-        start = seq_idx * len_bucket
-        indices.extend(range(start, start + length))
-    return indices
+    ids = torch.full((total,), int(pad_token_id), dtype=input_ids.dtype)
+    ids[rows] = input_ids
+    positions_grid = torch.arange(len_bucket, dtype=positions.dtype).repeat(batch_bucket)
+    positions_grid[rows] = positions
+    return ids, positions_grid
 
 
 @dataclass(frozen=True)

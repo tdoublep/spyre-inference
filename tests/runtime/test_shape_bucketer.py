@@ -20,14 +20,15 @@ from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 from vllm.config import VllmConfig
 
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     encoder_body_sizes,
-    encoder_bucket_valid_row_indices,
+    encoder_dense_row_indices,
     encoder_warmup_shapes,
-    expand_packed_to_encoder_bucket,
+    expand_packed_to_encoder_grid,
     logits_row_buckets,
     next_bucket,
     pick_encoder_shape,
@@ -266,14 +267,25 @@ class TestEncoderBodySizes:
 
 
 class TestDenseExpansion:
+    @staticmethod
+    def _expand(input_ids, positions, query_lens, batch_bucket, len_bucket, pad_token_id=0):
+        ids, pos = expand_packed_to_encoder_grid(
+            torch.tensor(input_ids, dtype=torch.int32),
+            torch.tensor(positions, dtype=torch.int32),
+            query_lens,
+            batch_bucket,
+            len_bucket,
+            pad_token_id=pad_token_id,
+        )
+        return ids.tolist(), pos.tolist()
+
     def test_pads_each_sequence_to_l_and_the_batch_to_b(self):
-        ids, pos = expand_packed_to_encoder_bucket(
+        ids, pos = self._expand(
             input_ids=[1, 2, 3, 7, 8],
             positions=[0, 1, 2, 0, 1],
             query_lens=[3, 2],
             batch_bucket=3,
             len_bucket=4,
-            pad_token_id=0,
         )
         assert len(ids) == len(pos) == 12
         # Sequence 0 occupies rows 0..3, sequence 1 rows 4..7, dummy rows 8..11.
@@ -282,31 +294,34 @@ class TestDenseExpansion:
         assert ids[8:12] == [0, 0, 0, 0]
 
     def test_positions_continue_through_real_pad(self):
-        _ids, pos = expand_packed_to_encoder_bucket(
-            input_ids=[1, 2], positions=[0, 1], query_lens=[2], batch_bucket=1, len_bucket=4
-        )
+        _ids, pos = self._expand([1, 2], [0, 1], [2], 1, 4)
         assert pos == [0, 1, 2, 3]
 
     def test_dummy_sequences_get_their_own_position_range(self):
-        _ids, pos = expand_packed_to_encoder_bucket(
-            input_ids=[1], positions=[0], query_lens=[1], batch_bucket=2, len_bucket=3
-        )
+        _ids, pos = self._expand([1], [0], [1], 2, 3)
         assert pos[3:6] == [0, 1, 2]
+
+    def test_a_pad_token_id_fills_every_non_real_row(self):
+        ids, _pos = self._expand([5], [0], [1], 2, 2, pad_token_id=7)
+        assert ids == [5, 7, 7, 7]
 
     def test_rejects_a_batch_wider_than_the_bucket(self):
         with pytest.raises(ValueError, match="exceeds batch_bucket"):
-            expand_packed_to_encoder_bucket([1, 2], [0, 0], [1, 1], 1, 4)
+            self._expand([1, 2], [0, 0], [1, 1], 1, 4)
 
     def test_rejects_a_sequence_longer_than_the_bucket(self):
         with pytest.raises(ValueError, match="exceeds len_bucket"):
-            expand_packed_to_encoder_bucket([1, 2, 3], [0, 1, 2], [3], 1, 2)
+            self._expand([1, 2, 3], [0, 1, 2], [3], 1, 2)
 
-    def test_valid_row_indices_invert_the_expansion(self):
+    def test_dense_rows_invert_the_expansion(self):
         """The gather that re-compacts the grid before pooling."""
-        assert encoder_bucket_valid_row_indices([3, 2], 4) == [0, 1, 2, 4, 5]
+        assert encoder_dense_row_indices([3, 2], 4).tolist() == [0, 1, 2, 4, 5]
 
-    def test_valid_row_indices_skip_a_zero_length_sequence(self):
-        assert encoder_bucket_valid_row_indices([2, 0, 1], 4) == [0, 1, 8]
+    def test_dense_rows_skip_a_zero_length_sequence(self):
+        assert encoder_dense_row_indices([2, 0, 1], 4).tolist() == [0, 1, 8]
+
+    def test_dense_rows_of_an_empty_batch(self):
+        assert encoder_dense_row_indices([], 4).tolist() == []
 
 
 class TestNextBucket:
