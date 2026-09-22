@@ -52,6 +52,9 @@ logger = init_logger(__name__)
 # stick-alignment constant in this plugin holds for either.
 _SUPPORTED_DTYPES = frozenset({torch.float16, torch.bfloat16})
 
+_SCHEDULER_CLS = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
+_POOLING_SCHEDULER_CLS = "spyre_inference.v1.core.scheduler.PoolingSpyreScheduler"
+
 
 def _disable_torch_accelerator() -> None:
     # Spyre has no torch.accelerator device, so empty_cache()/synchronize()/
@@ -353,7 +356,7 @@ class TorchSpyrePlatform(CpuPlatform):
         scheduler_config.max_num_batched_tokens = compile_sizes[-1]
         # Set only to pass vLLM's max_model_len check earlier in startup.
         scheduler_config.enable_chunked_prefill = False
-        scheduler_config.scheduler_cls = "spyre_inference.v1.core.scheduler.PoolingSpyreScheduler"
+        scheduler_config.scheduler_cls = _POOLING_SCHEDULER_CLS
         # Widened explicitly: compile_sizes is declared list[int | str] | None.
         widened_sizes: list[int | str] = list(compile_sizes)
         vllm_config.compilation_config.compile_sizes = widened_sizes
@@ -666,9 +669,12 @@ class TorchSpyrePlatform(CpuPlatform):
         # ---- scheduler ----
         scheduler_config = vllm_config.scheduler_config
         # Caps how many sequences prefill in one batch (SPYRE_MAX_NUM_PARTIAL_PREFILLS).
-        scheduler_class = "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
-        logger.info("Loading scheduler from: %s", scheduler_class)
-        scheduler_config.scheduler_cls = scheduler_class
+        # `_apply_pooling_shape_defaults` may already have installed the pooling
+        # subclass earlier in this same `VllmConfig.__post_init__`; overwriting it here
+        # would drop the admission gate that keeps every batch on a declared shape.
+        if scheduler_config.scheduler_cls != _POOLING_SCHEDULER_CLS:
+            logger.info("Loading scheduler from: %s", _SCHEDULER_CLS)
+            scheduler_config.scheduler_cls = _SCHEDULER_CLS
 
         # Spyre can't offset- or shape-re-view one on-device KV buffer per layer
         # (torch-spyre#3770, "Unexpected stick expression"). Disabling the hybrid

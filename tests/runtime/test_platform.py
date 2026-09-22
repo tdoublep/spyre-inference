@@ -681,3 +681,65 @@ def test_configure_threading_raises_when_undetectable(monkeypatch):
 
     with pytest.raises(RuntimeError, match="SPYRE_NUM_CPUS"):
         configure_threading(worker_count=1)
+
+
+def _pooling_vllm_config(max_model_len=1024):
+    """Real ``VllmConfig`` for a pooling model, built through the full ``__post_init__``.
+
+    ``__post_init__`` calls ``apply_config_platform_defaults`` and then
+    ``check_and_update_config``, so this exercises the ordering a real pooling run sees.
+    """
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=max_model_len,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    object.__setattr__(model_config, "runner_type", "pooling")
+    return VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(block_size=64),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+
+
+def test_pooling_scheduler_survives_check_and_update_config():
+    """The admission gate must still be installed after *both* platform hooks run.
+
+    ``_apply_pooling_shape_defaults`` sets the pooling scheduler from
+    ``apply_config_platform_defaults``; ``check_and_update_config`` runs later in the
+    same ``VllmConfig.__post_init__`` and used to overwrite it unconditionally, which
+    left every real pooling run without the gate.
+    """
+    vllm_config = _pooling_vllm_config()
+
+    assert vllm_config.scheduler_config.scheduler_cls == (
+        "spyre_inference.v1.core.scheduler.PoolingSpyreScheduler"
+    )
+
+    # Idempotent: the hook runs again in the EngineCore subprocess.
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    TorchSpyrePlatform.check_and_update_config(vllm_config)
+    assert vllm_config.scheduler_config.scheduler_cls == (
+        "spyre_inference.v1.core.scheduler.PoolingSpyreScheduler"
+    )
+
+
+def test_generate_scheduler_is_unaffected_by_the_pooling_guard():
+    """Guarding the pooling class must not stop a decoder run getting its scheduler."""
+    model_config = ModelConfig(
+        model="Qwen/Qwen3-0.6B",
+        max_model_len=1024,
+        dtype=torch.float16,
+        trust_remote_code=True,
+    )
+    vllm_config = VllmConfig(
+        model_config=model_config,
+        cache_config=CacheConfig(block_size=64),
+        compilation_config=CompilationConfig(custom_ops=["all"]),
+    )
+
+    assert vllm_config.scheduler_config.scheduler_cls == (
+        "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
+    )
