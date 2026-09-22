@@ -102,7 +102,6 @@ from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
-    encoder_dense_row_indices,
     encoder_group_shapes,
     encoder_group_width_caps,
     encoder_len_ladder,
@@ -1294,12 +1293,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if grid is None:
             return hidden_states
         extent, width, query_lens = grid
-        rows = encoder_dense_row_indices(query_lens, extent)
+        # Host Python, not tensor ops: every extra CPU aten op on the per-step path
+        # lengthens the shared eager-op guard chain and costs more than the loop (#981).
+        rows_list: list[int] = []
+        for seq_idx, length in enumerate(query_lens):
+            start = seq_idx * extent
+            rows_list.extend(range(start, start + length))
         total = width * extent
-        if rows.numel() == total:
+        if len(rows_list) == total:
             return hidden_states
-        rows = torch.cat([rows, rows.new_zeros(total - rows.numel())])
-        return select_rows(hidden_states, rows)
+        rows_list = rows_list + [0] * (total - len(rows_list))
+        return select_rows(hidden_states, torch.tensor(rows_list, dtype=torch.int64, device="cpu"))
 
     def _preprocess(self, *args, **kwargs):
         """Expand the ragged body into the dense grid, on the fast path only.

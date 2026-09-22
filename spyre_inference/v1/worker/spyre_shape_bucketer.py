@@ -258,9 +258,8 @@ def encoder_fast_path_shape(
 def encoder_dense_row_indices(query_lens: Sequence[int], len_bucket: int) -> torch.Tensor:
     """Dense row of every packed token: ``seq_idx * L + offset within the sequence``.
 
-    Both directions of the grid need it -- the expansion that pads the batch out to
-    ``B * L`` and the gather that compacts the hidden states back -- so it is built
-    once per step with tensor ops rather than a Python loop per row.
+    Both directions of the grid build these rows inline in Python; this is the
+    independent statement of the layout the round-trip test gathers with.
     """
     lens = torch.as_tensor(list(query_lens), dtype=torch.int64)
     if lens.numel() == 0:
@@ -286,19 +285,34 @@ def expand_packed_to_encoder_grid(
     """Pad each sequence to ``L`` and the batch to ``B``; return two ``[B*L]`` tensors.
 
     Real pad tokens continue positions from the true length. Batch-pad sequences are
-    ``pad_token_id`` with positions ``0 .. L-1``. Both fall out of seeding the position
-    grid with a tiled ``arange`` and scattering the real rows over it.
+    ``pad_token_id`` with positions ``0 .. L-1``.
     """
     if len(query_lens) > batch_bucket:
         raise ValueError(f"num_seqs={len(query_lens)} exceeds batch_bucket={batch_bucket}")
 
-    rows = encoder_dense_row_indices(query_lens, len_bucket)
+    # Host Python, not tensor ops: every extra CPU aten op on the per-step path
+    # lengthens the shared eager-op guard chain and costs more than the loop (#981).
+    id_list = input_ids.tolist()
+    pos_list = positions.tolist()
     total = batch_bucket * len_bucket
-    ids = torch.full((total,), int(pad_token_id), dtype=input_ids.dtype)
-    ids[rows] = input_ids
-    positions_grid = torch.arange(len_bucket, dtype=positions.dtype).repeat(batch_bucket)
-    positions_grid[rows] = positions
-    return ids, positions_grid
+    padded_ids = [int(pad_token_id)] * total
+    padded_pos = [0] * total
+    src = 0
+    for seq_idx, length in enumerate(query_lens):
+        dst = seq_idx * len_bucket
+        padded_ids[dst : dst + length] = id_list[src : src + length]
+        padded_pos[dst : dst + length] = pos_list[src : src + length]
+        for offset in range(length, len_bucket):
+            padded_pos[dst + offset] = offset
+        src += length
+    for seq_idx in range(len(query_lens), batch_bucket):
+        dst = seq_idx * len_bucket
+        for offset in range(len_bucket):
+            padded_pos[dst + offset] = offset
+    return (
+        torch.tensor(padded_ids, dtype=input_ids.dtype),
+        torch.tensor(padded_pos, dtype=positions.dtype),
+    )
 
 
 def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[int]:
