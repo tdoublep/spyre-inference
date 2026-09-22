@@ -29,7 +29,6 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 import torch
-
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
