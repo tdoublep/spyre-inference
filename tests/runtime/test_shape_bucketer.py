@@ -197,6 +197,26 @@ class TestEncoderWarmupShapes:
             config.scheduler_config.max_num_batched_tokens = encoder_body_sizes(first)[-1]
             assert encoder_warmup_shapes(config) == first, args
 
+    def test_the_memo_hands_out_a_fresh_list(self):
+        """Four call sites re-derive the same shapes; none may mutate another's copy."""
+        config = _pooling_config(512, 8, 4096)
+        first = encoder_warmup_shapes(config)
+        first.append((1, 1))
+        assert encoder_warmup_shapes(config) == [(512, 8)]
+
+    def test_the_memo_follows_the_environment(self, monkeypatch):
+        """Same config, different ladder: the memo key carries the env values."""
+        from spyre_inference import envs
+
+        config = _pooling_config(256, 2, 512)
+        assert encoder_warmup_shapes(config) == [(256, 2)]
+        monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "128,256")
+        envs.clear_env_cache()
+        try:
+            assert encoder_warmup_shapes(config) == [(128, 2), (256, 2)]
+        finally:
+            envs.clear_env_cache()
+
     def test_reads_the_environment(self, monkeypatch):
         from spyre_inference import envs
 

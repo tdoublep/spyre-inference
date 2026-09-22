@@ -87,6 +87,13 @@ def _resolve_encoder_buckets(
     return kept
 
 
+# Memo for `encoder_warmup_shapes`. The platform hook, the scheduler, the runner and
+# every attention layer all re-derive the same list from the same config, so a
+# per-layer model paid for it once per layer at startup. Keyed on the inputs, env
+# values included, so nothing goes stale.
+_ENCODER_SHAPES_MEMO: dict[tuple, list[tuple[int, int]]] = {}
+
+
 def encoder_warmup_shapes(
     vllm_config: VllmConfig,
     *,
@@ -99,6 +106,20 @@ def encoder_warmup_shapes(
     bounds the width. Idempotent once the caller writes that width back to
     ``max_num_seqs`` (``TorchSpyrePlatform._apply_pooling_shape_defaults``).
     """
+    memo_key = (
+        int(vllm_config.model_config.max_model_len),
+        int(vllm_config.scheduler_config.max_num_batched_tokens),
+        int(vllm_config.scheduler_config.max_num_seqs),
+        envs.SPYRE_ATTN_QUERY_BUCKETS,
+        envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
+        None if length_buckets is None else tuple(length_buckets),
+        None if num_seqs_buckets is None else tuple(num_seqs_buckets),
+    )
+    memoized = _ENCODER_SHAPES_MEMO.get(memo_key)
+    if memoized is not None:
+        # A copy: callers own the list they get back.
+        return list(memoized)
+
     max_model_len = int(vllm_config.model_config.max_model_len)
     # Encoder prefill cannot be chunked, so a budget under max_model_len head-of-line
     # blocks the scheduler forever.
@@ -119,10 +140,12 @@ def encoder_warmup_shapes(
         limit=width_limit,
         align=False,
     )
-    return sorted(
+    shapes = sorted(
         {(length, batch) for length in lengths for batch in widths},
         key=lambda pair: (pair[1], pair[0]),
     )
+    _ENCODER_SHAPES_MEMO[memo_key] = shapes
+    return list(shapes)
 
 
 def encoder_shape_covers(shape: tuple[int, int], num_seqs: int, max_len: int) -> bool:
