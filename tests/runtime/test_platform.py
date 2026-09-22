@@ -206,29 +206,72 @@ def test_num_gpu_blocks_override_skipped_for_pooling():
     assert vllm_config.cache_config.num_gpu_blocks_override is None
 
 
-def test_apply_config_sets_pooling_compile_sizes_from_token_cap():
-    """Pooling body T lives on compile_sizes; attention L is independent."""
+def _pooling_platform_config(
+    *, max_model_len=512, max_num_seqs=32, max_num_batched_tokens=512
+):
     from unittest.mock import MagicMock
 
     from vllm.config import CompilationMode
 
-    from spyre_inference.platform import TorchSpyrePlatform
-
     vllm_config = MagicMock()
     vllm_config.model_config.enforce_eager = False
     vllm_config.model_config.runner_type = "pooling"
-    vllm_config.model_config.max_model_len = 512
-    vllm_config.scheduler_config.max_num_batched_tokens = 512
+    vllm_config.model_config.max_model_len = max_model_len
+    vllm_config.scheduler_config.max_num_seqs = max_num_seqs
+    vllm_config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
     vllm_config.compilation_config.custom_ops = ["all"]
     # Empty list is falsy, so the platform generates pooling defaults.
     # A MagicMock here is truthy and would skip that path (#638).
     vllm_config.compilation_config.compile_sizes = []
+    return vllm_config
+
+
+def test_apply_config_gives_pooling_one_body_shape():
+    """The whole point of fixing the body at the budget: one compile size, so the
+    encoder attention kernels key on the sequence shapes alone."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_num_batched_tokens=512)
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
-    # The ladder starts at ENCODER_MIN_BODY_BUCKET, not at one stick: each body
-    # bucket multiplies the attention warmup sweep, which is keyed on buffer_rows.
-    assert vllm_config.compilation_config.compile_sizes == [256, 512]
+    assert vllm_config.compilation_config.compile_sizes == [512]
     assert vllm_config.scheduler_config.max_num_batched_tokens == 512
+
+
+def test_apply_config_floors_the_pooling_budget_at_max_model_len():
+    """Encoder prefill cannot be chunked, so a budget below max_model_len would
+    head-of-line block the scheduler forever."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_model_len=512, max_num_batched_tokens=256)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 512
+    assert vllm_config.compilation_config.compile_sizes == [512]
+
+
+def test_apply_config_caps_the_pooling_budget_at_the_measured_argmax():
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_model_len=512, max_num_batched_tokens=8192)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 2048
+
+
+def test_apply_config_clamps_pooling_max_num_seqs_to_the_widest_rectangle():
+    """``max_num_seqs`` above ``budget // 64`` asks for a batch no rectangle holds."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_num_seqs=64, max_num_batched_tokens=512)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.scheduler_config.max_num_seqs == 8  # 512 // 64
+
+
+def test_apply_config_leaves_a_fitting_pooling_max_num_seqs_alone():
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_num_seqs=4, max_num_batched_tokens=2048)
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.scheduler_config.max_num_seqs == 4
 
 
 def _fake_pad_config(head_dim=64, num_heads=8, *, transformers_backend=False, **rope_attrs):

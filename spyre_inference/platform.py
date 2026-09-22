@@ -351,6 +351,7 @@ class TorchSpyrePlatform(CpuPlatform):
             encoder_budget_rows,
             encoder_group_shapes,
             encoder_rectangles,
+            encoder_shape_tables,
         )
 
         scheduler_config = vllm_config.scheduler_config
@@ -359,28 +360,37 @@ class TorchSpyrePlatform(CpuPlatform):
         prev_num_seqs = scheduler_config.max_num_seqs
 
         # 2048 is the measured throughput argmax across pooling models; they regress
-        # above it. `encoder_budget_rows` then floors it at the longest declared
-        # length, which vLLM's own verify_max_model_len (run before this hook) cannot
-        # do for us.
-        budget = encoder_budget_rows(
-            max_model_len, min(prev_budget, cls._POOLING_MAX_BATCHED_TOKENS)
+        # above it. `encoder_budget_rows` then floors it at the longest declared length,
+        # which vLLM's own verify_max_model_len (run before this hook) cannot do for us,
+        # and caps it at what `max_num_seqs` sequences could actually carry.
+        scheduler_config.max_num_batched_tokens = min(
+            prev_budget, cls._POOLING_MAX_BATCHED_TOKENS
         )
-        scheduler_config.max_num_batched_tokens = budget
 
         # Config normalisation, not scheduling. The shortest length carries the widest
-        # rectangle, so this makes the widest declared width equal `max_num_seqs` and
-        # no batch ever needs more width than the ladder offers.
-        widest = max(1, budget // ENCODER_SEQ_ALIGNMENT)
+        # rectangle, so this makes the widest declared width equal `max_num_seqs` and no
+        # batch ever needs more width than the ladder offers.
+        widest = max(
+            1,
+            encoder_budget_rows(
+                max_model_len, scheduler_config.max_num_batched_tokens, prev_num_seqs
+            )
+            // ENCODER_SEQ_ALIGNMENT,
+        )
         if prev_num_seqs > widest:
             logger.warning(
-                "Lowering pooling max_num_seqs %d -> %d: a %d-token budget holds at "
-                "most that many sequences even at the shortest declared length. Raise "
+                "Lowering pooling max_num_seqs %d -> %d: the token budget holds at most "
+                "that many sequences even at the shortest declared length. Raise "
                 "--max-num-batched-tokens to widen it.",
                 prev_num_seqs,
                 widest,
-                budget,
             )
             scheduler_config.max_num_seqs = widest
+
+        # Read back off the tables, not recomputed, so the scheduler's limit and the
+        # shapes the runner dispatches on cannot drift apart.
+        budget = encoder_shape_tables(vllm_config).budget
+        scheduler_config.max_num_batched_tokens = budget
 
         # One body shape. Every rectangle is exactly `budget` rows and the slow path
         # packs into the same buffer, so the attention kernels key on the sequence

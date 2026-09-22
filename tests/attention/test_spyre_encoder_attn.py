@@ -33,10 +33,18 @@ from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     _alignment_units_for,
     _encoder_gather_kernel,
     _encoder_sdpa_kernel,
+    EncoderRectPlan,
+    build_encoder_plan,
     encoder_index_dtype,
-    encoder_mask,
+    encoder_key_pad_mask,
     encoder_row_table,
 )
+from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_dense_row_indices
+
+
+def encoder_mask(extent: int, kv_len: int, dtype: torch.dtype) -> torch.Tensor:
+    """Single-sequence mask, the shape these tests were written against."""
+    return encoder_key_pad_mask(extent, [kv_len], dtype)
 
 # extra `encoder_attention` mark so CI can split this into its own job
 # because these tests are pretty slow.
@@ -316,7 +324,7 @@ def test_alignment_units_for_rounds_up_to_powers_of_two():
 
 def test_encoder_mask_cuts_at_the_boundary_block():
     mask = encoder_mask(3 * ENCODER_LEN_ALIGNMENT, 100, torch.float32)
-    masked = torch.finfo(torch.float32).min
+    masked = torch.finfo(torch.float32).min / 2
     # Head and query axes stay 1 and broadcast: an encoder mask depends only on
     # the KV column, so it need not be materialised per head.
     assert mask.shape == (1, 1, 1, 3 * ENCODER_LEN_ALIGNMENT)
@@ -679,7 +687,7 @@ def test_single_sequence_exactly_filling_the_buffer_handles_a_fused_qkv_view(
 
 
 @torch.inference_mode()
-def test_encoder_seq_plans_built_once_and_reused_across_layers(default_vllm_config) -> None:
+def test_encoder_plan_built_once_and_reused_across_layers(default_vllm_config) -> None:
     """Second layer's forward() must reuse the first layer's plans, not rebuild them."""
     torch.set_default_device("cpu")
     set_random_seed(0)
@@ -721,13 +729,13 @@ def test_encoder_seq_plans_built_once_and_reused_across_layers(default_vllm_conf
         attn_metadata=attn_metadata,
     )
     impl.forward(**fwd, output=torch.empty_like(query))
-    cached_plans = attn_metadata.encoder_seq_plans
+    cached_plans = attn_metadata.encoder_plan
     assert cached_plans is not None
     assert len(cached_plans) == 1
     assert cached_plans[0].query_lens == [32]
 
     impl.forward(**fwd, output=torch.empty_like(query))
-    assert attn_metadata.encoder_seq_plans is cached_plans
+    assert attn_metadata.encoder_plan is cached_plans
 
 
 def _profile_metadata(spec_cls, *, max_model_len: int, prompt_len: int, num_seqs: int):
@@ -881,7 +889,7 @@ def test_grouped_attention_matches_the_per_sequence_reference(
     )
 
     if batched:
-        assert any(getattr(p, "group", 1) > 1 for p in attn_metadata.encoder_seq_plans), (
+        assert any(getattr(p, "group", 1) > 1 for p in attn_metadata.encoder_plan), (
             "grouping was enabled but every plan stayed a single sequence"
         )
 
@@ -891,6 +899,133 @@ def test_grouped_attention_matches_the_per_sequence_reference(
     assert_close_outliers(
         output.to("cpu"),
         ref_output,
+        max_outliers=8,
+        atol=0.3,
+        rtol=0.2,
+        outlier_atol=0.6,
+        outlier_rtol=0.4,
+    )
+
+
+@pytest.mark.parametrize("configure_device", ["cpu", "spyre"], indirect=True)
+@pytest.mark.parametrize("configure_compilation", ["STOCK_TORCH_COMPILE"], indirect=True)
+@pytest.mark.parametrize(
+    "query_lens",
+    [
+        pytest.param([64, 64, 64, 64], id="uniform_full_extent"),
+        pytest.param([40, 64, 17, 64], id="ragged_within_one_extent"),
+        pytest.param([100, 30, 128, 7], id="ragged_across_extents"),
+        pytest.param([64], id="single_request"),
+        # Fewer requests than the rectangle is wide, so batch-pad lanes are live.
+        pytest.param([50, 60], id="batch_pad_lanes"),
+    ],
+)
+@torch.inference_mode()
+def test_fast_and_slow_paths_agree(
+    default_vllm_config,
+    query_lens: list[int],
+    configure_compilation: str,
+    configure_device: str,
+) -> None:
+    """The same batch down both paths must give the same answer.
+
+    This is what keeps the slow path a fallback rather than a second implementation
+    that silently diverges. The two see different inputs by construction -- the fast
+    path a dense ``[B, L]`` grid, the slow path the packed list -- so the test builds
+    both from one set of activations and compares only the real token rows.
+    """
+    num_heads, num_kv_heads, head_size, block_size = 12, 12, 64, 64
+    dtype = torch.float16
+    device = torch.device(configure_device)
+    torch.set_default_device("cpu")
+    set_random_seed(0)
+
+    extent = _alignment_units_for(max(query_lens)) * ENCODER_LEN_ALIGNMENT
+    width = len(query_lens)
+    scale = head_size**-0.5
+
+    def make_impl():
+        return SpyreEncoderAttentionImpl(
+            num_heads=num_heads,
+            head_size=head_size,
+            scale=scale,
+            num_kv_heads=num_kv_heads,
+            alibi_slopes=None,
+            sliding_window=None,
+            kv_cache_dtype="auto",
+            logits_soft_cap=None,
+        )
+
+    def metadata(lens):
+        cu = torch.tensor([0] + list(lens), dtype=torch.int32).cumsum(dim=0, dtype=torch.int32)
+        return _build_metadata(
+            num_query_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            block_size=block_size,
+            seq_lens=torch.tensor(list(lens), dtype=torch.int32),
+            query_start_loc=cu,
+            block_table=torch.zeros(len(lens), extent // block_size, dtype=torch.int32),
+            slot_mapping=torch.arange(sum(lens), dtype=torch.int64),
+        )
+
+    kv_cache = SpyrePagedKVCache(k_pages=torch.empty(0), v_pages=torch.empty(0))
+
+    # One set of activations, laid out both ways. Grid row `s * extent + i` is packed
+    # row `cumsum(lens)[s] + i`; pad rows are zero and their outputs are dropped.
+    packed_q = torch.randn(sum(query_lens), num_heads, head_size, dtype=dtype)
+    packed_k = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
+    packed_v = torch.randn(sum(query_lens), num_kv_heads, head_size, dtype=dtype)
+
+    rows = encoder_dense_row_indices(query_lens, extent)
+
+    def to_grid(packed, heads):
+        grid = torch.zeros(width * extent, heads, head_size, dtype=dtype)
+        grid[rows] = packed
+        return grid
+
+    # Slow path: metadata carries no plan, so the impl builds a packed one.
+    slow_md = metadata(query_lens)
+    slow_out = _vllm_style_output(packed_q, device)
+    make_impl().forward(
+        layer=None,
+        query=convert(packed_q, device),
+        key=convert(packed_k, device),
+        value=convert(packed_v, device),
+        kv_cache=kv_cache,
+        attn_metadata=slow_md,
+        output=slow_out,
+    )
+    assert not isinstance(slow_md.encoder_plan, EncoderRectPlan), "expected the packed path"
+
+    # Fast path: the runner would have padded the body and laid out the grid, so the
+    # plan is built here with the covering rectangle declared.
+    grid_q = to_grid(packed_q, num_heads)
+    fast_md = metadata(query_lens)
+    fast_md.encoder_plan = build_encoder_plan(
+        fast_md,
+        rectangles=[(extent, width)],
+        width_cap_for={},
+        device=device,
+        dtype=dtype,
+        batched=True,
+    )
+    assert isinstance(fast_md.encoder_plan, EncoderRectPlan), "expected the rectangle path"
+    fast_out = _vllm_style_output(grid_q, device)
+    make_impl().forward(
+        layer=None,
+        query=convert(grid_q, device),
+        key=convert(to_grid(packed_k, num_kv_heads), device),
+        value=convert(to_grid(packed_v, num_kv_heads), device),
+        kv_cache=kv_cache,
+        attn_metadata=fast_md,
+        output=fast_out,
+    )
+
+    # Only the real token rows: pad rows differ by construction and nothing reads them.
+    assert_close_outliers(
+        fast_out.to("cpu")[rows],
+        slow_out.to("cpu"),
         max_outliers=8,
         atol=0.3,
         rtol=0.2,
