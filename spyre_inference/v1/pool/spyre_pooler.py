@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 import torch.nn as nn
 from vllm.logger import init_logger
@@ -34,10 +36,7 @@ from vllm.model_executor.layers.pooler.tokwise.poolers import TokenPooler
 from vllm.v1.outputs import PoolerOutput
 
 from spyre_inference.custom_ops.utils import convert
-from spyre_inference.v1.worker.spyre_shape_bucketer import (
-    default_encoder_len_buckets,
-    next_bucket,
-)
+from spyre_inference.v1.worker.spyre_shape_bucketer import next_bucket
 
 logger = init_logger(__name__)
 
@@ -501,7 +500,7 @@ def patch_pooler_for_spyre(
 
 
 def configure_pooling_for_spyre(
-    model: nn.Module, spyre_device: torch.device, max_model_len: int | None = None
+    model: nn.Module, spyre_device: torch.device, len_ladder: Sequence[int] | None = None
 ) -> bool:
     """Patch CLS/LAST/MEAN/token AllPool. True if hidden states stay on Spyre.
 
@@ -510,19 +509,19 @@ def configure_pooling_for_spyre(
     is garbage (torch-spyre#2971). False if the method is unknown or the
     head is an FP32 linear.
 
-    ``max_model_len`` builds the token-count ladder handed to ``SpyreAllPool``.
-    It is a parameter rather than a ``get_current_vllm_config()`` lookup inside
-    the pooler because only the caller is guaranteed to run inside a
-    ``set_current_vllm_config`` context; token pooling degrades to plain stick
-    alignment without it.
+    ``len_ladder`` is the declared prompt lengths, the only widths a request can be
+    padded to and so the right token-count ladder for ``SpyreAllPool``'s bucketed
+    gather. Passed in rather than re-derived here: only the caller is guaranteed to run
+    inside a ``set_current_vllm_config`` context, and token pooling degrades to plain
+    stick alignment without it.
     """
     pooler = getattr(model, "pooler", None)
     if pooler is None:
         logger.info("Pooling: model has no pooler; leaving outputs on CPU")
         return False
 
-    len_ladder = default_encoder_len_buckets(max_model_len) if max_model_len else []
-    num_patched, unsupported = patch_pooler_for_spyre(pooler, len_ladder)
+    ladder = sorted(set(len_ladder)) if len_ladder else []
+    num_patched, unsupported = patch_pooler_for_spyre(pooler, ladder)
     if unsupported or num_patched == 0:
         reason = ", ".join(sorted(set(unsupported))) if unsupported else type(pooler).__name__
         logger.info(
@@ -535,11 +534,11 @@ def configure_pooling_for_spyre(
     classifier = getattr(model, "classifier", None)
     token_level = any(isinstance(m, SpyreAllPool) for m in pooler.modules())
     if token_level:
-        if not len_ladder:
+        if not ladder:
             logger.warning(
-                "Pooling: token pooling has no length ladder (max_model_len was "
-                "not passed); gathers round to every 64-multiple instead of the "
-                "power-of-two buckets, so more shapes compile than necessary"
+                "Pooling: token pooling has no length ladder (none was passed); "
+                "gathers round to every 64-multiple instead of the declared "
+                "lengths, so more shapes compile than necessary"
             )
         prepare_token_head_for_spyre(model, pooler, spyre_device)
 
