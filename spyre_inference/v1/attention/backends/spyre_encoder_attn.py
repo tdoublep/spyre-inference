@@ -15,32 +15,22 @@
 """Encoder-only (bidirectional) self-attention for Spyre, without a KV cache.
 
 Selected by ``TorchSpyrePlatform.get_attn_backend_cls`` for ENCODER/ENCODER_ONLY
-layers. Operates on direct Q/K/V rather than the paged KV-cache path.
+layers. Two paths over one body buffer of ``R`` rows (``encoder_budget_rows``): a
+rectangle, when the batch fits one, where Q/K/V already *are* the ``[B, L]`` grid the
+runner laid out; otherwise the packed buffer, with requests grouped by their own extent
+and each group a fused gather/attend/scatter. The runner picks once per step and records
+the choice as the type of ``attn_metadata.encoder_plan``, so no compiled region branches
+on it. Both paths cross the opaque ``unified_attention_with_output``, so the enclosing
+block graph is identical for either.
 
-Two paths over one body buffer of ``R`` rows (``encoder_budget_rows``):
-
-* **Fast path** -- the batch fits a rectangle. The runner has already padded every
-  sequence to ``L`` and the batch to ``B = R / L``, so Q/K/V *are* the grid: one
-  reshape, one SDPA, one store, no data movement inside the layer.
-* **Slow path** -- the batch is too wide for any rectangle. Q/K/V stay packed and
-  requests are grouped by their own extent; each group is one fused
-  gather/attend/scatter.
-
-The runner picks between them once per step and records the choice as the *type* of
-``attn_metadata.encoder_plan``, so there is no branch inside a compiled region and no
-dynamo guard on the path. Both paths reach this impl through the opaque
-``unified_attention_with_output``, which means the enclosing block graph is identical
-for both -- one shape, shared.
-
-Three torch-spyre constraints shape the design, all load-bearing:
+Three torch-spyre constraints shape the design:
 
 * A compiled region reads its arguments from offset 0 and ignores ``storage_offset``
-  (#3770), so a sequence is gathered with ``index_select`` rather than sliced.
-* There is no on-device ``arange`` or ``full``, so every index and mask tensor is
-  built on the host and ``convert``'d, whole, in one call per plan.
-* SDPA's decomposition does ``amax`` then ``exp(scores - max)``, which NaNs a fully
-  masked row. Hence the mask fill of ``finfo.min / 2`` and the single attendable key
-  a batch-pad lane is given.
+  (#3770), so rows are gathered with ``index_select`` rather than sliced.
+* There is no on-device ``arange`` or ``full``, so index and mask tensors are host-built
+  and reach the device in one ``convert`` per plan.
+* SDPA decomposes to ``amax`` then ``exp(scores - max)``, which NaNs a fully masked row.
+  Hence the ``finfo.min / 2`` mask fill and the one attendable key a pad lane gets.
 """
 
 from __future__ import annotations
@@ -158,12 +148,6 @@ def _host_pad_head_dim(x: torch.Tensor, padded: int) -> torch.Tensor:
     on_host = convert(x, "cpu") if device.type == "spyre" else x
     on_host = F.pad(on_host.contiguous(), (0, padded - x.shape[-1]))
     return convert(on_host, device) if device.type == "spyre" else on_host
-
-
-# --------------------------------------------------------------------------
-# Kernels. Compiled once at module import; the impl picks the eager original
-# under enforce_eager.
-# --------------------------------------------------------------------------
 
 
 def _encoder_rect_kernel(
@@ -319,11 +303,6 @@ for _kernel in (
     compile_guard.watch(_kernel, f"encoder attention kernel {_kernel.__name__}")
 
 
-# --------------------------------------------------------------------------
-# Per-step plans. The type is the path.
-# --------------------------------------------------------------------------
-
-
 @dataclass
 class EncoderRectPlan:
     """Fast path: the whole batch is one ``[width, extent]`` rectangle."""
@@ -367,10 +346,8 @@ def build_encoder_plan(
 ) -> EncoderRectPlan | list[EncoderGroupPlan]:
     """Choose the path for this step and build what its kernels need.
 
-    Module-level and query-free so the model runner can call it before the model
-    runs. Inside a traced region its D2H reads and H2D converts would become graph
-    nodes -- that is how the RoBERTa position offset ends up as a ``to_dtype_cpu``
-    fallback.
+    Module-level and query-free so the runner can call it before the model runs: inside
+    a traced region its D2H reads and H2D converts would become graph nodes.
 
     ``query_start_loc``, not ``seq_lens``: query length *is* kv length here, and
     upstream's ``_dummy_run`` puts the whole padded token count in ``seq_lens``.
@@ -390,10 +367,8 @@ def build_encoder_plan(
         members.append((start, query_len, min(int(seq_lens[seq_idx]), query_len)))
 
     max_len = max((m[1] for m in members), default=0)
-    # A dropped request would shift every later sequence's lane, and the pooler
-    # addresses rows by its own cumsum over *all* requests -- so the grid would be
-    # silently misaligned rather than merely padded. The packed path indexes by
-    # absolute row and does not care.
+    # A dropped request shifts every later lane, and the pooler addresses rows by its
+    # own cumsum over all requests, so the grid would be misaligned rather than padded.
     rect = (
         encoder_fast_path_shape(len(members), max_len, rectangles)
         if len(members) == attn_metadata.num_seqs
@@ -419,9 +394,8 @@ def build_encoder_plan(
     index_dtype = encoder_index_dtype(device)
 
     def plan(chunk: list[tuple[int, int, int]], extent: int) -> EncoderGroupPlan:
-        # Pad lanes of the row table repeat the sequence's last real row, so the
-        # scatter writes that row several times. Sound only because the mask ignores
-        # the query axis, which makes every duplicate carry the same value.
+        # The row table's pad lanes repeat the last real row, so the scatter writes it
+        # several times. Sound only because the mask ignores the query axis.
         assert all(m[1] >= 1 for m in chunk), "a zero-length request has no row to clamp onto"
         return EncoderGroupPlan(
             starts=[m[0] for m in chunk],
@@ -441,11 +415,8 @@ def build_encoder_plan(
         if not batched:
             plans.extend(plan([m], extent) for m in group)
             continue
-        # Descending power-of-two chunks rather than padding up to one: padding a
-        # group up to `cap` would attend phantom sequences, and a step has several
-        # groups. The cap is the widest declared width at this extent, so every
-        # chunk lands on a pair warmup covered. Defaulting to 1 rather than raising
-        # keeps a step the tables called unreachable correct, at one compile.
+        # Descending power-of-two chunks, not padding up to `cap`: padding would attend
+        # phantom sequences. Default 1 keeps an undeclared extent correct, at one compile.
         cap = width_cap_for.get(extent, 1)
         offset = 0
         while offset < len(group):
@@ -571,21 +542,15 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         num_kv_heads: int,
         head_size: int,
     ) -> int:
-        """Trace every declared shape: one rectangle per length, one group per pair.
+        """Trace every declared shape, on the caller's own tensors.
 
-        Called from the first ``forward`` of warmup's single body-shape dummy run,
-        which is what makes this affordable -- 22 kernel traces rather than 22 model
-        forwards -- and, more importantly, correct: a Spyre tensor's device layout is
-        part of its cache key, and both a fused-QKV ``query`` (a strided view) and
-        ``output`` (a view of a 2-D allocation) have layouts a same-shaped fresh
-        tensor does not reproduce. Warming therefore writes into the caller's own
-        ``output``; safe because the real work right after overwrites every real
-        request's rows and the rest is padding.
+        A Spyre tensor's device layout is part of its cache key, and neither a fused-QKV
+        ``query`` (a strided view) nor ``output`` (a view of a 2-D allocation) is
+        reproduced by a same-shaped fresh tensor. Writing into the caller's ``output`` is
+        safe: the real work right after overwrites every real request's rows.
 
-        A buffer that is not the declared body shape warms nothing: every declared
-        shape is sized against that one buffer, so a smaller one would index out of
-        bounds, and serving never presents a different one -- only a caller that
-        bypasses the runner's bucketing does.
+        A buffer that is not the declared body shape warms nothing -- every declared
+        shape is sized against that one buffer, so a smaller one indexes out of bounds.
         """
         if self._warmed or query.shape[0] != self._buffer_rows:
             return 0
@@ -638,9 +603,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         if attn_metadata is None:
             return output
 
-        # Anything compiled since the previous kernel call happened in the body (or
-        # the pooler, for the first layer of a step) -- attribute it here so it is
-        # not silently missed.
+        # Attribute compiles since the last kernel call to the body or pooler.
         note_unattributed_compiles("model body / pooler")
 
         num_heads = query.shape[1]
@@ -656,14 +619,9 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
         plan = attn_metadata.encoder_plan
         if plan is None:
-            # The runner builds the plan off the traced path; this is the fallback for
-            # a caller that did not (unit tests, and any upstream path that bypasses
-            # the runner override). After the device alignment above, so the row tables
-            # and masks land where the activations are.
-            #
-            # Slow path only, never a rectangle: the grid layout is a contract with
-            # ``_preprocess``, so choosing a rectangle the runner did not lay out would
-            # read the wrong rows rather than merely run slower.
+            # Fallback for a caller that did not pre-build one. Slow path only: the grid
+            # layout is a contract with ``_preprocess``, so a rectangle the runner did
+            # not lay out would read the wrong rows.
             plan = build_encoder_plan(
                 attn_metadata,
                 rectangles=(),
@@ -694,8 +652,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             )
             head_size += head_pad
 
-        # Folds the per-layer eager store into the attention jobplan. Re-checked per
-        # call: vLLM hands out a fresh buffer per layer.
+        # Re-checked per call: vLLM hands out a fresh output buffer per layer.
         fused_store_ok = (
             self._compile_attn
             and output.dtype == query.dtype

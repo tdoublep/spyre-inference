@@ -373,11 +373,9 @@ class SpyreAttentionMetadata(AttentionMetadata):
     mask_by_chunk_cpu: torch.Tensor | None = None  # [num_chunks, entries * KV, 1, block] fp16
     mask_by_chunk_dev: torch.Tensor | None = None
 
-    # Encoder-only (no KV cache) precomputes: an EncoderRectPlan (fast path) or a
-    # list of EncoderGroupPlan (slow path), holding the step's device row tables
-    # and masks. Which one it is *is* the path selection, made once per step by the
-    # runner and read by every encoder layer. Typed loosely because the encoder
-    # backend imports from this module, not the other way round.
+    # An EncoderRectPlan (fast path) or a list of EncoderGroupPlan (slow path); which
+    # one it is *is* the path selection. Typed loosely: the encoder backend imports from
+    # this module, not the other way round.
     encoder_plan: object | None = None
 
     @property

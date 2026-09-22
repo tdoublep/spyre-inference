@@ -136,9 +136,7 @@ class TorchSpyrePlatform(CpuPlatform):
     # `pre_register_and_update`.
     _DEFAULT_MAX_NUM_SEQS = 4
 
-    # Ceiling on the pooling token budget, which is also the body's row count and the
-    # area of every fast-path rectangle. 2048 is the measured throughput argmax across
-    # pooling models; they regress above it.
+    # Measured throughput argmax across pooling models; they regress above it.
     _POOLING_MAX_BATCHED_TOKENS = 2048
 
     # Paged attention needs a KV block that is a multiple of 64 (128-byte stick /
@@ -394,15 +392,12 @@ class TorchSpyrePlatform(CpuPlatform):
         prev_budget = scheduler_config.max_num_batched_tokens
         prev_num_seqs = scheduler_config.max_num_seqs
 
-        # 2048 is the measured throughput argmax across pooling models; they regress
-        # above it. `encoder_budget_rows` then floors it at the longest declared length,
-        # which vLLM's own verify_max_model_len (run before this hook) cannot do for us,
-        # and caps it at what `max_num_seqs` sequences could actually carry.
+        # vLLM's verify_max_model_len runs before this hook, so the floor
+        # `encoder_budget_rows` applies is not checked for us.
         scheduler_config.max_num_batched_tokens = min(prev_budget, cls._POOLING_MAX_BATCHED_TOKENS)
 
-        # Config normalisation, not scheduling. The shortest length carries the widest
-        # rectangle, so this makes the widest declared width equal `max_num_seqs` and no
-        # batch ever needs more width than the ladder offers.
+        # The shortest length carries the widest rectangle, so no batch ever needs more
+        # width than the ladder offers.
         widest = max(
             1,
             encoder_budget_rows(
@@ -420,14 +415,12 @@ class TorchSpyrePlatform(CpuPlatform):
             )
             scheduler_config.max_num_seqs = widest
 
-        # Read back off the tables, not recomputed, so the scheduler's limit and the
-        # shapes the runner dispatches on cannot drift apart.
+        # Off the tables, not recomputed, so the limit and the dispatch shapes agree.
         budget = encoder_shape_tables(vllm_config).budget
         scheduler_config.max_num_batched_tokens = budget
 
-        # One body shape. Every rectangle is exactly `budget` rows and the slow path
-        # packs into the same buffer, so the attention kernels key on the sequence
-        # shapes alone rather than on the step's buffer size as well.
+        # One body shape: every rectangle is exactly `budget` rows and the slow path packs
+        # into the same buffer, so the attention kernels key on sequence shapes alone.
         vllm_config.compilation_config.compile_sizes = [budget]
 
         logger.info(

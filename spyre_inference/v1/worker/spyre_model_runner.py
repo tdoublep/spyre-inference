@@ -120,8 +120,7 @@ logger = init_logger(__name__)
 
 _PAD_SLOT_ID = -1
 
-# Steps between encoder dispatch-ratio log lines. Often enough to watch a benchmark
-# settle, rare enough not to flood a serving log.
+# Steps between encoder dispatch-ratio log lines.
 _ENCODER_DISPATCH_LOG_EVERY = 200
 
 
@@ -1098,7 +1097,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         else:
             # Stale grid would silently mislay this step's tokens in `_preprocess`.
             self._encoder_grid = None
-            if plan is not None:
+            if isinstance(plan, list):
                 self.spyre_encoder_slow_path_steps += 1
                 self._record_encoder_dispatch(
                     sum(sum(group.query_lens) for group in plan),
