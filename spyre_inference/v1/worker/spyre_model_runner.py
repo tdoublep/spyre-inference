@@ -101,9 +101,9 @@ from spyre_inference.v1.sample.topk_topp_sampler import SpyreTopKTopPSampler
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
-    encoder_dense_row_indices,
+    encoder_bucket_valid_row_indices,
     encoder_warmup_shapes,
-    expand_packed_to_encoder_grid,
+    expand_packed_to_encoder_bucket,
     logits_row_buckets,
     pick_encoder_shape,
 )
@@ -1102,16 +1102,17 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         len_bucket, batch_bucket, query_lens = grid
         total = batch_bucket * len_bucket
-        num_tokens = sum(query_lens)
-        ids, pos = expand_packed_to_encoder_grid(
-            input_ids[:num_tokens].cpu(),
-            positions[:num_tokens].cpu(),
+        dense_ids, dense_pos = expand_packed_to_encoder_bucket(
+            input_ids[: sum(query_lens)].cpu().tolist(),
+            positions[: sum(query_lens)].cpu().tolist(),
             query_lens,
             batch_bucket,
             len_bucket,
             pad_token_id=self._encoder_pad_token_id(),
         )
-        assert ids.shape[0] == total, (ids.shape[0], total)
+        assert len(dense_ids) == total, (len(dense_ids), total)
+        ids = torch.tensor(dense_ids, dtype=input_ids.dtype, device="cpu")
+        pos = torch.tensor(dense_pos, dtype=positions.dtype, device="cpu")
         return (
             convert(ids, input_ids.device),
             inputs_embeds,
@@ -1211,15 +1212,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if grid is None:
             if hidden_states.shape[0] == num_scheduled_tokens:
                 return hidden_states
-            rows = torch.arange(num_scheduled_tokens, dtype=torch.int64)
+            rows = list(range(num_scheduled_tokens))
         else:
             len_bucket, batch_bucket, query_lens = grid
-            rows = encoder_dense_row_indices(query_lens, len_bucket)
+            rows = encoder_bucket_valid_row_indices(query_lens, len_bucket)
             total_rows = batch_bucket * len_bucket
-            if rows.numel() == total_rows:
+            if len(rows) == total_rows:
                 return hidden_states
-            rows = torch.cat([rows, rows.new_zeros(total_rows - rows.numel())])
-        return select_rows(hidden_states, rows)
+            rows = rows + [0] * (total_rows - len(rows))
+        return select_rows(hidden_states, torch.tensor(rows, dtype=torch.int64, device="cpu"))
 
     def _dummy_pooler_run_task(
         self,
