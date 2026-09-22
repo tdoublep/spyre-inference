@@ -1088,11 +1088,21 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if isinstance(plan, EncoderRectPlan):
             self._encoder_grid = (plan.extent, plan.width, plan.query_lens)
             self.spyre_encoder_fast_path_steps += 1
+            logger.info_once(
+                "Encoder fast path in use: rectangle (L=%d, B=%d).", plan.extent, plan.width
+            )
         else:
             # Stale grid would silently mislay this step's tokens in `_preprocess`.
             self._encoder_grid = None
             if plan is not None:
                 self.spyre_encoder_slow_path_steps += 1
+                # No per-step detail in the args: info_once dedups on them, and the
+                # group multiset takes thousands of values.
+                logger.info_once(
+                    "Encoder slow path in use: a batch too wide for any rectangle. It "
+                    "costs per-layer data movement; see spyre_encoder_slow_path_steps "
+                    "for how often."
+                )
         return out
 
     def _determine_batch_execution_and_padding(
