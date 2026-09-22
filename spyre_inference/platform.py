@@ -136,6 +136,11 @@ class TorchSpyrePlatform(CpuPlatform):
     # `pre_register_and_update`.
     _DEFAULT_MAX_NUM_SEQS = 4
 
+    # Ceiling on the pooling token budget, which is also the body's row count and the
+    # area of every fast-path rectangle. 2048 is the measured throughput argmax across
+    # pooling models; they regress above it.
+    _POOLING_MAX_BATCHED_TOKENS = 2048
+
     # Paged attention needs a KV block that is a multiple of 64 (128-byte stick /
     # 2 bytes for fp16).
     _BLOCK_SIZE_MULTIPLE = 64
@@ -294,53 +299,20 @@ class TorchSpyrePlatform(CpuPlatform):
             if all(s not in vllm_config.compilation_config.custom_ops for s in ("all", "none")):
                 vllm_config.compilation_config.custom_ops.append("all")
 
-            # Body: 1D compile_sizes (packed token counts).
-            # Honor a user-set list (#638); otherwise generate defaults.
-            if vllm_config.compilation_config.compile_sizes:
-                compile_sizes = vllm_config.compilation_config.compile_sizes
+            if vllm_config.model_config.runner_type == "pooling":
+                cls._apply_pooling_shape_defaults(vllm_config)
             else:
-                # Largest default bucket: scheduler limit and 512 (Spyre max).
-                # Pooling has no 512 limit -- encoder flash reads the packed list,
-                # not a 512-token body. 2048 is the measured throughput argmax across
-                # pooling models; they regress above it.
-                is_pooling = vllm_config.model_config.runner_type == "pooling"
-                max_capture_size = min(
-                    vllm_config.scheduler_config.max_num_batched_tokens,
-                    2048 if is_pooling else 512,
-                )
-                if is_pooling:
-                    # A max-length request must fit the budget or it is never admitted:
-                    # encoder prefill cannot be chunked, so the scheduler head-of-line
-                    # blocks forever. vLLM's verify_max_model_len checks this in
-                    # SchedulerConfig.__post_init__, before this hook, so the cap below
-                    # would slip past it.
-                    model_len = vllm_config.model_config.max_model_len
-                    if max_capture_size < model_len:
-                        logger.warning(
-                            "Raising pooling token budget %d -> %d to fit max_model_len; "
-                            "encoder prefill cannot be chunked.",
-                            max_capture_size,
-                            model_len,
-                        )
-                        max_capture_size = model_len
-
-                    from spyre_inference.v1.worker.spyre_shape_bucketer import (
-                        ENCODER_MIN_BODY_BUCKET,
-                        default_encoder_len_buckets,
-                    )
-
-                    compile_sizes = [
-                        *default_encoder_len_buckets(
-                            max_capture_size, floor=ENCODER_MIN_BODY_BUCKET
-                        )
-                    ]
-                    logger.info(
-                        "Pooling body token buckets (1D compile_sizes): %s",
-                        compile_sizes,
-                    )
+                # Body: 1D compile_sizes (packed token counts).
+                # Honor a user-set list (#638); otherwise generate defaults.
+                if vllm_config.compilation_config.compile_sizes:
+                    compile_sizes = vllm_config.compilation_config.compile_sizes
                 else:
+                    # Largest default bucket: scheduler limit and 512 (Spyre max).
                     # Decode packs one token per running sequence; prefill lands on
                     # the single largest bucket. Denser sizes only cost warmup time.
+                    max_capture_size = min(
+                        vllm_config.scheduler_config.max_num_batched_tokens, 512
+                    )
                     num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
                     sizes = {max_capture_size, num_seqs}
                     size = 1
@@ -348,20 +320,84 @@ class TorchSpyrePlatform(CpuPlatform):
                         sizes.add(size)
                         size *= 2
                     compile_sizes = sorted(sizes)
-                vllm_config.compilation_config.compile_sizes = compile_sizes
+                    vllm_config.compilation_config.compile_sizes = compile_sizes
 
-            max_capture_size = max(int(s) for s in compile_sizes)
-            # Scheduler must not send more tokens than the largest body bucket.
-            vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
-            logger.warning(
-                "Capping max_num_batched_tokens to %d ",
-                max_capture_size,
-            )
+                max_capture_size = max(int(s) for s in compile_sizes)
+                # Scheduler must not send more tokens than the largest body bucket.
+                vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
+                logger.warning(
+                    "Capping max_num_batched_tokens to %d ",
+                    max_capture_size,
+                )
 
         # In check_and_update_config we assert the dtype is one Spyre supports.
         # This must be set here as the default, otherwise all usage (including test fixtures) would
         # require setting the dtype.
         vllm_config.model_config.dtype = torch.float16
+
+    @classmethod
+    def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
+        """Normalise the pooling limits onto the declared encoder shapes.
+
+        The token budget ``R`` is the only input. Both other limits are written back
+        from it: ``max_num_seqs`` downwards, and ``compile_sizes`` to the single body
+        shape every encoder path runs on.
+
+        The scheduler is left alone -- the slow path means no batch upstream can form
+        has to be refused.
+        """
+        from spyre_inference.v1.worker.spyre_shape_bucketer import (
+            ENCODER_SEQ_ALIGNMENT,
+            encoder_budget_rows,
+            encoder_group_shapes,
+            encoder_rectangles,
+        )
+
+        scheduler_config = vllm_config.scheduler_config
+        max_model_len = vllm_config.model_config.max_model_len
+        prev_budget = scheduler_config.max_num_batched_tokens
+        prev_num_seqs = scheduler_config.max_num_seqs
+
+        # 2048 is the measured throughput argmax across pooling models; they regress
+        # above it. `encoder_budget_rows` then floors it at the longest declared
+        # length, which vLLM's own verify_max_model_len (run before this hook) cannot
+        # do for us.
+        budget = encoder_budget_rows(
+            max_model_len, min(prev_budget, cls._POOLING_MAX_BATCHED_TOKENS)
+        )
+        scheduler_config.max_num_batched_tokens = budget
+
+        # Config normalisation, not scheduling. The shortest length carries the widest
+        # rectangle, so this makes the widest declared width equal `max_num_seqs` and
+        # no batch ever needs more width than the ladder offers.
+        widest = max(1, budget // ENCODER_SEQ_ALIGNMENT)
+        if prev_num_seqs > widest:
+            logger.warning(
+                "Lowering pooling max_num_seqs %d -> %d: a %d-token budget holds at "
+                "most that many sequences even at the shortest declared length. Raise "
+                "--max-num-batched-tokens to widen it.",
+                prev_num_seqs,
+                widest,
+                budget,
+            )
+            scheduler_config.max_num_seqs = widest
+
+        # One body shape. Every rectangle is exactly `budget` rows and the slow path
+        # packs into the same buffer, so the attention kernels key on the sequence
+        # shapes alone rather than on the step's buffer size as well.
+        vllm_config.compilation_config.compile_sizes = [budget]
+
+        logger.info(
+            "Pooling encoder shapes for max_model_len=%d, max_num_seqs=%d, "
+            "max_num_batched_tokens=%d: body [%d, hidden]; fast-path rectangles "
+            "(L, B) %s; slow-path groups (width, extent) %s.",
+            max_model_len,
+            scheduler_config.max_num_seqs,
+            budget,
+            budget,
+            encoder_rectangles(vllm_config),
+            encoder_group_shapes(vllm_config) or "none reachable",
+        )
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:

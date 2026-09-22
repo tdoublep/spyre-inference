@@ -21,7 +21,14 @@ import pytest
 
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
-    default_encoder_len_buckets,
+    encoder_budget_rows,
+    encoder_fast_path_shape,
+    encoder_group_shapes,
+    encoder_group_width_caps,
+    encoder_len_ladder,
+    encoder_rectangles,
+    encoder_shape_tables,
+    encoder_width_for,
     logits_row_buckets,
     next_bucket,
 )
@@ -157,10 +164,8 @@ class TestForPooling:
         assert b.bucket_sizes == [64, 128]
 
 
-class TestEncoderLenLadder:
-    """``default_encoder_len_buckets``/``next_bucket`` are still shared with the
-    pooler's own bucketed-row trimming (``spyre_pooler.py``) and with
-    ``platform.py``'s default ``compile_sizes`` generation."""
+class TestNextBucket:
+    """Still shared with the pooler's own bucketed-row trimming (``spyre_pooler.py``)."""
 
     def test_next_bucket_picks_smallest_fit(self):
         assert next_bucket(30, [64, 128, 256]) == 64
@@ -170,18 +175,125 @@ class TestEncoderLenLadder:
     def test_next_bucket_overflow_stick_aligns(self):
         assert next_bucket(3000, [64, 128]) == 3008  # 3000 → 47*64 = 3008
 
-    def test_default_encoder_len_buckets_from_max_model_len(self):
-        assert default_encoder_len_buckets(512) == [64, 128, 256, 512]
-        assert default_encoder_len_buckets(2048) == [64, 128, 256, 512, 1024, 2048]
-        assert default_encoder_len_buckets(100) == [64]
-        assert default_encoder_len_buckets(768) == [64, 128, 256, 512, 768]
 
-    def test_default_encoder_len_buckets_honours_a_higher_floor(self):
-        """The body raises the floor to keep warmup short; the pooler keeps the stick."""
-        assert default_encoder_len_buckets(2048, floor=256) == [256, 512, 1024, 2048]
-        assert default_encoder_len_buckets(512, floor=256) == [256, 512]
-        # A model shorter than the floor still gets one usable bucket.
-        assert default_encoder_len_buckets(100, floor=256) == [64]
+class TestEncoderLenLadder:
+    def test_powers_of_two_up_to_max_model_len(self):
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_batched_tokens=2048)
+        assert encoder_len_ladder(cfg) == [64, 128, 256, 512]
+
+    def test_top_entry_is_the_stick_above_max_model_len(self):
+        """Rounded *up*: an extent is a matmul dimension, and rounding down would
+        leave the longest requests with no covering bucket."""
+        cfg = _pooling_vllm_config(max_model_len=500, max_num_batched_tokens=2048)
+        assert encoder_len_ladder(cfg) == [64, 128, 256, 512]
+
+    def test_short_model_gets_one_bucket(self):
+        cfg = _pooling_vllm_config(max_model_len=100, max_num_batched_tokens=2048)
+        assert encoder_len_ladder(cfg) == [64, 128]
+
+    def test_query_bucket_override_is_clamped_and_appended(self, monkeypatch):
+        monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "100,4096")
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_batched_tokens=2048)
+        # 100 aligns up to 128; 4096 is unreachable and dropped; 512 is appended.
+        assert encoder_len_ladder(cfg) == [128, 512]
+
+
+class TestEncoderBudget:
+    def test_floored_at_the_top_of_the_ladder(self):
+        """Encoder prefill cannot be chunked, so a budget under max_model_len would
+        head-of-line block forever -- and no rectangle would hold one sequence."""
+        assert encoder_budget_rows(512, 256) == 512
+        assert encoder_budget_rows(500, 256) == 512
+        assert encoder_budget_rows(512, 2048) == 2048
+
+
+class TestEncoderRectangles:
+    def test_worked_example(self):
+        cfg = _pooling_vllm_config(
+            max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048
+        )
+        assert encoder_rectangles(cfg) == [(64, 32), (128, 16), (256, 8), (512, 4)]
+
+    def test_every_rectangle_is_exactly_the_budget(self):
+        """The single body shape depends on it."""
+        for max_num_seqs in (1, 4, 32):
+            cfg = _pooling_vllm_config(
+                max_model_len=512, max_num_seqs=max_num_seqs, max_num_batched_tokens=2048
+            )
+            budget = encoder_shape_tables(cfg).budget
+            assert {length * batch for length, batch in encoder_rectangles(cfg)} == {budget}
+
+    def test_width_for_is_capped_by_max_num_seqs(self):
+        cfg = _pooling_vllm_config(
+            max_model_len=512, max_num_seqs=4, max_num_batched_tokens=2048
+        )
+        assert encoder_width_for(64, cfg) == 4  # 2048 // 64 = 32, capped
+        assert encoder_width_for(512, cfg) == 4
+
+
+class TestEncoderGroupShapes:
+    def test_worked_example_is_eighteen_pairs(self):
+        cfg = _pooling_vllm_config(
+            max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048
+        )
+        groups = encoder_group_shapes(cfg)
+        assert len(groups) == 18
+        assert encoder_group_width_caps(cfg) == {64: 32, 128: 16, 256: 8, 512: 4}
+        # Powers of two only, never wider than the cap.
+        for width, extent in groups:
+            assert width & (width - 1) == 0
+            assert width <= encoder_width_for(extent, cfg)
+
+    def test_empty_when_the_fast_path_cannot_miss(self):
+        """``max_num_seqs`` at or below ``R // longest length`` means every batch fits a
+        rectangle, so the group family is unreachable and warming it is pure cost."""
+        cfg = _pooling_vllm_config(
+            max_model_len=512, max_num_seqs=4, max_num_batched_tokens=2048
+        )
+        assert encoder_group_shapes(cfg) == []
+
+    def test_declared_shape_count_matches_the_plan(self):
+        cfg = _pooling_vllm_config(
+            max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048
+        )
+        assert 1 + len(encoder_rectangles(cfg)) + len(encoder_group_shapes(cfg)) == 23
+
+
+class TestEncoderDispatch:
+    @pytest.fixture()
+    def rectangles(self):
+        return encoder_rectangles(
+            _pooling_vllm_config(
+                max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048
+            )
+        )
+
+    @pytest.mark.parametrize(
+        ("num_seqs", "max_len", "expected"),
+        [
+            (1, 10, (64, 32)),
+            (32, 64, (64, 32)),
+            (16, 128, (128, 16)),
+            (8, 256, (256, 8)),
+            (4, 512, (512, 4)),
+            # One too wide for the length it needs: slow path, not an error.
+            (33, 64, None),
+            (17, 128, None),
+            (9, 256, None),
+            (5, 512, None),
+            # The plan's go/no-go case: ~100-token prompts fill to num_seqs 20 while
+            # B(128) is 16.
+            (20, 100, None),
+        ],
+    )
+    def test_selection(self, rectangles, num_seqs, max_len, expected):
+        assert encoder_fast_path_shape(num_seqs, max_len, rectangles) == expected
+
+    def test_empty_batch_returns_none(self, rectangles):
+        assert encoder_fast_path_shape(0, 0, rectangles) is None
+
+    def test_no_rectangles_is_the_slow_path(self):
+        assert encoder_fast_path_shape(1, 64, []) is None
 
 
 class TestLogitsRowBuckets:

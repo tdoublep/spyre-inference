@@ -200,9 +200,8 @@ def mark_warmup_complete() -> None:
 def is_warmup_complete() -> bool:
     """Whether ``mark_warmup_complete`` has run.
 
-    Load-bearing: the model runner builds encoder attention plans only once warmup is
-    done, so warmup traces the custom-op path and serving the traced one. Plans built
-    from warmup's synthetic seq lens warm graphs serving never uses.
+    Load-bearing: it arms the late-compile warning, which is how constraint "nothing
+    compiles in the serving path" is checked rather than assumed.
     """
     return _warmup_complete
 
@@ -374,12 +373,12 @@ class SpyreAttentionMetadata(AttentionMetadata):
     mask_by_chunk_cpu: torch.Tensor | None = None  # [num_chunks, entries * KV, 1, block] fp16
     mask_by_chunk_dev: torch.Tensor | None = None
 
-    # Encoder-only (no KV cache) precomputes: one EncoderSeqPlan per request,
-    # holding its device row table and mask tiles. Typed loosely because the
-    # encoder backend imports from this module, not the other way round. Filled
-    # by the first encoder layer's forward() -- the builder runs on CPU and does
-    # not know the layer type -- and reused by the rest of the stack.
-    encoder_seq_plans: list | None = None
+    # Encoder-only (no KV cache) precomputes: an EncoderRectPlan (fast path) or a
+    # list of EncoderGroupPlan (slow path), holding the step's device row tables
+    # and masks. Which one it is *is* the path selection, made once per step by the
+    # runner and read by every encoder layer. Typed loosely because the encoder
+    # backend imports from this module, not the other way round.
+    encoder_plan: object | None = None
 
     @property
     def query_lens(self) -> torch.Tensor:
