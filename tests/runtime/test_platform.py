@@ -743,3 +743,62 @@ def test_generate_scheduler_is_unaffected_by_the_pooling_guard():
     assert vllm_config.scheduler_config.scheduler_cls == (
         "spyre_inference.v1.core.scheduler.TorchSpyreScheduler"
     )
+
+
+class TestOffsetPositionMaxModelLen:
+    """RoBERTa-family position embeddings are indexed at ``positions + pad_token_id + 1``.
+
+    Dense pooling pads every sequence to the declared length, so a length equal to the
+    table height makes the pad rows alone index past it on every request.
+    """
+
+    @staticmethod
+    def _config(architectures, max_model_len, rows=514, pad_token_id=1, pos_type="absolute"):
+        from unittest.mock import MagicMock
+
+        vllm_config = MagicMock()
+        vllm_config.model_config.max_model_len = max_model_len
+        vllm_config.model_config.hf_config = SimpleNamespace(
+            architectures=architectures,
+            max_position_embeddings=rows,
+            pad_token_id=pad_token_id,
+            position_embedding_type=pos_type,
+        )
+        return vllm_config
+
+    def test_roberta_is_lowered_to_the_indexable_range(self):
+        from spyre_inference.platform import TorchSpyrePlatform
+
+        vllm_config = self._config(["RobertaForSequenceClassification"], 514)
+        TorchSpyrePlatform._cap_offset_position_max_model_len(vllm_config)
+        assert vllm_config.model_config.max_model_len == 512
+
+    def test_an_already_lower_length_is_untouched(self):
+        from spyre_inference.platform import TorchSpyrePlatform
+
+        vllm_config = self._config(["RobertaModel"], 512)
+        TorchSpyrePlatform._cap_offset_position_max_model_len(vllm_config)
+        assert vllm_config.model_config.max_model_len == 512
+
+    def test_xlm_roberta_is_covered(self):
+        from spyre_inference.platform import TorchSpyrePlatform
+
+        vllm_config = self._config(["XLMRobertaForSequenceClassification"], 514)
+        TorchSpyrePlatform._cap_offset_position_max_model_len(vllm_config)
+        assert vllm_config.model_config.max_model_len == 512
+
+    def test_bert_keeps_its_length(self):
+        """BERT indexes positions directly, so nothing is offset and nothing is lowered."""
+        from spyre_inference.platform import TorchSpyrePlatform
+
+        vllm_config = self._config(["BertModel"], 512, rows=512, pad_token_id=0)
+        TorchSpyrePlatform._cap_offset_position_max_model_len(vllm_config)
+        assert vllm_config.model_config.max_model_len == 512
+
+    def test_rotary_roberta_is_left_alone(self):
+        """A non-absolute position embedding does not use the offset table at all."""
+        from spyre_inference.platform import TorchSpyrePlatform
+
+        vllm_config = self._config(["RobertaModel"], 514, pos_type="rotary")
+        TorchSpyrePlatform._cap_offset_position_max_model_len(vllm_config)
+        assert vllm_config.model_config.max_model_len == 514
