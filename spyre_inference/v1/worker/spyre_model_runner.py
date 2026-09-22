@@ -1064,7 +1064,14 @@ class TorchSpyreModelRunner(GPUModelRunner):
             query_lens = [int(n) for n in num_scheduled_tokens_np[:num_reqs]]
             pair = pick_encoder_shape(num_reqs, max(query_lens, default=0), self._encoder_shapes)
             if pair is None:
-                return None
+                # Stale grid would silently mislay this step's tokens in `_preprocess`.
+                self._encoder_grid = None
+                raise ValueError(
+                    f"no declared pooling shape covers {num_reqs} sequences of up to "
+                    f"{max(query_lens, default=0)} tokens; declared: "
+                    f"{self._encoder_shapes}. PoolingSpyreScheduler should not have "
+                    "admitted this batch."
+                )
             len_bucket, batch_bucket = pair
             self._encoder_grid = (len_bucket, batch_bucket, query_lens)
             return BatchDescriptor(num_tokens=batch_bucket * len_bucket)

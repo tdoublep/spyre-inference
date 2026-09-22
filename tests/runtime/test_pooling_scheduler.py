@@ -209,3 +209,44 @@ class TestUpstreamAdmissionIsClampedToTheGate:
         with pytest.raises(RuntimeError, match="upstream blew up"):
             PoolingSpyreScheduler.schedule(sched)
         assert sched.max_num_running_reqs == 32
+
+
+class TestHeldBackRequestsSurviveAFailure:
+    """A raise in the base scheduler must not drop the requests the gate held back.
+
+    The gate drains ``self.waiting`` into local deques before delegating, so anything it
+    does not re-add is lost to the engine entirely rather than retried next step.
+    """
+
+    SHAPES = [(512, 2), (256, 8), (64, 32)]
+
+    def _stub(self, reqs):
+        sched = PoolingSpyreScheduler.__new__(PoolingSpyreScheduler)
+        sched.spyre_warmup_shapes = list(self.SHAPES)
+        sched.waiting = FCFSRequestQueue(list(reqs))
+        sched.running = []
+        sched.max_num_running_reqs = 32
+        return sched
+
+    def _raise_from_base(self, sched, monkeypatch):
+        def _boom(self, *args, **kwargs):
+            raise RuntimeError("upstream blew up")
+
+        monkeypatch.setattr(TorchSpyreScheduler, "schedule", _boom)
+        with pytest.raises(RuntimeError, match="upstream blew up"):
+            PoolingSpyreScheduler.schedule(sched)
+
+    def test_holdback_is_restored_when_the_base_raises(self, monkeypatch):
+        # Only (512, 2) fits a 512-token request, so 2 are approved and 3 held back.
+        reqs = [_req(512, f"r{i}") for i in range(5)]
+        sched = self._stub(reqs)
+        self._raise_from_base(sched, monkeypatch)
+        assert {r.name for r in sched.waiting} == {r.name for r in reqs}
+
+    def test_skipped_requests_are_restored_too(self, monkeypatch):
+        # r0 takes the only (512, 2) shape; r1/r3 are short and skipped past it; r2 is
+        # another 512 that cannot join.
+        reqs = [_req(512, "r0"), _req(10, "r1"), _req(512, "r2"), _req(10, "r3")]
+        sched = self._stub(reqs)
+        self._raise_from_base(sched, monkeypatch)
+        assert {r.name for r in sched.waiting} == {"r0", "r1", "r2", "r3"}

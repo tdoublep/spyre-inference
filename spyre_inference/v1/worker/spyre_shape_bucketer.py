@@ -125,6 +125,17 @@ def encoder_warmup_shapes(
     )
 
 
+def encoder_shape_covers(shape: tuple[int, int], num_seqs: int, max_len: int) -> bool:
+    """Whether a declared ``(L, B)`` holds ``num_seqs`` sequences of up to ``max_len``.
+
+    The one place this rule lives. `PoolingSpyreScheduler` admits on it and
+    `pick_encoder_shape` dispatches on it, so the gate cannot approve a batch the
+    runner then rejects.
+    """
+    length, batch = shape
+    return batch >= num_seqs and length >= max_len
+
+
 def pick_encoder_shape(
     num_seqs: int,
     max_len: int,
@@ -137,9 +148,9 @@ def pick_encoder_shape(
     """
     if num_seqs < 1 or max_len < 1:
         return None
-    for length, batch in shapes:
-        if batch >= num_seqs and length >= max_len:
-            return length, batch
+    for shape in shapes:
+        if encoder_shape_covers(shape, num_seqs, max_len):
+            return shape
     return None
 
 

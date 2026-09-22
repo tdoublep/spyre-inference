@@ -22,7 +22,10 @@ from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.request import Request
 
 from spyre_inference import envs
-from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_warmup_shapes
+from spyre_inference.v1.worker.spyre_shape_bucketer import (
+    encoder_shape_covers,
+    encoder_warmup_shapes,
+)
 
 logger = init_logger(__name__)
 
@@ -85,10 +88,11 @@ class PoolingSpyreScheduler(TorchSpyreScheduler):
         current_batch_size: int,
     ) -> list[tuple[int, int]]:
         """Shapes that hold this request *and* leave room for it in the batch."""
+        # `current_batch_size + 1`: this request on top of those already admitted.
         return [
-            (length, batch)
-            for length, batch in shapes
-            if request.num_prompt_tokens <= length and current_batch_size < batch
+            shape
+            for shape in shapes
+            if encoder_shape_covers(shape, current_batch_size + 1, request.num_prompt_tokens)
         ]
 
     def schedule(self, *args, **kwargs) -> SchedulerOutput:
@@ -137,14 +141,13 @@ class PoolingSpyreScheduler(TorchSpyreScheduler):
         max_num_running_reqs = self.max_num_running_reqs
         self.max_num_running_reqs = min(max_num_running_reqs, len(self.running) + len(self.waiting))
         try:
-            outputs = super().schedule(*args, **kwargs)
+            return super().schedule(*args, **kwargs)
         finally:
             self.max_num_running_reqs = max_num_running_reqs
-
-        # Skipped first, then never-considered: preserves the original priority.
-        while skip_queue:
-            self.waiting.add_request(skip_queue.popleft())
-        while holdback_queue:
-            self.waiting.add_request(holdback_queue.popleft())
-
-        return outputs
+            # In the `finally`: a raise here would otherwise drop every held-back
+            # request instead of retrying it on the next step.
+            # Skipped first, then never-considered: preserves the original priority.
+            while skip_queue:
+                self.waiting.add_request(skip_queue.popleft())
+            while holdback_queue:
+                self.waiting.add_request(holdback_queue.popleft())
