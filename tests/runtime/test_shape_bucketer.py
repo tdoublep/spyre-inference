@@ -202,9 +202,16 @@ class TestEncoderBudget:
     def test_floored_at_the_top_of_the_ladder(self):
         """Encoder prefill cannot be chunked, so a budget under max_model_len would
         head-of-line block forever -- and no rectangle would hold one sequence."""
-        assert encoder_budget_rows(512, 256) == 512
-        assert encoder_budget_rows(500, 256) == 512
-        assert encoder_budget_rows(512, 2048) == 2048
+        assert encoder_budget_rows(512, 256, 32) == 512
+        assert encoder_budget_rows(500, 256, 32) == 512
+        assert encoder_budget_rows(512, 2048, 32) == 2048
+
+    def test_capped_at_what_max_num_seqs_can_carry(self):
+        """A rectangle is always the whole buffer, so a narrow engine would otherwise
+        run the body on budget rows for one short request."""
+        assert encoder_budget_rows(64, 2048, 1) == 64
+        assert encoder_budget_rows(512, 2048, 2) == 1024
+        assert encoder_budget_rows(512, 2048, 4) == 2048
 
 
 class TestEncoderRectangles:
