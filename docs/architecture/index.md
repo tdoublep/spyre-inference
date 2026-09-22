@@ -297,11 +297,13 @@ attention is bidirectional over the full sequence — and inheriting the decoder
 off again.
 
 Pooling runs on **one** set of compile shapes: `(prompt_length, batch_size)` pairs, the
-cross product of `SPYRE_ATTN_QUERY_BUCKETS` and `SPYRE_ATTN_NUM_SEQS_BUCKETS` — the same
-two ladders the decoder attention bucketer uses. Both default to a single entry, so an
-unconfigured run compiles one `max_num_seqs × max_model_len` graph. `--max-num-batched-tokens`
-caps a shape's width, and `--max-num-seqs` / `compile_sizes` are written back from the
-result. Because the runner pads every sequence to `L` and the batch to `B` **before the
+cross product of `SPYRE_ATTN_QUERY_BUCKETS` and `SPYRE_ATTN_NUM_SEQS_BUCKETS`. Both default
+to powers of two — lengths from the 64-element stick to `max_model_len`, widths from 1 to
+`max_num_seqs` — and `--max-num-batched-tokens` (2048 by default for pooling) then filters
+the pairs, per pair rather than as a cap on one axis. `--max-num-seqs` is written back down
+to the widest surviving shape, so raising it is what makes wide short batches reachable.
+`compile_sizes` drives only the decoder's 1-D path and is left alone here: pooling warmup
+traces one graph per declared shape, which covers body, attention and pooler together. Because the runner pads every sequence to `L` and the batch to `B` **before the
 model runs**, the body sees exactly `B × L` token rows, so attention's grid is a reshape
 rather than a gather:
 
@@ -309,7 +311,7 @@ rather than a gather:
    covers, holding the rest back. That is what removes the runtime fallback:
    `pick_encoder_shape` cannot miss, so nothing compiles mid-request.
 2. The runner's `_preprocess` override rewrites `input_ids` / `positions` into the dense
-   `B × L` layout (`expand_packed_to_encoder_bucket`). `query_start_loc` and `seq_lens`
+   `B × L` layout (`expand_packed_to_encoder_grid`). `query_start_loc` and `seq_lens`
    deliberately keep the **real ragged** lengths — attention needs them for its key-pad
    mask, and pooling reads nothing else off them.
 3. Attention reshapes `[B*L, H, D]` → `[B, H, L, Dp]` and calls

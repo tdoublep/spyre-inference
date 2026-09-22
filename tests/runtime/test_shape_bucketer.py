@@ -25,7 +25,6 @@ from vllm.config import VllmConfig
 
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
-    encoder_body_sizes,
     encoder_dense_row_indices,
     encoder_warmup_shapes,
     expand_packed_to_encoder_grid,
@@ -145,23 +144,45 @@ def _pooling_config(max_model_len=512, max_num_seqs=8, max_num_batched_tokens=40
 class TestEncoderWarmupShapes:
     """``(L, B)`` shapes from ``max_model_len`` / ``max_num_seqs`` and the two ladders."""
 
-    def test_default_is_a_single_shape_of_max_num_seqs_by_max_model_len(self):
-        assert encoder_warmup_shapes(_pooling_config(512, 8, 4096)) == [(512, 8)]
+    def test_default_is_both_ladders_crossed(self):
+        """Powers of two on each axis: lengths from the stick, widths from 1."""
+        shapes = encoder_warmup_shapes(_pooling_config(512, 8, 4096))
+        assert sorted({length for length, _ in shapes}) == [64, 128, 256, 512]
+        assert sorted({batch for _, batch in shapes}) == [1, 2, 4, 8]
+        # Nothing is dropped here: the widest pair is exactly the budget.
+        assert len(shapes) == 16
 
-    def test_the_token_budget_caps_the_width(self):
-        # 2048 tokens hold four 512-token sequences, whatever max_num_seqs says.
-        assert encoder_warmup_shapes(_pooling_config(512, 256, 2048)) == [(512, 4)]
+    def test_the_token_budget_filters_pairs_rather_than_capping_the_width(self):
+        # 2048 tokens hold four 512-token sequences but thirty-two 64-token ones, so the
+        # width available depends on the length instead of being capped globally.
+        shapes = encoder_warmup_shapes(_pooling_config(512, 256, 2048))
+        assert all(length * batch <= 2048 for length, batch in shapes)
+        assert max(batch for length, batch in shapes if length == 512) == 4
+        assert max(batch for length, batch in shapes if length == 64) == 32
 
     def test_a_budget_below_max_model_len_still_leaves_one_sequence(self):
         # Encoder prefill cannot be chunked, so the budget is floored at max_model_len.
-        assert encoder_warmup_shapes(_pooling_config(8192, 32, 2048)) == [(8192, 1)]
+        shapes = encoder_warmup_shapes(_pooling_config(8192, 32, 2048))
+        assert (8192, 1) in shapes
+        assert all(length * batch <= 8192 for length, batch in shapes)
+
+    def test_the_widest_batch_can_exceed_the_width_at_the_longest_length(self):
+        """Why `PoolingSpyreScheduler` has to clamp `max_num_running_reqs`.
+
+        `max_num_seqs` is written back from the widest shape overall, which a long
+        request cannot reach, so upstream would otherwise admit a batch no shape covers.
+        """
+        shapes = encoder_warmup_shapes(_pooling_config(512, 32, 2048))
+        assert max(batch for _, batch in shapes) == 32
+        assert max(batch for length, batch in shapes if length == 512) == 4
 
     def test_the_ladders_are_crossed_and_sorted_by_batch_then_length(self):
         # Sorted by (B, L) so pick_encoder_shape's first match is the cheapest graph.
         shapes = encoder_warmup_shapes(
             _pooling_config(512, 8, 4096), length_buckets=[64, 256], num_seqs_buckets=[1, 4]
         )
-        # Each ladder gains its own limit (512 and 8), so 3 x 3 = 9 shapes.
+        # The length ladder gains max_model_len (512); the width ladder is taken as given,
+        # so 3 lengths x 2 widths.
         assert shapes == [
             (64, 1),
             (256, 1),
@@ -169,20 +190,31 @@ class TestEncoderWarmupShapes:
             (64, 4),
             (256, 4),
             (512, 4),
-            (64, 8),
-            (256, 8),
-            (512, 8),
         ]
+
+    def test_only_the_length_ladder_gains_its_limit(self):
+        """``max_model_len`` is an input a shape must cover; ``max_num_seqs`` is not.
+
+        ``max_num_seqs`` is written back *from* the widest declared width, so a width
+        ladder that stops short simply lowers it -- nothing is left uncovered.
+        """
+        shapes = encoder_warmup_shapes(
+            _pooling_config(512, 8, 4096), length_buckets=[64], num_seqs_buckets=[2]
+        )
+        assert shapes == [(64, 2), (512, 2)]
+        assert max(batch for _, batch in shapes) == 2
 
     def test_lengths_round_up_to_the_stick(self):
         shapes = encoder_warmup_shapes(_pooling_config(512, 2, 1024), length_buckets=[100])
-        assert [length for length, _ in shapes] == [128, 512]
+        assert sorted({length for length, _ in shapes}) == [128, 512]
 
-    def test_unreachable_entries_are_dropped_and_the_limit_appended(self):
+    def test_unreachable_entries_are_dropped(self):
+        # 9999 exceeds max_model_len and 99 exceeds max_num_seqs, so neither is
+        # schedulable; max_model_len is still appended to the length ladder.
         shapes = encoder_warmup_shapes(
             _pooling_config(512, 4, 2048), length_buckets=[64, 9999], num_seqs_buckets=[2, 99]
         )
-        assert shapes == [(64, 2), (512, 2), (64, 4), (512, 4)]
+        assert shapes == [(64, 2), (512, 2)]
 
     def test_non_positive_entries_are_ignored(self):
         assert encoder_warmup_shapes(
@@ -194,27 +226,33 @@ class TestEncoderWarmupShapes:
         for args in [(512, 256, 2048), (512, 8, 8192), (8192, 32, 2048), (384, 6, 2304)]:
             config = _pooling_config(*args)
             first = encoder_warmup_shapes(config)
+            # The only write-backs: max_num_seqs down to the widest shape, and the
+            # budget up to max_model_len when it was below it.
             config.scheduler_config.max_num_seqs = max(b for _, b in first)
-            config.scheduler_config.max_num_batched_tokens = encoder_body_sizes(first)[-1]
+            config.scheduler_config.max_num_batched_tokens = max(
+                config.scheduler_config.max_num_batched_tokens,
+                config.model_config.max_model_len,
+            )
             assert encoder_warmup_shapes(config) == first, args
 
     def test_the_memo_hands_out_a_fresh_list(self):
         """Four call sites re-derive the same shapes; none may mutate another's copy."""
         config = _pooling_config(512, 8, 4096)
         first = encoder_warmup_shapes(config)
+        expected = list(first)
         first.append((1, 1))
-        assert encoder_warmup_shapes(config) == [(512, 8)]
+        assert encoder_warmup_shapes(config) == expected
 
     def test_the_memo_follows_the_environment(self, monkeypatch):
         """Same config, different ladder: the memo key carries the env values."""
         from spyre_inference import envs
 
         config = _pooling_config(256, 2, 512)
-        assert encoder_warmup_shapes(config) == [(256, 2)]
+        assert sorted({length for length, _ in encoder_warmup_shapes(config)}) == [64, 128, 256]
         monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "128,256")
         envs.clear_env_cache()
         try:
-            assert encoder_warmup_shapes(config) == [(128, 2), (256, 2)]
+            assert sorted({length for length, _ in encoder_warmup_shapes(config)}) == [128, 256]
         finally:
             envs.clear_env_cache()
 
@@ -255,15 +293,6 @@ class TestPickEncoderShape:
     def test_none_on_a_degenerate_batch(self):
         assert pick_encoder_shape(0, 10, self.SHAPES) is None
         assert pick_encoder_shape(1, 0, self.SHAPES) is None
-
-
-class TestEncoderBodySizes:
-    def test_distinct_products_only(self):
-        """The body is flat ``[B*L, hidden]``, so equal-area shapes share a graph."""
-        assert encoder_body_sizes([(512, 2), (256, 4), (64, 32)]) == [1024, 2048]
-
-    def test_single_shape(self):
-        assert encoder_body_sizes([(512, 8)]) == [4096]
 
 
 class TestDenseExpansion:

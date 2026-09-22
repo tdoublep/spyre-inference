@@ -139,6 +139,12 @@ class TorchSpyrePlatform(CpuPlatform):
     # `pre_register_and_update`.
     _DEFAULT_MAX_NUM_SEQS = 4
 
+    # Applied only when the user didn't pass `--max-num-batched-tokens`, and only for
+    # pooling. It is what bounds the declared shape set, and vLLM's generative default is
+    # far too wide for it: 2048 rows let a 64-token bucket carry 32 sequences, which is
+    # where short-batch throughput comes from. Enforced by `pre_register_and_update`.
+    _DEFAULT_POOLING_MAX_BATCHED_TOKENS = 2048
+
     # Paged attention needs a KV block that is a multiple of 64 (128-byte stick /
     # 2 bytes for fp16).
     _BLOCK_SIZE_MULTIPLE = 64
@@ -184,9 +190,18 @@ class TorchSpyrePlatform(CpuPlatform):
 
         @functools.wraps(original)
         def _spyre_patched(self, usage_context, model_config, parallel_config):
-            user_supplied = self.max_num_seqs is not None
+            # Captured before the original fills them in: `None` is the only signal that
+            # the user left a limit to us.
+            user_num_seqs = self.max_num_seqs is not None
+            user_budget = self.max_num_batched_tokens is not None
             original(self, usage_context, model_config, parallel_config)
-            if not user_supplied and self.max_num_seqs is not None:
+            if (
+                not user_budget
+                and self.max_num_batched_tokens is not None
+                and model_config.runner_type == "pooling"
+            ):
+                self.max_num_batched_tokens = cls._DEFAULT_POOLING_MAX_BATCHED_TOKENS
+            if not user_num_seqs and self.max_num_seqs is not None:
                 self.max_num_seqs = min(self.max_num_seqs, cls._DEFAULT_MAX_NUM_SEQS)
 
         _spyre_patched._spyre_patched = True
@@ -373,10 +388,7 @@ class TorchSpyrePlatform(CpuPlatform):
         All three limits are inputs; ``max_num_seqs`` and ``max_num_batched_tokens`` are
         written back, downwards only, so the scheduler admits only what a shape covers.
         """
-        from spyre_inference.v1.worker.spyre_shape_bucketer import (
-            encoder_body_sizes,
-            encoder_warmup_shapes,
-        )
+        from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_warmup_shapes
 
         cls._cap_offset_position_max_model_len(vllm_config)
 
@@ -385,46 +397,56 @@ class TorchSpyrePlatform(CpuPlatform):
         prev_budget = scheduler_config.max_num_batched_tokens
         prev_num_seqs = scheduler_config.max_num_seqs
 
+        # The budget is an input -- `_DEFAULT_POOLING_MAX_BATCHED_TOKENS` supplies it when
+        # the user did not, so an explicit `--max-num-batched-tokens` is respected here.
+        # Only floored: encoder prefill cannot be chunked, so a budget under max_model_len
+        # head-of-line blocks the scheduler forever.
+        budget = max(prev_budget, max_model_len)
+        scheduler_config.max_num_batched_tokens = budget
+
         shapes = encoder_warmup_shapes(vllm_config)
-        compile_sizes = encoder_body_sizes(shapes)
         max_batch = max(batch for _, batch in shapes)
 
+        # Lowered to the widest declared shape: the gate can only admit a batch some
+        # shape covers, so a higher limit would let upstream past it.
         scheduler_config.max_num_seqs = max_batch
-        scheduler_config.max_num_batched_tokens = compile_sizes[-1]
+        if budget != prev_budget:
+            logger.info(
+                "Pooling max_num_batched_tokens %d -> %d; it bounds the declared shapes, "
+                "so the widest batch is %d (at the %d-token bucket).",
+                prev_budget,
+                budget,
+                max_batch,
+                min(length for length, batch in shapes if batch == max_batch),
+            )
         # Set only to pass vLLM's max_model_len check earlier in startup.
         scheduler_config.enable_chunked_prefill = False
         scheduler_config.scheduler_cls = _POOLING_SCHEDULER_CLS
-        # Widened explicitly: compile_sizes is declared list[int | str] | None.
-        widened_sizes: list[int | str] = list(compile_sizes)
-        vllm_config.compilation_config.compile_sizes = widened_sizes
 
         logger.info(
-            "Pooling compile shapes (prompt_len, batch_size): %s for max_model_len=%d; "
-            "max_num_seqs=%d, max_num_batched_tokens=%d, body compile_sizes=%s",
+            "Pooling declared shapes (prompt_len, batch_size): %s for max_model_len=%d; "
+            "max_num_seqs=%d, max_num_batched_tokens=%d. Warmup traces one graph per "
+            "shape.",
             shapes,
             max_model_len,
             max_batch,
-            compile_sizes[-1],
-            compile_sizes,
+            scheduler_config.max_num_batched_tokens,
         )
         if max_batch < prev_num_seqs:
+            # The shortest bucket is what bounds the widest batch, so quote that pair
+            # rather than max_model_len: at a 2048-token budget a 64-token bucket
+            # carries 32 sequences even though a max_model_len one carries far fewer.
+            widest_len = min(length for length, batch in shapes if batch == max_batch)
             logger.warning(
-                "Lowering max_num_seqs %d -> %d: a batch of %d sequences of %d tokens "
-                "needs %d dense rows, over the %d-token budget. Raise "
-                "--max-num-batched-tokens to widen it.",
+                "Lowering max_num_seqs %d -> %d: the widest declared shape is "
+                "(%d tokens x %d sequences) = %d dense rows, and the %d-token budget "
+                "allows none wider. Raise --max-num-batched-tokens to widen it.",
                 prev_num_seqs,
                 max_batch,
-                prev_num_seqs,
-                max_model_len,
-                prev_num_seqs * max_model_len,
+                widest_len,
+                max_batch,
+                widest_len * max_batch,
                 prev_budget,
-            )
-        if compile_sizes[-1] > prev_budget:
-            logger.warning(
-                "Raising max_num_batched_tokens %d -> %d to fit max_model_len; "
-                "encoder prefill cannot be chunked.",
-                prev_budget,
-                compile_sizes[-1],
             )
 
     @classmethod

@@ -44,6 +44,24 @@ def _align_up(n: int, align: int = ENCODER_SEQ_ALIGNMENT) -> int:
     return max(align, (n + align - 1) // align * align)
 
 
+def powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
+    """Powers of 2 in [start, n] (start rounded up to a power of 2), plus n itself.
+
+    The geometric ladder both bucketers default to.
+    """
+    if n < 1:
+        return ()
+    v = 1
+    while v < start:
+        v *= 2
+    result = []
+    while v < n:
+        result.append(v)
+        v *= 2
+    result.append(n)
+    return tuple(result)
+
+
 def next_bucket(n: int, buckets: list[int]) -> int:
     """Smallest bucket ``>= n``. If ``n`` exceeds every bucket, stick-align ``n``."""
     if n < 1:
@@ -61,18 +79,21 @@ def _resolve_encoder_buckets(
     env_name: str,
     limit: int,
     align: bool,
+    default: Sequence[int],
+    append_limit: bool,
 ) -> list[int]:
-    """One encoder ladder: the override, else the env list, else just ``limit``.
+    """One encoder ladder: the override, else the env list, else ``default``.
 
-    ``limit`` is appended when missing so the widest admissible batch always has a shape,
-    and is exempt from ``align`` because ``max_model_len`` is not ours to raise.
+    ``append_limit`` is for the length axis: ``max_model_len`` is an input, so a shape has
+    to cover it, and it is exempt from ``align`` because it is not ours to raise. Widths
+    need no such entry -- ``max_num_seqs`` is written back *from* the ladder.
     """
     if override is not None:
         raw = [int(v) for v in override]
     elif env_value:
         raw = [int(v) for v in env_value.split(",") if v.strip()]
     else:
-        raw = [limit]
+        raw = list(default)
     values = {_align_up(v) if align else v for v in raw if v > 0}
     kept = sorted(v for v in values if v <= limit)
     dropped = sorted(v for v in values if v > limit)
@@ -83,9 +104,9 @@ def _resolve_encoder_buckets(
             dropped,
             limit,
         )
-    if limit not in kept:
+    if append_limit and limit not in kept:
         kept.append(limit)
-    return kept
+    return kept or [limit]
 
 
 # Memo for `encoder_warmup_shapes`. The platform hook, the scheduler, the runner and
@@ -103,9 +124,13 @@ def encoder_warmup_shapes(
 ) -> list[tuple[int, int]]:
     """Declared ``(prompt_length, batch_size)`` shapes, cheapest covering shape first.
 
-    A shape puts ``B * L`` dense rows through the body, so ``max_num_batched_tokens``
-    bounds the width. Idempotent once the caller writes that width back to
-    ``max_num_seqs`` (``TorchSpyrePlatform._apply_pooling_shape_defaults``).
+    Both ladders default to powers of two: lengths from the stick up to
+    ``max_model_len``, widths from 1 up to ``max_num_seqs``. A shape puts ``B * L`` dense
+    rows through the body, so ``max_num_batched_tokens`` filters the pairs rather than
+    capping a ladder — a short length can carry a wider batch than a long one.
+
+    Idempotent once the caller writes the widest width back to ``max_num_seqs``
+    (``TorchSpyrePlatform._apply_pooling_shape_defaults``).
     """
     memo_key = (
         int(vllm_config.model_config.max_model_len),
@@ -132,17 +157,24 @@ def encoder_warmup_shapes(
         "SPYRE_ATTN_QUERY_BUCKETS",
         limit=max_model_len,
         align=True,
+        default=powers_of_two_up_to(max_model_len, start=ENCODER_SEQ_ALIGNMENT),
+        append_limit=True,
     )
-    width_limit = max(1, min(int(vllm_config.scheduler_config.max_num_seqs), budget // lengths[-1]))
+    max_num_seqs = max(1, int(vllm_config.scheduler_config.max_num_seqs))
+    width_limit = max_num_seqs
     widths = _resolve_encoder_buckets(
         num_seqs_buckets,
         envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
         "SPYRE_ATTN_NUM_SEQS_BUCKETS",
         limit=width_limit,
         align=False,
+        default=powers_of_two_up_to(width_limit),
+        append_limit=False,
     )
+    # `(max_model_len, 1)` always survives, because the budget is floored at
+    # max_model_len, so the set is never empty.
     shapes = sorted(
-        {(length, batch) for length in lengths for batch in widths},
+        {(length, batch) for length in lengths for batch in widths if length * batch <= budget},
         key=lambda pair: (pair[1], pair[0]),
     )
     _ENCODER_SHAPES_MEMO[memo_key] = shapes
@@ -176,11 +208,6 @@ def pick_encoder_shape(
         if encoder_shape_covers(shape, num_seqs, max_len):
             return shape
     return None
-
-
-def encoder_body_sizes(shapes: Sequence[tuple[int, int]]) -> list[int]:
-    """Distinct ``B * L`` counts: the body is flat, so equal-area shapes share a graph."""
-    return sorted({length * batch for length, batch in shapes})
 
 
 def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[int]:
@@ -258,12 +285,17 @@ class SpyreShapeBucketer:
         self._max_bucket_size = self._bucket_sizes[-1] if self._bucket_sizes else 0
         self._is_warmed_up = False
 
-        logger.info(
-            "SpyreShapeBucketer initialized with %d bucket sizes: min=%d, max=%d",
-            len(self._bucket_sizes),
-            self._bucket_sizes[0] if self._bucket_sizes else 0,
-            self._max_bucket_size,
-        )
+        # Pooling dispatches on the declared (L, B) shapes, not this 1-D ladder; the
+        # instance exists there only to carry `is_warmed_up`.
+        if vllm_config.model_config.runner_type == "pooling":
+            logger.debug("SpyreShapeBucketer constructed for pooling; the 1-D ladder is unused.")
+        else:
+            logger.info(
+                "SpyreShapeBucketer initialized with %d bucket sizes: min=%d, max=%d",
+                len(self._bucket_sizes),
+                self._bucket_sizes[0] if self._bucket_sizes else 0,
+                self._max_bucket_size,
+            )
 
     @property
     def bucket_sizes(self) -> list[int]:

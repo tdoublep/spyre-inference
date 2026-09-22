@@ -233,8 +233,9 @@ def test_apply_config_pins_pooling_config_to_the_declared_shapes(monkeypatch):
         vllm_config.compilation_config.compile_sizes = []
         TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
-        # (64, 32) = 2048 and (512, 32) = 16384.
-        assert vllm_config.compilation_config.compile_sizes == [2048, 16384]
+        # Pooling warmup traces one graph per declared shape, so compile_sizes (which
+        # only drives the decoder's 1-D path) is left alone.
+        assert vllm_config.compilation_config.compile_sizes == []
         # Never overridden: the shapes are derived from it, not the other way round.
         assert vllm_config.model_config.max_model_len == 512
         assert vllm_config.scheduler_config.max_num_seqs == 32
@@ -265,9 +266,10 @@ def test_apply_config_lowers_pooling_max_num_seqs_to_the_token_budget():
     vllm_config.compilation_config.compile_sizes = []
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
-    # 2048 tokens hold four 512-token sequences, so one (512, 4) graph.
-    assert vllm_config.compilation_config.compile_sizes == [2048]
-    assert vllm_config.scheduler_config.max_num_seqs == 4
+    # 2048 tokens hold four 512-token sequences but thirty-two 64-token ones, so the
+    # widest declared shape is 32 wide and max_num_seqs follows it down from 256.
+    assert vllm_config.compilation_config.compile_sizes == []
+    assert vllm_config.scheduler_config.max_num_seqs == 32
     assert vllm_config.scheduler_config.max_num_batched_tokens == 2048
 
 

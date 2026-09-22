@@ -24,8 +24,8 @@ from spyre_inference import envs
 from spyre_inference.v1.attention.spyre_attn_bucketer import (
     SpyreAttnBucketer,
     _parse_buckets,
-    _powers_of_two_up_to,
     batched_decode_chunking,
+    powers_of_two_up_to,
 )
 
 BLOCK_SIZE = 64
@@ -49,7 +49,7 @@ def make_config(
 
 def _list_pow2(limit: int, start: int = 1) -> list[int]:
     """[start, 2*start, ..., limit], the buckets the kv axis defaults to."""
-    return list(_powers_of_two_up_to(limit, start=start))
+    return list(powers_of_two_up_to(limit, start=start))
 
 
 @pytest.fixture()

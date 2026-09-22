@@ -42,6 +42,7 @@ from vllm.config import VllmConfig
 from vllm.logger import init_logger
 
 from spyre_inference import envs
+from spyre_inference.v1.worker.spyre_shape_bucketer import powers_of_two_up_to
 
 logger = init_logger(__name__)
 
@@ -109,21 +110,6 @@ def _parse_buckets(raw: str | None) -> list[int] | None:
     return values
 
 
-def _powers_of_two_up_to(n: int, start: int = 1) -> tuple[int, ...]:
-    """Powers of 2 in [start, n] (start rounded up to a power of 2), plus n itself."""
-    if n < 1:
-        return ()
-    v = 1
-    while v < start:
-        v *= 2
-    result = []
-    while v < n:
-        result.append(v)
-        v *= 2
-    result.append(n)
-    return tuple(result)
-
-
 def _resolve_buckets(
     raw: str | None, limit: int, name: str, default: Callable[[], list[int]]
 ) -> list[int]:
@@ -182,7 +168,7 @@ class SpyreAttnBucketer:
             max_batched = min(max_batched, max_model_len)
 
         if block_size & (block_size - 1):
-            # Not fatal: _powers_of_two_up_to rounds the start up to a power of
+            # Not fatal: powers_of_two_up_to rounds the start up to a power of
             # two, just coarser at the bottom. Reachable because the platform
             # only forces a multiple of 64 (SpyrePlatform.check_and_update_config).
             logger.warning(
@@ -200,7 +186,7 @@ class SpyreAttnBucketer:
                 envs.SPYRE_ATTN_NUM_SEQS_BUCKETS,
                 max_num_seqs,
                 "SPYRE_ATTN_NUM_SEQS_BUCKETS",
-                lambda: list(_powers_of_two_up_to(max_num_seqs, start=_MIN_BATCHED_SEQS)),
+                lambda: list(powers_of_two_up_to(max_num_seqs, start=_MIN_BATCHED_SEQS)),
             )
             if max_num_seqs >= _MIN_BATCHED_SEQS
             else []
@@ -224,7 +210,7 @@ class SpyreAttnBucketer:
             envs.SPYRE_ATTN_KV_BUCKETS,
             max_model_len,
             "SPYRE_ATTN_KV_BUCKETS",
-            lambda: list(_powers_of_two_up_to(max_model_len, start=block_size)),
+            lambda: list(powers_of_two_up_to(max_model_len, start=block_size)),
         )
 
         # num_blocks is what the kernel specializes on. Derived from the kv
@@ -234,7 +220,13 @@ class SpyreAttnBucketer:
             {(kv + block_size - 1) // block_size for kv in self._kv_buckets}
         )
 
-        logger.info(
+        # A pooling model only reaches these buckets through a decoder-type tower with a
+        # real KV cache (CLIP's, say). An encoder-only model has none, so announcing kv
+        # buckets and a block count there contradicts the runner's own "no KV cache" line.
+        summarize = (
+            logger.debug if vllm_config.model_config.runner_type == "pooling" else logger.info
+        )
+        summarize(
             "SpyreAttnBucketer: %d kv buckets [%d..%d], %d query buckets [%d..%d], "
             "max num_blocks=%d",
             len(self._kv_buckets),

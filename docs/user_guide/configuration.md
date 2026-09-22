@@ -65,22 +65,29 @@ Pooling has **one** set of compile shapes: `(prompt_length, batch_size)` pairs. 
 sequence is padded to `L` and the batch to `B` before the model runs, so the body sees
 exactly `B × L` token rows and attention is a reshape plus one SDPA call.
 
-The default is a **single** shape of `--max-model-len × --max-num-seqs`:
+Both axes default to **powers of two**: lengths from 64 (the Spyre stick) up to
+`--max-model-len`, widths from 1 up to `--max-num-seqs`, crossed. A 512-token model at
+`--max-num-seqs 4` therefore declares twelve shapes, `{64, 128, 256, 512} × {1, 2, 4}`, so
+a short or narrow batch is not padded up to the widest graph.
 
 ```bash
 vllm serve ibm-granite/granite-embedding-125m-english --runner pooling \
   --max-model-len 512 --max-num-seqs 8 --max-num-batched-tokens 4096
 ```
 
-`--max-num-batched-tokens` is what caps the width: a shape puts `B × L` dense rows through
-the body, so the budget bounds how many sequences one bucket holds. With the 2048 default
-and `--max-model-len 512` the batch is 4, whatever `--max-num-seqs` says — raise the budget
-to widen it. Going the other way, a `--max-num-batched-tokens` above `max_num_seqs ×
-max_model_len` is lowered to it, since no larger batch can be scheduled.
+`--max-num-batched-tokens` is a constraint on the set, not a cap on one axis: a shape puts
+`B × L` dense rows through the body, so any pair over the budget is dropped. That filters
+per pair, so a short length keeps a wider batch than a long one — at a 2048-token budget,
+`(64, 32)` survives while `(512, 32)` does not. Pooling defaults it to **2048**; pass the
+flag to change it.
 
-To compile more than one shape, use the same two bucket lists the decoder attention path
-uses — `SPYRE_ATTN_QUERY_BUCKETS` for prompt lengths and `SPYRE_ATTN_NUM_SEQS_BUCKETS` for
-batch widths:
+Wide batches of *short* sequences therefore need `--max-num-seqs` raised, since the width
+ladder stops at it. At the 2048 default, `--max-num-seqs 32` declares eighteen shapes and
+makes `(64, 32)` reachable, where the default `--max-num-seqs 4` stops at `(64, 4)`.
+
+To declare a different set, use the same two bucket lists the decoder attention path uses —
+`SPYRE_ATTN_QUERY_BUCKETS` for prompt lengths and `SPYRE_ATTN_NUM_SEQS_BUCKETS` for batch
+widths:
 
 ```bash
 SPYRE_ATTN_QUERY_BUCKETS=64,256 \
@@ -90,16 +97,18 @@ vllm serve ibm-granite/granite-embedding-125m-english --runner pooling \
 ```
 
 Here the two lists are **crossed**, as they are for the decoder. Each is clamped to its
-limit: entries above `--max-model-len` (lengths) or the budget-capped `--max-num-seqs`
-(widths) are dropped, and the limit itself is appended when missing, so every schedulable
-batch keeps a shape. Lengths are rounded up to a multiple of 64 (the Spyre stick).
+limit: entries above `--max-model-len` (lengths) or `--max-num-seqs` (widths) are dropped.
+`max_model_len` is appended to the length ladder when missing, because it is an input a
+shape has to cover; the width ladder needs no such entry, since `--max-num-seqs` is
+lowered to the widest width declared. Lengths are rounded up to a multiple of 64 (the
+Spyre stick).
 
 | setting | value |
 | --- | --- |
 | `--max-model-len` | the largest prompt length; an input, never overridden |
-| `--max-num-seqs` | lowered to `max_num_batched_tokens ÷ max_model_len` when that is smaller |
-| `--max-num-batched-tokens` | set to the largest `B × L`, so the scheduler cannot overshoot the widest graph |
-| `compile_sizes` | the distinct `B × L` products (equal-area shapes share a body graph) |
+| `--max-num-seqs` | lowered to the widest declared shape, so the gate cannot be overshot |
+| `--max-num-batched-tokens` | an input that filters the pairs; defaults to 2048 for pooling and is only ever raised, to `max_model_len` (encoder prefill cannot be chunked) |
+| `compile_sizes` | unused for pooling; warmup traces one graph per declared shape |
 
 A prompt longer than `--max-model-len` is rejected by vLLM's own length check.
 `PoolingSpyreScheduler` admits only batches a declared shape covers, so no request ever
@@ -115,7 +124,9 @@ latency control:
 - A single request against `(512, 8)` computes 8 rows' worth. Add `1` to
   `SPYRE_ATTN_NUM_SEQS_BUCKETS` if single-request latency matters — the narrowest covering
   shape wins, so a lone request then lands on `(512, 1)`.
-- The lists cross, so `n` lengths × `m` widths is `n × m` graphs to compile at warmup.
+- The lists cross, so `n` lengths × `m` widths is `n × m` graphs to trace at warmup, and
+  warmup cost grows with the set. The batch axis dominates: a new width costs noticeably
+  more than another length at a width already traced.
   Keep both short.
 
 Masks and pooling always use the real, unpadded lengths.
