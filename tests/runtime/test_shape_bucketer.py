@@ -25,7 +25,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_group_shapes,
     encoder_group_width_caps,
     encoder_len_ladder,
-    encoder_rectangle_for,
+    encoder_rectangle_for_batch,
     encoder_rectangles,
     encoder_shape_tables,
     encoder_width_for,
@@ -330,13 +330,13 @@ class TestEncoderDispatch:
         ],
     )
     def test_selection(self, rectangles, num_seqs, max_len, expected):
-        assert encoder_rectangle_for(num_seqs, max_len, rectangles) == expected
+        assert encoder_rectangle_for_batch(num_seqs, max_len, rectangles) == expected
 
     def test_empty_batch_returns_none(self, rectangles):
-        assert encoder_rectangle_for(0, 0, rectangles) is None
+        assert encoder_rectangle_for_batch(0, 0, rectangles) is None
 
     def test_no_rectangles_is_the_jagged_path(self):
-        assert encoder_rectangle_for(1, 64, []) is None
+        assert encoder_rectangle_for_batch(1, 64, []) is None
 
 
 class TestLogitsRowBuckets:

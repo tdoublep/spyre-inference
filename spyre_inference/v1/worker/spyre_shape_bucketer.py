@@ -266,12 +266,16 @@ def encoder_group_width_caps(vllm_config: VllmConfig) -> dict[int, int]:
     return caps
 
 
-def encoder_rectangle_for(
+def encoder_rectangle_for_batch(
     num_seqs: int,
     max_len: int,
     rectangles: Sequence[tuple[int, int]],
 ) -> tuple[int, int] | None:
-    """The rectangle serving this batch, or ``None`` to take the jagged path.
+    """The ``(extent, width)`` this batch runs in, or ``None`` to take the jagged path.
+
+    Takes the shortest declared length that covers ``max_len``, and only if the batch is
+    no wider than that length's rectangle -- a longer length would pad every sequence
+    further, and a wider batch has no lane to put the extra sequences in.
 
     ``None`` is a routine outcome, not an error: the scheduler is upstream's, so the
     backend cannot refuse a batch and must have a path for every one it can form.

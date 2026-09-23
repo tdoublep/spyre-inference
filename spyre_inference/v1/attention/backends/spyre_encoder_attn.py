@@ -57,7 +57,7 @@ from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_group_shapes,
     encoder_group_width_caps,
-    encoder_rectangle_for,
+    encoder_rectangle_for_batch,
     encoder_rectangles,
     encoder_shape_tables,
 )
@@ -404,7 +404,7 @@ def build_encoder_plan(
     # A dropped request shifts every later lane, and the pooler addresses rows by its
     # own cumsum over all requests, so the grid would be misaligned rather than padded.
     rect = (
-        encoder_rectangle_for(len(members), max_len, rectangles)
+        encoder_rectangle_for_batch(len(members), max_len, rectangles)
         if len(members) == attn_metadata.num_seqs
         else None
     )
