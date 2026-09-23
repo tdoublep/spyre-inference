@@ -342,7 +342,8 @@ the `finfo.min / 2` mask fill and the single attendable key a batch-pad lane get
 
 The body is compiled once, at `R` rows. Attention is shape-managed separately behind the
 opaque custom-op boundary: one rectangle per declared length on the rectangular path, one
-`(width, extent)` pair per group on the jagged one. With `max_model_len=512`,
+`(width, extent)` pair per group on the jagged one (a *group* being the requests that
+share one padded extent, attended together in one call). With `max_model_len=512`,
 `max_num_seqs=32` and a 2048-token budget that is 23 shapes — one body, four rectangles,
 18 group pairs — and at `max_num_seqs=4` only five, since no batch that narrow can miss
 the rectangular path.

@@ -79,9 +79,11 @@ then lowered to `R / 64` if it was higher, since no batch wider than that fits.
   one reshape, one `F.scaled_dot_product_attention`, one store, no data movement
   inside the layer. Taken whenever `num_seqs <= B`.
 - **Attention, jagged path**: for a batch too wide for any rectangle, Q/K/V stay
-  packed and requests are grouped by their own padded length; each group is one
-  fused gather/attend/scatter, keyed on `(group width, extent)`. Widths are powers
-  of two up to `B`; a wider group is chunked into descending powers of two.
+  packed and requests are split into *groups* — the requests sharing one padded
+  length. Each group is one fused gather/attend/scatter keyed on `(group width,
+  extent)`, so a jagged step makes one kernel call per group rather than per
+  request. Widths are powers of two up to `B`; a wider group is chunked into
+  descending powers of two.
 
 With `--max-model-len 512 --max-num-seqs 32 --max-num-batched-tokens 2048` that is
 23 shapes: one body, four rectangles (`(64,32) (128,16) (256,8) (512,4)`, each

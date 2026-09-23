@@ -335,44 +335,6 @@ class TorchSpyrePlatform(CpuPlatform):
         vllm_config.model_config.dtype = torch.float16
 
     @classmethod
-    def _cap_offset_position_max_model_len(cls, vllm_config: VllmConfig) -> None:
-        """Lower ``max_model_len`` to what an offset position embedding can index.
-
-        RoBERTa-family embeddings gather ``position_ids + pad_token_id + 1``, so the
-        usable context is ``max_position_embeddings - pad_token_id - 1`` (512 for the
-        514-row table), not the ``max_position_embeddings`` vLLM derives.
-
-        New here because the rectangular path is: it pads every sequence out to the
-        declared length, so a max-length request's pad rows alone index two past the
-        table on every request. Packed-only, positions never ran past the real prompt
-        length, so a prompt would have had to actually be 514 tokens to notice.
-        """
-        model_config = vllm_config.model_config
-        hf_config = model_config.hf_config
-        architectures = getattr(hf_config, "architectures", None) or []
-        if not any("Roberta" in arch for arch in architectures):
-            return
-        if getattr(hf_config, "position_embedding_type", "absolute") != "absolute":
-            return
-        rows = getattr(hf_config, "max_position_embeddings", None)
-        pad_token_id = getattr(hf_config, "pad_token_id", None)
-        if not isinstance(rows, int) or not isinstance(pad_token_id, int):
-            return
-        usable = rows - pad_token_id - 1
-        if usable < 1 or model_config.max_model_len <= usable:
-            return
-        logger.warning(
-            "Lowering max_model_len %d -> %d: %s offsets positions by pad_token_id+1=%d "
-            "into a %d-row position embedding.",
-            model_config.max_model_len,
-            usable,
-            architectures[0],
-            pad_token_id + 1,
-            rows,
-        )
-        model_config.max_model_len = usable
-
-    @classmethod
     def _apply_pooling_shape_defaults(cls, vllm_config: VllmConfig) -> None:
         """Normalise the pooling limits onto the declared encoder shapes.
 
@@ -383,6 +345,9 @@ class TorchSpyrePlatform(CpuPlatform):
         The scheduler is left alone -- the jagged path means no batch upstream can form
         has to be refused.
         """
+        # Model-specific, so it lives with the model; called from here because the cap
+        # has to land before the shape tables below derive from max_model_len.
+        from spyre_inference.models.roberta import cap_max_model_len_for_position_offset
         from spyre_inference.v1.worker.spyre_shape_bucketer import (
             ENCODER_SEQ_ALIGNMENT,
             encoder_budget_rows,
@@ -391,7 +356,7 @@ class TorchSpyrePlatform(CpuPlatform):
             encoder_shape_tables,
         )
 
-        cls._cap_offset_position_max_model_len(vllm_config)
+        cap_max_model_len_for_position_offset(vllm_config.model_config)
 
         scheduler_config = vllm_config.scheduler_config
         max_model_len = vllm_config.model_config.max_model_len

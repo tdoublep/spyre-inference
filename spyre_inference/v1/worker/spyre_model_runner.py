@@ -853,7 +853,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if is_pooling and not self.vllm_config.model_config.enforce_eager:
             logger.info(
                 "Warming up model: body [%d, hidden], %d encoder rectangle(s), "
-                "%d encoder group shape(s).",
+                "%d jagged-path group shape(s).",
                 self._encoder_budget,
                 len(self._encoder_rectangles),
                 len(encoder_group_shapes(self.vllm_config)),

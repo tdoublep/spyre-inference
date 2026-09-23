@@ -97,7 +97,13 @@ class EncoderShapeTables:
     rectangles: tuple[tuple[int, int], ...]
     """Rectangular path ``(L, B)``, one per length."""
     groups: tuple[tuple[int, int], ...]
-    """Jagged path ``(width, extent)``. Empty when no batch can miss the rectangular path."""
+    """The jagged path's shapes, as ``(width, extent)``.
+
+    A *group* is the unit the jagged path splits a batch into: the requests that share one
+    padded extent, dispatched together as a single ``width``-wide kernel call. So one
+    jagged step usually has several groups, and these pairs are every group shape it can
+    produce. Empty when no batch can miss the rectangular path.
+    """
 
 
 def encoder_shape_tables(vllm_config: VllmConfig) -> EncoderShapeTables:
