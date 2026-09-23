@@ -229,7 +229,7 @@ class TestEveryReachableBatchLandsOnADeclaredShape:
                 if length < 1:
                     continue
                 # Ragged as well as uniform: a step with several extents is what makes
-                # the jagged path's group space multi-dimensional.
+                # the ragged path's group space multi-dimensional.
                 for lens in (
                     [length] * num_seqs,
                     [max(1, length - i * 37) for i in range(num_seqs)],
@@ -260,7 +260,7 @@ class TestEveryReachableBatchLandsOnADeclaredShape:
         lens = [64] * 17
         plan = build_encoder_plan(
             _fake_metadata(lens),
-            # No rectangles, so the jagged path is forced regardless of the batch.
+            # No rectangles, so the ragged path is forced regardless of the batch.
             rectangles=(),
             width_cap_for={ENCODER_LEN_ALIGNMENT: 16},
             device=torch.device("cpu"),

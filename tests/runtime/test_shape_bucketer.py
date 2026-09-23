@@ -319,7 +319,7 @@ class TestEncoderDispatch:
             (16, 128, (128, 16)),
             (8, 256, (256, 8)),
             (4, 512, (512, 4)),
-            # One too wide for the length it needs: jagged path, not an error.
+            # One too wide for the length it needs: ragged path, not an error.
             (33, 64, None),
             (17, 128, None),
             (9, 256, None),
@@ -335,7 +335,7 @@ class TestEncoderDispatch:
     def test_empty_batch_returns_none(self, rectangles):
         assert encoder_rectangle_for_batch(0, 0, rectangles) is None
 
-    def test_no_rectangles_is_the_jagged_path(self):
+    def test_no_rectangles_is_the_ragged_path(self):
         assert encoder_rectangle_for_batch(1, 64, []) is None
 
 

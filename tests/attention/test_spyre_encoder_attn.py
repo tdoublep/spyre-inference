@@ -928,7 +928,7 @@ def test_grouped_attention_matches_the_per_sequence_reference(
     ],
 )
 @torch.inference_mode()
-def test_fast_and_jagged_paths_agree(
+def test_fast_and_ragged_paths_agree(
     default_vllm_config,
     query_lens: list[int],
     configure_compilation: str,
@@ -936,9 +936,9 @@ def test_fast_and_jagged_paths_agree(
 ) -> None:
     """The same batch down both paths must give the same answer.
 
-    This is what keeps the jagged path a fallback rather than a second implementation
+    This is what keeps the ragged path a fallback rather than a second implementation
     that silently diverges. The two see different inputs by construction -- the rectangular
-    path a dense ``[B, L]`` grid, the jagged path the packed list -- so the test builds
+    path a dense ``[B, L]`` grid, the ragged path the packed list -- so the test builds
     both from one set of activations and compares only the real token rows.
     """
     num_heads, num_kv_heads, head_size, block_size = 12, 12, 64, 64
@@ -991,7 +991,7 @@ def test_fast_and_jagged_paths_agree(
         grid[rows] = packed
         return grid
 
-    # Jagged path: metadata carries no plan, so the impl builds a packed one.
+    # Ragged path: metadata carries no plan, so the impl builds a packed one.
     slow_md = metadata(query_lens)
     slow_out = _vllm_style_output(packed_q, device)
     make_impl().forward(

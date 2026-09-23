@@ -315,7 +315,7 @@ exactly the extents a request can be assigned):
    reshapes, runs one `F.scaled_dot_product_attention`, and stores — no data movement
    inside the layer. `_unpad_encoder_hidden` compacts the grid back before the pooler, at a
    fixed row count so the gather does not specialise per token total.
-2. **Jagged path** — for a batch too wide for any rectangle. Q/K/V stay packed and requests
+2. **Ragged path** — for a batch too wide for any rectangle. Q/K/V stay packed and requests
    are grouped by their own padded extent; `_encoder_fused_kernel` does gather, attend and
    scatter for one group in a single graph, keyed on `(width, extent)`. Request boundaries
    ride in int32 row-index tables, so a card never does offset arithmetic on *shapes* —
@@ -342,7 +342,7 @@ the `finfo.min / 2` mask fill and the single attendable key a batch-pad lane get
 
 The body is compiled once, at `R` rows. Attention is shape-managed separately behind the
 opaque custom-op boundary: one rectangle per declared length on the rectangular path, one
-`(width, extent)` pair per group on the jagged one (a *group* being the requests that
+`(width, extent)` pair per group on the ragged one (a *group* being the requests that
 share one padded extent, attended together in one call). With `max_model_len=512`,
 `max_num_seqs=32` and a 2048-token budget that is 23 shapes — one body, four rectangles,
 18 group pairs — and at `max_num_seqs=4` only five, since no batch that narrow can miss
@@ -351,7 +351,7 @@ the rectangular path.
 <figure markdown="span">
   ![Encoder target state](encoder-ideal-state.svg){: style="width: 140%; max-width: 1400px; margin-left: -20%" }
   <figcaption>
-    Encoder / embedding models under <code>STOCK_TORCH_COMPILE</code>, <strong>jagged path
+    Encoder / embedding models under <code>STOCK_TORCH_COMPILE</code>, <strong>ragged path
     only</strong>: attention over the packed list, grouped by each request's padded
     extent. Predates the rectangular path and the single <code>R</code>-row body, so read the
     body bucketing and the warmup sweep as historical; the grouping and the row-index

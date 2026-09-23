@@ -333,7 +333,7 @@ class SpyreAttentionMetadata(AttentionMetadata):
     mask_by_chunk_dev: torch.Tensor | None = None
 
     # Which one it is *is* the path selection: one rectangle for the dense path, a list
-    # of groups for the jagged one. Imported under TYPE_CHECKING only -- the encoder
+    # of groups for the ragged one. Imported under TYPE_CHECKING only -- the encoder
     # backend imports from this module, not the other way round.
     encoder_plan: "EncoderRectPlan | list[EncoderGroupPlan] | None" = None
 

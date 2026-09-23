@@ -559,10 +559,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self._encoder_budget = encoder_shape_tables(vllm_config).budget if is_pooling else 0
         self._encoder_buffer_rows = 0
-        # (extent, width, query_lens) on the rectangular path; None on the jagged one.
+        # (extent, width, query_lens) on the rectangular path; None on the ragged one.
         self._encoder_grid: tuple[int, int, list[int]] | None = None
         self.spyre_encoder_rect_steps = 0
-        self.spyre_encoder_jagged_steps = 0
+        self.spyre_encoder_ragged_steps = 0
         self.spyre_encoder_real_tokens = 0
         self.spyre_encoder_body_rows = 0
         self.spyre_encoder_seqs = 0
@@ -853,7 +853,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if is_pooling and not self.vllm_config.model_config.enforce_eager:
             logger.info(
                 "Warming up model: body [%d, hidden], %d encoder rectangle(s), "
-                "%d jagged-path group shape(s).",
+                "%d ragged-path group shape(s).",
                 self._encoder_budget,
                 len(self._encoder_rectangles),
                 len(encoder_group_shapes(self.vllm_config)),
@@ -1100,7 +1100,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             # Stale grid would silently mislay this step's tokens in `_preprocess`.
             self._encoder_grid = None
             if isinstance(plan, list):
-                self.spyre_encoder_jagged_steps += 1
+                self.spyre_encoder_ragged_steps += 1
                 self._record_encoder_dispatch(
                     sum(sum(group.query_lens) for group in plan),
                     sum(group.group for group in plan),
@@ -1120,7 +1120,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         self.spyre_encoder_real_tokens += real_tokens
         self.spyre_encoder_body_rows += rows
         self.spyre_encoder_seqs += num_seqs
-        steps = self.spyre_encoder_rect_steps + self.spyre_encoder_jagged_steps
+        steps = self.spyre_encoder_rect_steps + self.spyre_encoder_ragged_steps
         if steps % _ENCODER_DISPATCH_LOG_EVERY:
             return
         logger.info(
@@ -1128,7 +1128,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
             "body occupancy %.1f%% (%d real tokens in %d rows).",
             steps,
             self.spyre_encoder_rect_steps,
-            self.spyre_encoder_jagged_steps,
+            self.spyre_encoder_ragged_steps,
             self.spyre_encoder_seqs / steps,
             100.0 * self.spyre_encoder_real_tokens / max(1, self.spyre_encoder_body_rows),
             self.spyre_encoder_real_tokens,
@@ -1288,7 +1288,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         The gather keeps its input's row count: sizing it to the real token count adds
         a ``torch.compile`` specialisation per distinct total, recompiling nearly every
-        step once prompt lengths vary. The jagged path is already packed, and every
+        step once prompt lengths vary. The ragged path is already packed, and every
         pooler either gathers by row index or crops on the host, so its trailing pad
         needs no gather at all.
         """
@@ -1459,7 +1459,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
 
         # Not a crop: the row count stays the buffer's. On the rectangular path this
-        # re-compacts the grid to the packed order the cursor addresses; on the jagged
+        # re-compacts the grid to the packed order the cursor addresses; on the ragged
         # path it is a no-op, since each pooler gathers itself from host cursor counts.
         hidden_states = self._unpad_encoder_hidden(
             convert(hidden_states, self._spyre_device), num_scheduled_tokens

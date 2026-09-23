@@ -20,7 +20,7 @@ the nearest bucket ``>=`` actual ``num_tokens``. Linear / LN compile on ``[T, â€
 Pooling has one body shape, ``R`` rows, where ``R`` is the token budget (see
 ``encoder_budget``). Fixing it is what reduces the encoder attention kernels'
 cache keys to the sequence shapes alone: both the rectangular path's rectangle and the
-jagged path's fused gather/attend/store take the body buffer as an argument, so a
+ragged path's fused gather/attend/store take the body buffer as an argument, so a
 varying buffer size would multiply every attention graph.
 
 On top of that one buffer sit two shape families, both derived from a single
@@ -28,7 +28,7 @@ power-of-two length ladder:
 
 * ``encoder_rectangles`` -- the rectangular path. One ``(L, B)`` per length, ``B = R // L``,
   so the grid is exactly the body buffer and a batch needs no per-layer movement.
-* ``encoder_group_shapes`` -- the jagged path, for batches too wide for a rectangle.
+* ``encoder_group_shapes`` -- the ragged path, for batches too wide for a rectangle.
   One ``(width, extent)`` per group of equal-extent requests.
 """
 
@@ -97,11 +97,11 @@ class EncoderShapeTables:
     rectangles: tuple[tuple[int, int], ...]
     """Rectangular path ``(L, B)``, one per length."""
     groups: tuple[tuple[int, int], ...]
-    """The jagged path's shapes, as ``(width, extent)``.
+    """The ragged path's shapes, as ``(width, extent)``.
 
-    A *group* is the unit the jagged path splits a batch into: the requests that share one
+    A *group* is the unit the ragged path splits a batch into: the requests that share one
     padded extent, dispatched together as a single ``width``-wide kernel call. So one
-    jagged step usually has several groups, and these pairs are every group shape it can
+    ragged step usually has several groups, and these pairs are every group shape it can
     produce. Empty when no batch can miss the rectangular path.
     """
 
@@ -194,15 +194,15 @@ def _encoder_lengths(max_model_len: int) -> tuple[int, ...]:
 def _encoder_groups(
     lengths: tuple[int, ...], budget: int, max_num_seqs: int
 ) -> tuple[tuple[int, int], ...]:
-    """Jagged-path ``(width, extent)`` pairs, widths powers of two up to ``B(e)``.
+    """Ragged-path ``(width, extent)`` pairs, widths powers of two up to ``B(e)``.
 
-    Empty when the rectangular path cannot miss. Dispatch takes the jagged path only when
+    Empty when the rectangular path cannot miss. Dispatch takes the ragged path only when
     ``num_seqs > budget // L``, and ``L`` is largest -- so ``budget // L`` smallest --
     at the top of the ladder; if ``max_num_seqs`` does not exceed that, no schedulable
     batch reaches this family and warming it would compile the most expensive graphs
     in the run for nothing.
 
-    Several widths per extent, unlike the rectangular path's one: a jagged-path step has
+    Several widths per extent, unlike the rectangular path's one: a ragged-path step has
     several groups, and padding each up to ``B(e)`` would cost ``budget`` rows per
     group rather than per step.
     """
@@ -260,7 +260,7 @@ def encoder_rectangles(vllm_config: VllmConfig) -> list[tuple[int, int]]:
 
 
 def encoder_group_shapes(vllm_config: VllmConfig) -> list[tuple[int, int]]:
-    """Jagged-path ``(width, extent)`` table; empty when the rectangular path cannot miss."""
+    """Ragged-path ``(width, extent)`` table; empty when the rectangular path cannot miss."""
     return list(encoder_shape_tables(vllm_config).groups)
 
 
@@ -277,7 +277,7 @@ def encoder_rectangle_for_batch(
     max_len: int,
     rectangles: Sequence[tuple[int, int]],
 ) -> tuple[int, int] | None:
-    """The ``(extent, width)`` this batch runs in, or ``None`` to take the jagged path.
+    """The ``(extent, width)`` this batch runs in, or ``None`` to take the ragged path.
 
     Takes the shortest declared length that covers ``max_len``, and only if the batch is
     no wider than that length's rectangle -- a longer length would pad every sequence

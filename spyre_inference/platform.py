@@ -342,7 +342,7 @@ class TorchSpyrePlatform(CpuPlatform):
         from it: ``max_num_seqs`` downwards, and ``compile_sizes`` to the single body
         shape every encoder path runs on.
 
-        The scheduler is left alone -- the jagged path means no batch upstream can form
+        The scheduler is left alone -- the ragged path means no batch upstream can form
         has to be refused.
         """
         # Model-specific, so it lives with the model; called from here because the cap
@@ -390,7 +390,7 @@ class TorchSpyrePlatform(CpuPlatform):
         budget = encoder_shape_tables(vllm_config).budget
         scheduler_config.max_num_batched_tokens = budget
 
-        # One body shape: every rectangle is exactly `budget` rows and the jagged path
+        # One body shape: every rectangle is exactly `budget` rows and the ragged path
         # packs into the same buffer, so the attention kernels key on sequence shapes
         # alone. A user-set list still wins, including an empty one to opt out (#911).
         if vllm_config.compilation_config.compile_sizes is None:
@@ -399,7 +399,7 @@ class TorchSpyrePlatform(CpuPlatform):
         logger.info(
             "Pooling encoder shapes for max_model_len=%d, max_num_seqs=%d, "
             "max_num_batched_tokens=%d: body [%d, hidden]; rectangles "
-            "(L, B) %s; jagged groups (width, extent) %s.",
+            "(L, B) %s; ragged groups (width, extent) %s.",
             max_model_len,
             scheduler_config.max_num_seqs,
             budget,

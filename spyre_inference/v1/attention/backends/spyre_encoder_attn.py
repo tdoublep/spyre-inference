@@ -300,7 +300,7 @@ def _encoder_fused_kernel(
     num_kv_heads,
     head_size,
 ):
-    """Jagged path: gather, attend and store one group of equal-extent requests.
+    """Ragged path: gather, attend and store one group of equal-extent requests.
 
     Attention accounts for most of a step's jobplan launches, and each launch carries
     its own parameter upload, so collapsing three graphs into one is a device-path
@@ -353,7 +353,7 @@ class EncoderRectPlan:
 
 @dataclass
 class EncoderGroupPlan:
-    """Jagged path: one group of equal-extent requests inside the packed buffer.
+    """Ragged path: one group of equal-extent requests inside the packed buffer.
 
     A group of one is the ordinary single-request case, so this covers both.
     """
@@ -647,7 +647,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
         plan = attn_metadata.encoder_plan
         if plan is None:
-            # Fallback for a caller that did not pre-build one. Jagged path only: the grid
+            # Fallback for a caller that did not pre-build one. Ragged path only: the grid
             # layout is a contract with ``_preprocess``, so a rectangle the runner did
             # not lay out would read the wrong rows.
             plan = build_encoder_plan(

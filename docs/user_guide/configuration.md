@@ -78,10 +78,10 @@ then lowered to `R / 64` if it was higher, since no batch wider than that fits.
   runner pads every sequence to `L` and the batch to `B`, so Q/K/V *are* the grid:
   one reshape, one `F.scaled_dot_product_attention`, one store, no data movement
   inside the layer. Taken whenever `num_seqs <= B`.
-- **Attention, jagged path**: for a batch too wide for any rectangle, Q/K/V stay
+- **Attention, ragged path**: for a batch too wide for any rectangle, Q/K/V stay
   packed and requests are split into *groups* — the requests sharing one padded
   length. Each group is one fused gather/attend/scatter keyed on `(group width,
-  extent)`, so a jagged step makes one kernel call per group rather than per
+  extent)`, so a ragged step makes one kernel call per group rather than per
   request. Widths are powers of two up to `B`; a wider group is chunked into
   descending powers of two.
 
@@ -93,7 +93,7 @@ empty — no batch that narrow can miss the rectangular path — leaving five sh
 Both paths go through the same opaque attention op, so the block graph is identical
 for either and the choice is made once per step from the step's metadata. The
 runner counts them in `spyre_encoder_rect_steps` /
-`spyre_encoder_jagged_steps`.
+`spyre_encoder_ragged_steps`.
 
 Compiled pooling warmup runs one dummy at the body shape; the first attention call
 in it traces every declared rectangle and group pair, against that call's own
