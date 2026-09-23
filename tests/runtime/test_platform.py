@@ -219,9 +219,9 @@ def _pooling_platform_config(*, max_model_len=512, max_num_seqs=32, max_num_batc
     vllm_config.scheduler_config.max_num_batched_tokens = max_num_batched_tokens
     vllm_config.compilation_config.mode = CompilationMode.STOCK_TORCH_COMPILE
     vllm_config.compilation_config.custom_ops = ["all"]
-    # Empty list is falsy, so the platform generates pooling defaults.
-    # A MagicMock here is truthy and would skip that path (#638).
-    vllm_config.compilation_config.compile_sizes = []
+    # None requests pooling defaults. A MagicMock here is not None and would
+    # skip that path (#638).
+    vllm_config.compilation_config.compile_sizes = None
     return vllm_config
 
 
@@ -546,7 +546,7 @@ def test_compile_sizes_default_generated():
     from spyre_inference.platform import TorchSpyrePlatform
 
     vllm_config = _defaults_config(enforce_eager=False, mode=None)
-    vllm_config.compilation_config.compile_sizes = []
+    vllm_config.compilation_config.compile_sizes = None
     vllm_config.scheduler_config.max_num_seqs = 4
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
@@ -558,7 +558,7 @@ def test_compile_sizes_default_includes_non_power_of_two_max_num_seqs():
     from spyre_inference.platform import TorchSpyrePlatform
 
     vllm_config = _defaults_config(enforce_eager=False, mode=None)
-    vllm_config.compilation_config.compile_sizes = []
+    vllm_config.compilation_config.compile_sizes = None
     vllm_config.scheduler_config.max_num_seqs = 6
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
@@ -596,13 +596,27 @@ def test_compile_sizes_default_caps_at_max_num_batched_tokens():
     from spyre_inference.platform import TorchSpyrePlatform
 
     vllm_config = _defaults_config(enforce_eager=False, mode=None)
-    vllm_config.compilation_config.compile_sizes = []
+    vllm_config.compilation_config.compile_sizes = None
     vllm_config.scheduler_config.max_num_seqs = 4
     vllm_config.scheduler_config.max_num_batched_tokens = 32
 
     TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
 
     assert vllm_config.compilation_config.compile_sizes == [1, 2, 4, 32]
+    assert vllm_config.scheduler_config.max_num_batched_tokens == 32
+
+
+def test_compile_sizes_empty_list_opts_out():
+    """An explicit empty list disables bucketing and leaves the scheduler alone."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _defaults_config(enforce_eager=False, mode=None)
+    vllm_config.compilation_config.compile_sizes = []
+    vllm_config.scheduler_config.max_num_batched_tokens = 32
+
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+
+    assert vllm_config.compilation_config.compile_sizes == []
     assert vllm_config.scheduler_config.max_num_batched_tokens == 32
 
 

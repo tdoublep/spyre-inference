@@ -297,27 +297,30 @@ class TorchSpyrePlatform(CpuPlatform):
             if all(s not in vllm_config.compilation_config.custom_ops for s in ("all", "none")):
                 vllm_config.compilation_config.custom_ops.append("all")
 
+            # Body: 1D compile_sizes (packed token counts). Honor a user-set list
+            # (#638), including an empty one to opt out of bucketing; otherwise
+            # generate defaults. None only reaches us because this hook runs before
+            # post_init_cudagraph_sizes(), which rewrites None to [].
             if vllm_config.model_config.runner_type == "pooling":
                 cls._apply_pooling_shape_defaults(vllm_config)
+                compile_sizes = vllm_config.compilation_config.compile_sizes
+            elif vllm_config.compilation_config.compile_sizes is not None:
+                compile_sizes = vllm_config.compilation_config.compile_sizes
             else:
-                # Body: 1D compile_sizes (packed token counts).
-                # Honor a user-set list (#638); otherwise generate defaults.
-                if vllm_config.compilation_config.compile_sizes:
-                    compile_sizes = vllm_config.compilation_config.compile_sizes
-                else:
-                    # Largest default bucket: scheduler limit and 512 (Spyre max).
-                    # Decode packs one token per running sequence; prefill lands on
-                    # the single largest bucket. Denser sizes only cost warmup time.
-                    max_capture_size = min(vllm_config.scheduler_config.max_num_batched_tokens, 512)
-                    num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
-                    sizes = {max_capture_size, num_seqs}
-                    size = 1
-                    while size < num_seqs:
-                        sizes.add(size)
-                        size *= 2
-                    compile_sizes = sorted(sizes)
-                    vllm_config.compilation_config.compile_sizes = compile_sizes
+                # Largest default bucket: scheduler limit and 512 (Spyre max).
+                # Decode packs one token per running sequence; prefill lands on
+                # the single largest bucket. Denser sizes only cost warmup time.
+                max_capture_size = min(vllm_config.scheduler_config.max_num_batched_tokens, 512)
+                num_seqs = min(vllm_config.scheduler_config.max_num_seqs, max_capture_size)
+                sizes = {max_capture_size, num_seqs}
+                size = 1
+                while size < num_seqs:
+                    sizes.add(size)
+                    size *= 2
+                compile_sizes = sorted(sizes)
+                vllm_config.compilation_config.compile_sizes = compile_sizes
 
+            if compile_sizes:
                 max_capture_size = max(int(s) for s in compile_sizes)
                 # Scheduler must not send more tokens than the largest body bucket.
                 vllm_config.scheduler_config.max_num_batched_tokens = max_capture_size
@@ -419,9 +422,11 @@ class TorchSpyrePlatform(CpuPlatform):
         budget = encoder_shape_tables(vllm_config).budget
         scheduler_config.max_num_batched_tokens = budget
 
-        # One body shape: every rectangle is exactly `budget` rows and the slow path packs
-        # into the same buffer, so the attention kernels key on sequence shapes alone.
-        vllm_config.compilation_config.compile_sizes = [budget]
+        # One body shape: every rectangle is exactly `budget` rows and the jagged path
+        # packs into the same buffer, so the attention kernels key on sequence shapes
+        # alone. A user-set list still wins, including an empty one to opt out (#911).
+        if vllm_config.compilation_config.compile_sizes is None:
+            vllm_config.compilation_config.compile_sizes = [budget]
 
         logger.info(
             "Pooling encoder shapes for max_model_len=%d, max_num_seqs=%d, "
