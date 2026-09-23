@@ -348,6 +348,29 @@ def expand_packed_to_encoder_grid(
     )
 
 
+def expand_packed_token_types(
+    token_type_ids: torch.Tensor,
+    query_lens: Sequence[int],
+    batch_bucket: int,
+    len_bucket: int,
+) -> torch.Tensor:
+    """Scatter packed segment ids into the ``[B*L]`` grid; every pad slot is segment 0.
+
+    One value per packed token, so it takes the same layout as ``input_ids``. Left packed
+    it would pair each sequence's segment ids with another sequence's tokens, and
+    silently: the buffer still matches ``input_ids`` in shape, so the all-zeros fallback
+    in ``spyre_token_type_embeddings`` never fires.
+    """
+    values = token_type_ids.tolist()
+    grid = [0] * (batch_bucket * len_bucket)
+    src = 0
+    for seq_idx, length in enumerate(query_lens):
+        dst = seq_idx * len_bucket
+        grid[dst : dst + length] = values[src : src + length]
+        src += length
+    return torch.tensor(grid, dtype=token_type_ids.dtype)
+
+
 def logits_row_buckets(bucket_sizes: Sequence[int], max_num_reqs: int) -> list[int]:
     """Row widths the lm_head can see: each body bucket clipped to ``max_num_reqs``."""
     cap = max(1, max_num_reqs)

@@ -41,7 +41,7 @@ from __future__ import annotations
 import bisect
 import time
 from contextlib import contextmanager
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -108,6 +108,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_rectangles,
     encoder_shape_tables,
     expand_packed_to_encoder_grid,
+    expand_packed_token_types,
     logits_row_buckets,
 )
 
@@ -1343,11 +1344,35 @@ class TorchSpyreModelRunner(GPUModelRunner):
             pad_token_id=self._encoder_pad_token_id(),
         )
         assert ids.shape[0] == width * extent, (ids.shape[0], width * extent)
+
+        # token_type_ids rides through `rest` in model_kwargs and is one value per packed
+        # token, so it needs the same rearrangement or every sequence past the first gets
+        # another's segment ids. Scanned for rather than indexed, to avoid pinning this
+        # override to upstream's return arity.
+        regrouped = []
+        for item in rest:
+            if not isinstance(item, dict):
+                regrouped.append(item)
+                continue
+            model_kwargs = cast(dict[str, Any], item)
+            token_types = model_kwargs.get("token_type_ids")
+            if token_types is not None:
+                model_kwargs = {
+                    **model_kwargs,
+                    "token_type_ids": convert(
+                        expand_packed_token_types(
+                            token_types[:num_tokens].cpu(), query_lens, width, extent
+                        ),
+                        token_types.device,
+                    ),
+                }
+            regrouped.append(model_kwargs)
+
         return (
             convert(ids, input_ids.device),
             inputs_embeds,
             convert(pos, positions.device),
-            *rest,
+            *regrouped,
         )
 
     def _encoder_pad_token_id(self) -> int:

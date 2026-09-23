@@ -24,6 +24,7 @@ import torch
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     encoder_dense_row_indices,
     expand_packed_to_encoder_grid,
+    expand_packed_token_types,
 )
 
 
@@ -105,3 +106,43 @@ def test_a_length_past_the_extent_is_rejected():
 
 def test_empty_batch_yields_no_rows():
     assert encoder_dense_row_indices([], 64).numel() == 0
+
+
+@pytest.mark.parametrize("query_lens", [[4, 2], [64, 64], [1, 64, 32], [7, 1, 63, 64]])
+def test_token_types_follow_the_same_rows_as_the_ids(query_lens):
+    """Segment ids must land on the tokens they describe. Left packed, every sequence
+    past the first pairs with another's tokens -- and silently, since the buffer still
+    matches ``input_ids`` in shape."""
+    extent, width = 64, len(query_lens) + 2
+    total = sum(query_lens)
+    ids = torch.arange(1, total + 1, dtype=torch.int64)
+    positions = torch.cat([torch.arange(n, dtype=torch.int64) for n in query_lens])
+    # Distinct per sequence, so a misplaced run is visible rather than coincidentally equal.
+    token_types = torch.cat(
+        [torch.full((n,), seq_idx % 2, dtype=torch.int32) for seq_idx, n in enumerate(query_lens)]
+    )
+
+    grid_ids, _ = expand_packed_to_encoder_grid(ids, positions, query_lens, width, extent)
+    grid_types = expand_packed_token_types(token_types, query_lens, width, extent)
+
+    assert grid_types.shape == grid_ids.shape
+    rows = encoder_dense_row_indices(query_lens, extent)
+    assert torch.equal(grid_types[rows], token_types)
+    # Every pad slot -- interior and batch-pad lane -- is segment 0.
+    pad = torch.ones(width * extent, dtype=torch.bool)
+    pad[rows] = False
+    assert not grid_types[pad].any()
+
+
+def test_token_types_are_not_left_packed():
+    """The bug this guards: a contiguous copy pairs sequence 1's segment ids with
+    sequence 0's pad rows."""
+    extent, width = 64, 2
+    query_lens = [4, 3]
+    token_types = torch.tensor([0, 0, 0, 0, 1, 1, 1], dtype=torch.int32)
+
+    grid = expand_packed_token_types(token_types, query_lens, width, extent)
+
+    assert grid[:4].tolist() == [0, 0, 0, 0]
+    assert grid[4:extent].sum() == 0, "sequence 0's pad rows must not carry segment 1"
+    assert grid[extent : extent + 3].tolist() == [1, 1, 1]
