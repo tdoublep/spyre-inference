@@ -236,6 +236,24 @@ def test_apply_config_gives_pooling_one_body_shape():
     assert vllm_config.scheduler_config.max_num_batched_tokens == 512
 
 
+@pytest.mark.parametrize("enforce_eager", [False, True], ids=["compiled", "eager"])
+def test_apply_config_caps_roberta_max_model_len_on_both_paths(enforce_eager):
+    """Eager pads to the declared length too, so an uncapped 514 would index two rows
+    past the position table on every full-length request."""
+    from spyre_inference.platform import TorchSpyrePlatform
+
+    vllm_config = _pooling_platform_config(max_model_len=514)
+    vllm_config.model_config.enforce_eager = enforce_eager
+    vllm_config.model_config.hf_config = SimpleNamespace(
+        architectures=["XLMRobertaForSequenceClassification"],
+        max_position_embeddings=514,
+        pad_token_id=1,
+        position_embedding_type="absolute",
+    )
+    TorchSpyrePlatform.apply_config_platform_defaults(vllm_config)
+    assert vllm_config.model_config.max_model_len == 512
+
+
 def test_apply_config_floors_the_pooling_budget_at_max_model_len():
     """Encoder prefill cannot be chunked, so a budget below max_model_len would
     head-of-line block the scheduler forever."""

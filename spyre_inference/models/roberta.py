@@ -60,9 +60,9 @@ def cap_max_model_len_for_position_offset(model_config: Any) -> None:
     table on every request. Packed-only, positions never ran past the real prompt length,
     so a prompt had to actually be 514 tokens to notice.
 
-    Called from ``TorchSpyrePlatform.check_and_update_config`` rather than from this
-    module's model classes, which are not imported until load: the cap has to land before
-    the encoder shape tables derive from ``max_model_len`` and before vLLM's
+    Called from ``TorchSpyrePlatform.apply_config_platform_defaults`` rather than from
+    this module's model classes, which are not imported until load: the cap has to land
+    before the encoder shape tables derive from ``max_model_len`` and before vLLM's
     ``SchedulerConfig`` validation. No-op for every other architecture.
     """
     hf_config = model_config.hf_config

@@ -1259,8 +1259,11 @@ class TorchSpyreModelRunner(GPUModelRunner):
         if not self._pooling_on_spyre:
             return
         rows = hidden_states.shape[0]
+        # Up to the power of two at or above the limit, which is not itself always one:
+        # 6 sequences round up to 8 rows, so stopping at the limit misses that width.
+        limit = 1 << max(0, self.scheduler_config.max_num_seqs - 1).bit_length()
         width = 1
-        while width <= self.scheduler_config.max_num_seqs:
+        while width <= limit:
             if width <= rows:
                 select_rows(hidden_states, torch.zeros(width, dtype=torch.int64))
             width *= 2

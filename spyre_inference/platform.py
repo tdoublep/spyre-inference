@@ -274,6 +274,14 @@ class TorchSpyrePlatform(CpuPlatform):
         if vllm_config.model_config is None:
             return
 
+        # Eager pads to the declared length just like the compiled path, so the cap has
+        # to land before the split below -- and before anything derives from
+        # max_model_len.
+        if vllm_config.model_config.runner_type == "pooling":
+            from spyre_inference.models.roberta import cap_max_model_len_for_position_offset
+
+            cap_max_model_len_for_position_offset(vllm_config.model_config)
+
         # Key off enforce_eager, not compilation_config.mode: vLLM rewrites the
         # mode between repeated invocations of this hook (e.g. in the EngineCore
         # subprocess), while enforce_eager persists, so it's the only stable signal.
@@ -345,9 +353,6 @@ class TorchSpyrePlatform(CpuPlatform):
         The scheduler is left alone -- the ragged path means no batch upstream can form
         has to be refused.
         """
-        # Model-specific, so it lives with the model; called from here because the cap
-        # has to land before the shape tables below derive from max_model_len.
-        from spyre_inference.models.roberta import cap_max_model_len_for_position_offset
         from spyre_inference.v1.worker.spyre_shape_bucketer import (
             ENCODER_SEQ_ALIGNMENT,
             encoder_budget_rows,
@@ -355,8 +360,6 @@ class TorchSpyrePlatform(CpuPlatform):
             encoder_rectangles,
             encoder_shape_tables,
         )
-
-        cap_max_model_len_for_position_offset(vllm_config.model_config)
 
         scheduler_config = vllm_config.scheduler_config
         max_model_len = vllm_config.model_config.max_model_len
