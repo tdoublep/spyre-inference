@@ -819,7 +819,6 @@ def test_encoder_build_survives_a_body_bucket_past_max_model_len(default_vllm_co
 @torch.inference_mode()
 def test_grouped_attention_matches_the_per_sequence_reference(
     default_vllm_config,
-    monkeypatch,
     batched: bool,
     seq_lens: list[tuple[int, int]],
     configure_compilation: str,
@@ -833,10 +832,6 @@ def test_grouped_attention_matches_the_per_sequence_reference(
     while having different real ``kv_len`` -- only their masks differ, and those
     are concatenated in member order to match the kernel's folded batch dim.
     """
-    from spyre_inference import envs
-
-    monkeypatch.setattr(envs, "SPYRE_ENCODER_BATCHED_ATTN", batched, raising=False)
-
     num_heads, num_kv_heads, head_size, block_size = 12, 12, 64, 64
     dtype = torch.float16
     torch.set_default_device("cpu")
@@ -876,9 +871,17 @@ def test_grouped_attention_matches_the_per_sequence_reference(
         kv_cache_dtype="auto",
         logits_soft_cap=None,
     )
-    assert impl._batched_attn == batched, "the opt-in flag must reach the impl"
-
     output = _vllm_style_output(query, torch.device(configure_device))
+    # Pre-built rather than left to the impl, which always groups under a compiled
+    # config: `batched=False` is the shape the eager path builds.
+    attn_metadata.encoder_plan = build_encoder_plan(
+        attn_metadata,
+        rectangles=(),
+        width_cap_for=impl._width_caps,
+        device=output.device,
+        dtype=dtype,
+        batched=batched,
+    )
     impl.forward(
         layer=None,
         query=query,
@@ -889,10 +892,13 @@ def test_grouped_attention_matches_the_per_sequence_reference(
         output=output,
     )
 
+    groups = [getattr(p, "group", 1) for p in attn_metadata.encoder_plan]
     if batched:
-        assert any(getattr(p, "group", 1) > 1 for p in attn_metadata.encoder_plan), (
+        assert any(g > 1 for g in groups), (
             "grouping was enabled but every plan stayed a single sequence"
         )
+    else:
+        assert groups == [1] * len(groups), "grouping was disabled but a plan batched"
 
     ref_output = ref_encoder_attn(
         query=query, key=key, value=value, query_lens=query_lens, scale=scale
@@ -922,7 +928,7 @@ def test_grouped_attention_matches_the_per_sequence_reference(
     ],
 )
 @torch.inference_mode()
-def test_fast_and_slow_paths_agree(
+def test_fast_and_jagged_paths_agree(
     default_vllm_config,
     query_lens: list[int],
     configure_compilation: str,
@@ -930,9 +936,9 @@ def test_fast_and_slow_paths_agree(
 ) -> None:
     """The same batch down both paths must give the same answer.
 
-    This is what keeps the slow path a fallback rather than a second implementation
-    that silently diverges. The two see different inputs by construction -- the fast
-    path a dense ``[B, L]`` grid, the slow path the packed list -- so the test builds
+    This is what keeps the jagged path a fallback rather than a second implementation
+    that silently diverges. The two see different inputs by construction -- the rectangular
+    path a dense ``[B, L]`` grid, the jagged path the packed list -- so the test builds
     both from one set of activations and compares only the real token rows.
     """
     num_heads, num_kv_heads, head_size, block_size = 12, 12, 64, 64
@@ -985,7 +991,7 @@ def test_fast_and_slow_paths_agree(
         grid[rows] = packed
         return grid
 
-    # Slow path: metadata carries no plan, so the impl builds a packed one.
+    # Jagged path: metadata carries no plan, so the impl builds a packed one.
     slow_md = metadata(query_lens)
     slow_out = _vllm_style_output(packed_q, device)
     make_impl().forward(
@@ -999,7 +1005,7 @@ def test_fast_and_slow_paths_agree(
     )
     assert not isinstance(slow_md.encoder_plan, EncoderRectPlan), "expected the packed path"
 
-    # Fast path: the runner would have padded the body and laid out the grid, so the
+    # Rectangular path: the runner would have padded the body and laid out the grid, so the
     # plan is built here with the covering rectangle declared.
     grid_q = to_grid(packed_q, num_heads)
     fast_md = metadata(query_lens)

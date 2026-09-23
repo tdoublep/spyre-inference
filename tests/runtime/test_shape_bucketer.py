@@ -22,10 +22,10 @@ import pytest
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
     SpyreShapeBucketer,
     encoder_budget_rows,
-    encoder_fast_path_shape,
     encoder_group_shapes,
     encoder_group_width_caps,
     encoder_len_ladder,
+    encoder_rectangle_for,
     encoder_rectangles,
     encoder_shape_tables,
     encoder_width_for,
@@ -245,7 +245,7 @@ class TestEncoderGroupShapes:
             assert width & (width - 1) == 0
             assert width <= encoder_width_for(extent, cfg)
 
-    def test_empty_when_the_fast_path_cannot_miss(self):
+    def test_empty_when_the_rectangle_cannot_miss(self):
         """``max_num_seqs`` at or below ``R // longest length`` means every batch fits a
         rectangle, so the group family is unreachable and warming it is pure cost."""
         cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=4, max_num_batched_tokens=2048)
@@ -271,7 +271,7 @@ class TestEncoderDispatch:
             (16, 128, (128, 16)),
             (8, 256, (256, 8)),
             (4, 512, (512, 4)),
-            # One too wide for the length it needs: slow path, not an error.
+            # One too wide for the length it needs: jagged path, not an error.
             (33, 64, None),
             (17, 128, None),
             (9, 256, None),
@@ -282,13 +282,13 @@ class TestEncoderDispatch:
         ],
     )
     def test_selection(self, rectangles, num_seqs, max_len, expected):
-        assert encoder_fast_path_shape(num_seqs, max_len, rectangles) == expected
+        assert encoder_rectangle_for(num_seqs, max_len, rectangles) == expected
 
     def test_empty_batch_returns_none(self, rectangles):
-        assert encoder_fast_path_shape(0, 0, rectangles) is None
+        assert encoder_rectangle_for(0, 0, rectangles) is None
 
-    def test_no_rectangles_is_the_slow_path(self):
-        assert encoder_fast_path_shape(1, 64, []) is None
+    def test_no_rectangles_is_the_jagged_path(self):
+        assert encoder_rectangle_for(1, 64, []) is None
 
 
 class TestLogitsRowBuckets:

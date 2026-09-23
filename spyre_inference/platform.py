@@ -340,9 +340,12 @@ class TorchSpyrePlatform(CpuPlatform):
 
         RoBERTa-family embeddings gather ``position_ids + pad_token_id + 1``, so the
         usable context is ``max_position_embeddings - pad_token_id - 1`` (512 for the
-        514-row table), not the ``max_position_embeddings`` vLLM derives. The fast path
-        pads every sequence to the declared length, so the pad rows alone index two
-        past the table on every request.
+        514-row table), not the ``max_position_embeddings`` vLLM derives.
+
+        New here because the rectangular path is: it pads every sequence out to the
+        declared length, so a max-length request's pad rows alone index two past the
+        table on every request. Packed-only, positions never ran past the real prompt
+        length, so a prompt would have had to actually be 514 tokens to notice.
         """
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
@@ -377,7 +380,7 @@ class TorchSpyrePlatform(CpuPlatform):
         from it: ``max_num_seqs`` downwards, and ``compile_sizes`` to the single body
         shape every encoder path runs on.
 
-        The scheduler is left alone -- the slow path means no batch upstream can form
+        The scheduler is left alone -- the jagged path means no batch upstream can form
         has to be refused.
         """
         from spyre_inference.v1.worker.spyre_shape_bucketer import (
@@ -430,8 +433,8 @@ class TorchSpyrePlatform(CpuPlatform):
 
         logger.info(
             "Pooling encoder shapes for max_model_len=%d, max_num_seqs=%d, "
-            "max_num_batched_tokens=%d: body [%d, hidden]; fast-path rectangles "
-            "(L, B) %s; slow-path groups (width, extent) %s.",
+            "max_num_batched_tokens=%d: body [%d, hidden]; rectangles "
+            "(L, B) %s; jagged groups (width, extent) %s.",
             max_model_len,
             scheduler_config.max_num_seqs,
             budget,

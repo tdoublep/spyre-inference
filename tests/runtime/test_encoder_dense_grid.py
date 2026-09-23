@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""The fast path's grid layout is a contract between two places in the runner:
+"""The rectangular path's grid layout is a contract between two places in the runner:
 ``_preprocess`` scatters the packed tokens into ``[B*L]``, and ``_unpad_encoder_hidden``
 gathers them back for the pooler. They share one row-index table, so a round trip is
 the thing worth testing.

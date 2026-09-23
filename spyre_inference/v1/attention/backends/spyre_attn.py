@@ -18,7 +18,7 @@ import contextlib
 import functools
 import time
 from dataclasses import dataclass, field
-from typing import ClassVar, NamedTuple
+from typing import TYPE_CHECKING, ClassVar, NamedTuple
 
 import torch
 from torch._dynamo.utils import counters
@@ -57,6 +57,12 @@ from spyre_inference.v1.attention.spyre_attn_bucketer import (
     batched_decode_chunking,
 )
 from spyre_inference.v1.worker import compile_guard
+
+if TYPE_CHECKING:
+    from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+        EncoderGroupPlan,
+        EncoderRectPlan,
+    )
 
 logger = init_logger(__name__)
 
@@ -180,52 +186,14 @@ _warmup_complete = False
 
 
 def mark_warmup_complete() -> None:
-    """Arm the late-compile warning, once warmup has claimed full variant coverage.
-
-    Syncs the graph counter too. Warmup's last compiles are the pooler's, which run
-    after the final attention kernel call, so nothing else would account for them --
-    and the first real request would then report them as compiled outside warmup.
-    """
-    global _warmup_complete, _last_graph_count
-    _last_graph_count = counters["stats"]["unique_graphs"]
+    """Arm the late-compile warning, once warmup has claimed full variant coverage."""
+    global _warmup_complete
     _warmup_complete = True
 
 
 def is_warmup_complete() -> bool:
-    """Whether ``mark_warmup_complete`` has run.
-
-    Load-bearing: it arms the late-compile warning, which is how constraint "nothing
-    compiles in the serving path" is checked rather than assumed.
-    """
+    """Whether ``mark_warmup_complete`` has run. For diagnostics, not control flow."""
     return _warmup_complete
-
-
-# Graph count as of the last time some code path accounted for it. Every compile
-# after warmup is attributed either to a kernel label or, via
-# ``note_unattributed_compiles``, to whatever ran between two kernel calls.
-_last_graph_count = 0
-_late_compiles: dict[str, int] = {}
-
-
-def note_unattributed_compiles(where: str) -> None:
-    """Report graphs compiled outside our kernels, which ``_call_kernel`` cannot see.
-
-    Without this a compile in the body or pooler is invisible, so "no warning"
-    does not mean "no compiles".
-    """
-    global _last_graph_count
-    now = counters["stats"]["unique_graphs"]
-    if _warmup_complete and now > _last_graph_count:
-        delta = now - _last_graph_count
-        _late_compiles[where] = _late_compiles.get(where, 0) + delta
-        logger.warning(
-            "%d graph(s) compiled outside warmup and outside an attention kernel "
-            "(observed at %s; %d total there)",
-            delta,
-            where,
-            _late_compiles[where],
-        )
-    _last_graph_count = now
 
 
 def _call_kernel(label: str, fn, *args):
@@ -236,24 +204,16 @@ def _call_kernel(label: str, fn, *args):
     That assumes nothing else compiles concurrently on another thread, which holds for
     a single-tenant serving process; if it ever stops holding, the cost is a spurious
     warning, not a wrong result.
-
-    Logged on every occurrence: ``warning_once`` dedups on the message, so it
-    reported "at least one" as though it were exactly one.
     """
-    global _last_graph_count
     if not _warmup_complete:
         return fn(*args)
     before = counters["stats"]["unique_graphs"]
     result = fn(*args)
-    after = counters["stats"]["unique_graphs"]
-    _last_graph_count = after
-    if after != before:
-        _late_compiles[label] = _late_compiles.get(label, 0) + (after - before)
-        logger.warning(
-            "%s compiled outside warmup (%d total for this label), which costs a full "
-            "Inductor compile mid-request. Re-run with TORCH_LOGS=recompiles for the guard.",
+    if counters["stats"]["unique_graphs"] != before:
+        logger.warning_once(
+            "%s compiled outside warmup, which costs a full Inductor compile mid-request. "
+            "Re-run with TORCH_LOGS=recompiles to see which guard failed.",
             label,
-            _late_compiles[label],
         )
     return result
 
@@ -372,10 +332,10 @@ class SpyreAttentionMetadata(AttentionMetadata):
     mask_by_chunk_cpu: torch.Tensor | None = None  # [num_chunks, entries, 1, block] fp16
     mask_by_chunk_dev: torch.Tensor | None = None
 
-    # An EncoderRectPlan (fast path) or a list of EncoderGroupPlan (slow path); which
-    # one it is *is* the path selection. Typed loosely: the encoder backend imports from
-    # this module, not the other way round.
-    encoder_plan: object | None = None
+    # Which one it is *is* the path selection: one rectangle for the dense path, a list
+    # of groups for the jagged one. Imported under TYPE_CHECKING only -- the encoder
+    # backend imports from this module, not the other way round.
+    encoder_plan: "EncoderRectPlan | list[EncoderGroupPlan] | None" = None
 
     @property
     def query_lens(self) -> torch.Tensor:

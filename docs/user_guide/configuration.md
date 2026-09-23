@@ -71,26 +71,24 @@ lowered to `R / 64` if it was higher, since no batch wider than that fits.
   Fixing it is what keeps the attention kernels keyed on sequence shapes alone.
 - **Lengths**: powers of two from 64 (one Spyre stick) up to `--max-model-len`.
   `SPYRE_ATTN_QUERY_BUCKETS` overrides the ladder.
-- **Attention, fast path**: for each length `L`, one rectangle `B = R / L`. The
+- **Attention, rectangular path**: for each length `L`, one rectangle `B = R / L`. The
   runner pads every sequence to `L` and the batch to `B`, so Q/K/V *are* the grid:
   one reshape, one `F.scaled_dot_product_attention`, one store, no data movement
   inside the layer. Taken whenever `num_seqs <= B`.
-- **Attention, slow path**: for a batch too wide for any rectangle, Q/K/V stay
+- **Attention, jagged path**: for a batch too wide for any rectangle, Q/K/V stay
   packed and requests are grouped by their own padded length; each group is one
   fused gather/attend/scatter, keyed on `(group width, extent)`. Widths are powers
   of two up to `B`; a wider group is chunked into descending powers of two.
-  `SPYRE_ENCODER_BATCHED_ATTN=0` serves them one at a time, which shortens warmup
-  at a throughput cost.
 
 With `--max-model-len 512 --max-num-seqs 32 --max-num-batched-tokens 2048` that is
 23 shapes: one body, four rectangles (`(64,32) (128,16) (256,8) (512,4)`, each
 exactly 2048 rows), and 18 group pairs. At `--max-num-seqs 4` the group family is
-empty — no batch that narrow can miss the fast path — leaving five shapes.
+empty — no batch that narrow can miss the rectangular path — leaving five shapes.
 
 Both paths go through the same opaque attention op, so the block graph is identical
 for either and the choice is made once per step from the step's metadata. The
-runner counts them in `spyre_encoder_fast_path_steps` /
-`spyre_encoder_slow_path_steps`.
+runner counts them in `spyre_encoder_rect_steps` /
+`spyre_encoder_jagged_steps`.
 
 Compiled pooling warmup runs one dummy at the body shape; the first attention call
 in it traces every declared rectangle and group pair, against that call's own

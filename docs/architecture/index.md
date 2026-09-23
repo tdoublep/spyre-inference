@@ -306,13 +306,13 @@ attention graph.
 On top of that one buffer sit two paths over a single power-of-two length ladder
 (`ENCODER_LEN_ALIGNMENT = 64` steps up to `max_model_len`):
 
-1. **Fast path** — one rectangle per length, `B = R / L`, so a rectangle is exactly the
+1. **Rectangular path** — one rectangle per length, `B = R / L`, so a rectangle is exactly the
    body buffer. The runner pads each sequence to `L` and the batch to `B` in `_preprocess`
    (host-side, integer tensors only), so Q/K/V *are* the grid: `_encoder_rect_kernel`
    reshapes, runs one `F.scaled_dot_product_attention`, and stores — no data movement
    inside the layer. `_unpad_encoder_hidden` compacts the grid back before the pooler, at a
    fixed row count so the gather does not specialise per token total.
-2. **Slow path** — for a batch too wide for any rectangle. Q/K/V stay packed and requests
+2. **Jagged path** — for a batch too wide for any rectangle. Q/K/V stay packed and requests
    are grouped by their own padded extent; `_encoder_fused_kernel` does gather, attend and
    scatter for one group in a single graph, keyed on `(width, extent)`. Request boundaries
    ride in int32 row-index tables, so a card never does offset arithmetic on *shapes* —
@@ -327,9 +327,10 @@ paths stay behind the opaque `unified_attention_with_output`, the enclosing bloc
 identical for either — one shape, shared — so path selection is never a branch inside a
 compiled region nor a dynamo guard.
 
-Three torch-spyre constraints shape the rest: a compiled region reads its arguments from
-offset 0 and ignores `storage_offset` (#3770), so rows are gathered with `index_select`
-rather than sliced; there is no on-device `arange` or `full`, so every index and mask
+Three torch-spyre constraints shape the rest: a compile input's `storage_offset` is a
+Dynamo guard (torch-spyre#4449, which closed #3770) and for int32 is still dropped
+outright, so rows are gathered with `index_select` rather than sliced — a slice would
+either recompile per offset or read the wrong rows; there is no on-device `arange` or `full`, so every index and mask
 tensor is host-built and reaches the device in one `convert` per plan; and SDPA's
 decomposition does `amax` then `exp(scores - max)`, which NaNs a fully masked row — hence
 the `finfo.min / 2` mask fill and the single attendable key a batch-pad lane gets.
@@ -337,18 +338,18 @@ the `finfo.min / 2` mask fill and the single attendable key a batch-pad lane get
 ## Encoder / embedding models: compile shape axes
 
 The body is compiled once, at `R` rows. Attention is shape-managed separately behind the
-opaque custom-op boundary: one rectangle per declared length on the fast path, one
-`(width, extent)` pair per group on the slow one. With `max_model_len=512`,
+opaque custom-op boundary: one rectangle per declared length on the rectangular path, one
+`(width, extent)` pair per group on the jagged one. With `max_model_len=512`,
 `max_num_seqs=32` and a 2048-token budget that is 23 shapes — one body, four rectangles,
 18 group pairs — and at `max_num_seqs=4` only five, since no batch that narrow can miss
-the fast path.
+the rectangular path.
 
 <figure markdown="span">
   ![Encoder target state](encoder-ideal-state.svg){: style="width: 140%; max-width: 1400px; margin-left: -20%" }
   <figcaption>
-    Encoder / embedding models under <code>STOCK_TORCH_COMPILE</code>, <strong>slow path
+    Encoder / embedding models under <code>STOCK_TORCH_COMPILE</code>, <strong>jagged path
     only</strong>: attention over the packed list, grouped by each request's padded
-    extent. Predates the fast path and the single <code>R</code>-row body, so read the
+    extent. Predates the rectangular path and the single <code>R</code>-row body, so read the
     body bucketing and the warmup sweep as historical; the grouping and the row-index
     tables are still current. Regenerating it needs the <code>d2</code> toolchain.
   </figcaption>

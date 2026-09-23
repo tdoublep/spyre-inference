@@ -558,10 +558,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         )
         self._encoder_budget = encoder_shape_tables(vllm_config).budget if is_pooling else 0
         self._encoder_buffer_rows = 0
-        # (extent, width, query_lens) on the fast path; None on the slow one.
+        # (extent, width, query_lens) on the rectangular path; None on the jagged one.
         self._encoder_grid: tuple[int, int, list[int]] | None = None
-        self.spyre_encoder_fast_path_steps = 0
-        self.spyre_encoder_slow_path_steps = 0
+        self.spyre_encoder_rect_steps = 0
+        self.spyre_encoder_jagged_steps = 0
         self.spyre_encoder_real_tokens = 0
         self.spyre_encoder_body_rows = 0
         self.spyre_encoder_seqs = 0
@@ -1083,7 +1083,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
                         # real device is _spyre_device.
                         device=self._spyre_device,
                         dtype=self._model_dtype(),
-                        batched=envs.SPYRE_ENCODER_BATCHED_ATTN,
+                        # Grouping only pays off through the compiled kernels; the
+                        # eager per-request loop has no launch overhead to amortise.
+                        batched=self.compilation_config.mode is CompilationMode.STOCK_TORCH_COMPILE,
                     )
                     encoder_md.encoder_plan = plan
                 else:
@@ -1091,13 +1093,13 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
         if isinstance(plan, EncoderRectPlan):
             self._encoder_grid = (plan.extent, plan.width, plan.query_lens)
-            self.spyre_encoder_fast_path_steps += 1
+            self.spyre_encoder_rect_steps += 1
             self._record_encoder_dispatch(sum(plan.query_lens), len(plan.query_lens), rows)
         else:
             # Stale grid would silently mislay this step's tokens in `_preprocess`.
             self._encoder_grid = None
             if isinstance(plan, list):
-                self.spyre_encoder_slow_path_steps += 1
+                self.spyre_encoder_jagged_steps += 1
                 self._record_encoder_dispatch(
                     sum(sum(group.query_lens) for group in plan),
                     sum(group.group for group in plan),
@@ -1111,21 +1113,21 @@ class TorchSpyreModelRunner(GPUModelRunner):
         The counters live in the worker process, so a log line is the only way they
         reach whoever is running a benchmark. Occupancy is the number worth watching:
         the body is one fixed shape, so a step that is narrow or short pays for rows it
-        does not use, and that is the cost the fast path trades away per-layer data
+        does not use, and that is the cost the rectangular path trades away per-layer data
         movement for.
         """
         self.spyre_encoder_real_tokens += real_tokens
         self.spyre_encoder_body_rows += rows
         self.spyre_encoder_seqs += num_seqs
-        steps = self.spyre_encoder_fast_path_steps + self.spyre_encoder_slow_path_steps
+        steps = self.spyre_encoder_rect_steps + self.spyre_encoder_jagged_steps
         if steps % _ENCODER_DISPATCH_LOG_EVERY:
             return
         logger.info(
             "Encoder dispatch over %d steps: %d fast, %d slow; mean %.2f seqs/step; "
             "body occupancy %.1f%% (%d real tokens in %d rows).",
             steps,
-            self.spyre_encoder_fast_path_steps,
-            self.spyre_encoder_slow_path_steps,
+            self.spyre_encoder_rect_steps,
+            self.spyre_encoder_jagged_steps,
             self.spyre_encoder_seqs / steps,
             100.0 * self.spyre_encoder_real_tokens / max(1, self.spyre_encoder_body_rows),
             self.spyre_encoder_real_tokens,
@@ -1191,8 +1193,9 @@ class TorchSpyreModelRunner(GPUModelRunner):
     ) -> BatchDescriptor | None:
         """Padded ``BatchDescriptor`` for a warmed 1D body bucket, or None.
 
-        Decoder and pooling share this path. Pooling's ladder is a single entry, the
-        token budget, so every pooling step pads to the same row count.
+        Decoder and pooling share this path; the buckets are ``compile_sizes``. Pooling
+        declares just one of them, the token budget, so every pooling step pads to that
+        same row count.
         """
         del num_reqs, num_scheduled_tokens_np
         bucketer = self.spyre_shape_bucketer
@@ -1263,10 +1266,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _warm_encoder_unpack(self, hidden_states: torch.Tensor) -> None:
-        """Compile the fast path's re-compaction gather.
+        """Compile the rectangular path's re-compaction gather.
 
         ``_unpad_encoder_hidden`` runs in ``_pool``, which no dummy run reaches, so
-        without this the first fast-path request pays its compile. One shape only: the
+        without this the first rectangular-path request pays its compile. One shape only: the
         gather deliberately keeps the buffer's row count.
         """
         if not self._pooling_on_spyre or not self._encoder_rectangles:
@@ -1276,15 +1279,15 @@ class TorchSpyreModelRunner(GPUModelRunner):
     def _unpad_encoder_hidden(
         self, hidden_states: torch.Tensor, num_scheduled_tokens: int
     ) -> torch.Tensor:
-        """Re-compact a fast-path grid to the packed order the poolers address.
+        """Re-compact a rectangular-path grid to the packed order the poolers address.
 
-        The poolers index rows by ``cumsum(num_scheduled_tokens)``, so on the fast
+        The poolers index rows by ``cumsum(num_scheduled_tokens)``, so on the rectangular
         path the inter-sequence pad rows have to go. Reporting padded lengths instead
         makes ``PoolingCursor.is_partial_prefill()`` true and ``SpyreCLSPool`` raise.
 
         The gather keeps its input's row count: sizing it to the real token count adds
         a ``torch.compile`` specialisation per distinct total, recompiling nearly every
-        step once prompt lengths vary. The slow path is already packed, and every
+        step once prompt lengths vary. The jagged path is already packed, and every
         pooler either gathers by row index or crops on the host, so its trailing pad
         needs no gather at all.
         """
@@ -1306,7 +1309,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
         return select_rows(hidden_states, torch.tensor(rows_list, dtype=torch.int64, device="cpu"))
 
     def _preprocess(self, *args, **kwargs):
-        """Expand the ragged body into the dense grid, on the fast path only.
+        """Expand the ragged body into the dense grid, on the rectangular path only.
 
         Upstream writes rows contiguously and the padding hook only sets the trailing
         pad count, so the interior per-sequence padding a rectangle needs has to
@@ -1430,8 +1433,8 @@ class TorchSpyreModelRunner(GPUModelRunner):
             "Either all or none of the requests in a batch must be pooling request"
         )
 
-        # Not a crop: the row count stays the buffer's. On the fast path this
-        # re-compacts the grid to the packed order the cursor addresses; on the slow
+        # Not a crop: the row count stays the buffer's. On the rectangular path this
+        # re-compacts the grid to the packed order the cursor addresses; on the jagged
         # path it is a no-op, since each pooler gathers itself from host cursor counts.
         hidden_states = self._unpad_encoder_hidden(
             convert(hidden_states, self._spyre_device), num_scheduled_tokens

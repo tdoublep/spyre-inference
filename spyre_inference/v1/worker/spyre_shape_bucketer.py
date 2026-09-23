@@ -19,16 +19,16 @@ the nearest bucket ``>=`` actual ``num_tokens``. Linear / LN compile on ``[T, â€
 
 Pooling has one body shape, ``R`` rows, where ``R`` is the token budget (see
 ``encoder_budget``). Fixing it is what reduces the encoder attention kernels'
-cache keys to the sequence shapes alone: both the fast path's rectangle and the
-slow path's fused gather/attend/store take the body buffer as an argument, so a
+cache keys to the sequence shapes alone: both the rectangular path's rectangle and the
+jagged path's fused gather/attend/store take the body buffer as an argument, so a
 varying buffer size would multiply every attention graph.
 
 On top of that one buffer sit two shape families, both derived from a single
 power-of-two length ladder:
 
-* ``encoder_rectangles`` -- the fast path. One ``(L, B)`` per length, ``B = R // L``,
+* ``encoder_rectangles`` -- the rectangular path. One ``(L, B)`` per length, ``B = R // L``,
   so the grid is exactly the body buffer and a batch needs no per-layer movement.
-* ``encoder_group_shapes`` -- the slow path, for batches too wide for a rectangle.
+* ``encoder_group_shapes`` -- the jagged path, for batches too wide for a rectangle.
   One ``(width, extent)`` per group of equal-extent requests.
 """
 
@@ -37,6 +37,7 @@ from __future__ import annotations
 import bisect
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
 from vllm.config import VllmConfig
@@ -78,35 +79,36 @@ class EncoderShapeTables:
     lengths: tuple[int, ...]
     """The length ladder: powers of two from one stick up to ``max_model_len``."""
     rectangles: tuple[tuple[int, int], ...]
-    """Fast path ``(L, B)``, one per length."""
+    """Rectangular path ``(L, B)``, one per length."""
     groups: tuple[tuple[int, int], ...]
-    """Slow path ``(width, extent)``. Empty when no batch can miss the fast path."""
-
-
-# The platform hook, the runner and every attention layer re-derive these from the
-# same config, so a 12-layer model paid for the derivation 14 times at startup.
-# Keyed on the inputs, env override included, so nothing goes stale.
-_ENCODER_TABLES_MEMO: dict[tuple, EncoderShapeTables] = {}
+    """Jagged path ``(width, extent)``. Empty when no batch can miss the rectangular path."""
 
 
 def encoder_shape_tables(vllm_config: VllmConfig) -> EncoderShapeTables:
-    """Resolve and memoise the length ladder and both shape families."""
-    max_model_len = int(vllm_config.model_config.max_model_len)
-    max_num_seqs = max(1, int(vllm_config.scheduler_config.max_num_seqs))
-    key = (
-        max_model_len,
+    """Resolve the length ladder and both shape families for this config.
+
+    The platform hook, the runner and every attention layer re-derive these from the same
+    config, so a 12-layer model paid for the derivation 14 times at startup. Cached on the
+    limits it actually reads (env override included) rather than on the unhashable config.
+    """
+    return _encoder_shape_tables(
+        int(vllm_config.model_config.max_model_len),
         int(vllm_config.scheduler_config.max_num_batched_tokens),
-        max_num_seqs,
+        max(1, int(vllm_config.scheduler_config.max_num_seqs)),
         envs.SPYRE_ATTN_QUERY_BUCKETS,
     )
-    memoized = _ENCODER_TABLES_MEMO.get(key)
-    if memoized is not None:
-        return memoized
 
+
+@lru_cache(maxsize=8)
+def _encoder_shape_tables(
+    max_model_len: int,
+    max_num_batched_tokens: int,
+    max_num_seqs: int,
+    query_buckets_override: str | None,
+) -> EncoderShapeTables:
+    del query_buckets_override  # read from envs below; a cache key only
     lengths = _encoder_lengths(max_model_len)
-    budget = encoder_budget_rows(
-        max_model_len, vllm_config.scheduler_config.max_num_batched_tokens, max_num_seqs
-    )
+    budget = encoder_budget_rows(max_model_len, max_num_batched_tokens, max_num_seqs)
 
     # `budget // length`, not `min(max_num_seqs, budget // length)`: the rectangle is
     # the *physical* grid, and holding it at exactly `budget` rows is what keeps the
@@ -115,14 +117,12 @@ def encoder_shape_tables(vllm_config: VllmConfig) -> EncoderShapeTables:
     # only attention rows, and only at the short lengths where attention is cheapest.
     rectangles = tuple((length, budget // length) for length in lengths)
 
-    tables = EncoderShapeTables(
+    return EncoderShapeTables(
         budget=budget,
         lengths=lengths,
         rectangles=rectangles,
         groups=_encoder_groups(lengths, budget, max_num_seqs),
     )
-    _ENCODER_TABLES_MEMO[key] = tables
-    return tables
 
 
 def _encoder_lengths(max_model_len: int) -> tuple[int, ...]:
@@ -131,6 +131,11 @@ def _encoder_lengths(max_model_len: int) -> tuple[int, ...]:
     ``SPYRE_ATTN_QUERY_BUCKETS`` overrides, clamped the same way the decoder's
     ladders are: entries above ``max_model_len`` are dropped as unreachable and the
     limit is appended when missing, so every schedulable length has a bucket.
+
+    It is the only knob over either shape family, because both are derived from this
+    ladder: one rectangle per entry, and one group width family per entry. Fewer, coarser
+    entries mean a shorter warmup and more padding per request; there is deliberately no
+    separate override for the groups, which would let the two families disagree.
 
     The limit is rounded *up* to a stick. An extent is a matmul dimension, so it
     cannot be the raw ``max_model_len`` when that is not a whole number of sticks,
@@ -165,15 +170,15 @@ def _encoder_lengths(max_model_len: int) -> tuple[int, ...]:
 def _encoder_groups(
     lengths: tuple[int, ...], budget: int, max_num_seqs: int
 ) -> tuple[tuple[int, int], ...]:
-    """Slow-path ``(width, extent)`` pairs, widths powers of two up to ``B(e)``.
+    """Jagged-path ``(width, extent)`` pairs, widths powers of two up to ``B(e)``.
 
-    Empty when the fast path cannot miss. Dispatch takes the slow path only when
+    Empty when the rectangular path cannot miss. Dispatch takes the jagged path only when
     ``num_seqs > budget // L``, and ``L`` is largest -- so ``budget // L`` smallest --
     at the top of the ladder; if ``max_num_seqs`` does not exceed that, no schedulable
     batch reaches this family and warming it would compile the most expensive graphs
     in the run for nothing.
 
-    Several widths per extent, unlike the fast path's one: a slow-path step has
+    Several widths per extent, unlike the rectangular path's one: a jagged-path step has
     several groups, and padding each up to ``B(e)`` would cost ``budget`` rows per
     group rather than per step.
     """
@@ -220,12 +225,12 @@ def encoder_width_for(length: int, vllm_config: VllmConfig) -> int:
 
 
 def encoder_rectangles(vllm_config: VllmConfig) -> list[tuple[int, int]]:
-    """Fast-path ``(L, B)`` table."""
+    """Rectangular-path ``(L, B)`` table."""
     return list(encoder_shape_tables(vllm_config).rectangles)
 
 
 def encoder_group_shapes(vllm_config: VllmConfig) -> list[tuple[int, int]]:
-    """Slow-path ``(width, extent)`` table; empty when the fast path cannot miss."""
+    """Jagged-path ``(width, extent)`` table; empty when the rectangular path cannot miss."""
     return list(encoder_shape_tables(vllm_config).groups)
 
 
@@ -237,12 +242,12 @@ def encoder_group_width_caps(vllm_config: VllmConfig) -> dict[int, int]:
     return caps
 
 
-def encoder_fast_path_shape(
+def encoder_rectangle_for(
     num_seqs: int,
     max_len: int,
     rectangles: Sequence[tuple[int, int]],
 ) -> tuple[int, int] | None:
-    """The rectangle serving this batch, or ``None`` to take the slow path.
+    """The rectangle serving this batch, or ``None`` to take the jagged path.
 
     ``None`` is a routine outcome, not an error: the scheduler is upstream's, so the
     backend cannot refuse a batch and must have a path for every one it can form.

@@ -509,11 +509,12 @@ def configure_pooling_for_spyre(
     is garbage (torch-spyre#2971). False if the method is unknown or the
     head is an FP32 linear.
 
-    ``len_ladder`` is the declared prompt lengths, the only widths a request can be
-    padded to and so the right token-count ladder for ``SpyreAllPool``'s bucketed
-    gather. Passed in rather than re-derived here: only the caller is guaranteed to run
-    inside a ``set_current_vllm_config`` context, and token pooling degrades to plain
-    stick alignment without it.
+    ``len_ladder`` is ``encoder_len_ladder``: the declared padded prompt lengths (powers
+    of two from one stick to ``max_model_len``), which are the only per-request widths
+    ``SpyreAllPool``'s bucketed gather can see. Not the body's ``compile_sizes``, which is
+    one entry. Passed in rather than re-derived here because only the caller is guaranteed
+    to run inside a ``set_current_vllm_config`` context; without it token pooling falls
+    back to plain stick alignment.
     """
     pooler = getattr(model, "pooler", None)
     if pooler is None:
@@ -536,9 +537,9 @@ def configure_pooling_for_spyre(
     if token_level:
         if not ladder:
             logger.warning(
-                "Pooling: token pooling has no length ladder (none was passed); "
-                "gathers round to every 64-multiple instead of the declared "
-                "lengths, so more shapes compile than necessary"
+                "Pooling: token pooling got no declared prompt lengths, so its gather "
+                "rounds row counts to every 64-multiple rather than to the declared "
+                "lengths, compiling more shapes than necessary"
             )
         prepare_token_head_for_spyre(model, pooler, spyre_device)
 

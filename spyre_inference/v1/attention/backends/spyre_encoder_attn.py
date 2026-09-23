@@ -25,8 +25,9 @@ block graph is identical for either.
 
 Three torch-spyre constraints shape the design:
 
-* A compiled region reads its arguments from offset 0 and ignores ``storage_offset``
-  (#3770), so rows are gathered with ``index_select`` rather than sliced.
+* A compile input's ``storage_offset`` is a Dynamo guard (torch-spyre#4449, which
+  closed #3770), and for int32 it is still dropped outright, so rows are gathered with
+  ``index_select``: slicing would either recompile per offset or read the wrong rows.
 * There is no on-device ``arange`` or ``full``, so index and mask tensors are host-built
   and reach the device in one ``convert`` per plan.
 * SDPA decomposes to ``amax`` then ``exp(scores - max)``, which NaNs a fully masked row.
@@ -41,9 +42,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from vllm.config import get_current_vllm_config
+from vllm.utils.math_utils import cdiv, next_power_of_2
 from vllm.v1.attention.backend import AttentionLayer
 
-from spyre_inference import envs
 from spyre_inference.custom_ops.utils import convert
 from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionBackend,
@@ -51,13 +52,12 @@ from spyre_inference.v1.attention.backends.spyre_attn import (
     SpyreAttentionMetadata,
     SpyrePagedKVCache,
     _call_kernel,
-    note_unattributed_compiles,
 )
 from spyre_inference.v1.worker import compile_guard
 from spyre_inference.v1.worker.spyre_shape_bucketer import (
-    encoder_fast_path_shape,
     encoder_group_shapes,
     encoder_group_width_caps,
+    encoder_rectangle_for,
     encoder_rectangles,
     encoder_shape_tables,
 )
@@ -78,11 +78,7 @@ def _alignment_units_for(length: int) -> int:
     handful of buckets, at the cost of padding a request up to the next one: a
     260-token request attends over 512, not 320.
     """
-    units = max(1, (length + ENCODER_LEN_ALIGNMENT - 1) // ENCODER_LEN_ALIGNMENT)
-    bucket = 1
-    while bucket < units:
-        bucket *= 2
-    return bucket
+    return next_power_of_2(cdiv(length, ENCODER_LEN_ALIGNMENT))
 
 
 def encoder_index_dtype(device: torch.device) -> torch.dtype:
@@ -150,6 +146,44 @@ def _host_pad_head_dim(x: torch.Tensor, padded: int) -> torch.Tensor:
     return convert(on_host, device) if device.type == "spyre" else on_host
 
 
+def _widen_head_dim(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    output: torch.Tensor,
+    num_heads: int,
+    padded_head_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Q/K/V widened to ``padded_head_size``, plus a fresh output buffer that shape.
+
+    Spyre addresses the head dim in 64-element sticks, so a sub-stick head size has to
+    run at the padded width throughout, on our own output rather than the caller's.
+    ``_narrow_head_dim_into`` puts the result back.
+    """
+    return (
+        _host_pad_head_dim(query, padded_head_size),
+        _host_pad_head_dim(key, padded_head_size),
+        _host_pad_head_dim(value, padded_head_size),
+        convert(
+            torch.zeros((output.shape[0], num_heads, padded_head_size), dtype=output.dtype),
+            output.device,
+        ),
+    )
+
+
+def _narrow_head_dim_into(padded: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
+    """Copy ``padded``'s real head columns into ``output``, and return ``output``.
+
+    Narrowed on the host, then written through the flattened views, whose rows are a
+    whole number of sticks -- a device-side narrow of the head dim is the per-head view
+    ``_host_pad_head_dim`` cannot express.
+    """
+    rows = output.shape[0]
+    on_host = convert(padded, "cpu")[..., : output.shape[-1]].contiguous()
+    output.reshape(rows, -1).copy_(convert(on_host.reshape(rows, -1), output.device))
+    return output
+
+
 def _encoder_rect_kernel(
     query,
     key,
@@ -162,7 +196,7 @@ def _encoder_rect_kernel(
     num_kv_heads,
     head_size,
 ):
-    """Fast path: view ``[B*L, H, D]`` as the grid, attend, un-view. One graph.
+    """Rectangular path: view ``[B*L, H, D]`` as the grid, attend, un-view. One graph.
 
     The reshapes stay inside the graph so the layout change is the matmul's problem
     rather than standalone d2d copies; these kernels are dispatch-bound, so the
@@ -266,7 +300,7 @@ def _encoder_fused_kernel(
     num_kv_heads,
     head_size,
 ):
-    """Slow path: gather, attend and store one group of equal-extent requests.
+    """Jagged path: gather, attend and store one group of equal-extent requests.
 
     Attention accounts for most of a step's jobplan launches, and each launch carries
     its own parameter upload, so collapsing three graphs into one is a device-path
@@ -305,7 +339,7 @@ for _kernel in (
 
 @dataclass
 class EncoderRectPlan:
-    """Fast path: the whole batch is one ``[width, extent]`` rectangle."""
+    """Rectangular path: the whole batch is one ``[width, extent]`` rectangle."""
 
     extent: int
     width: int
@@ -319,7 +353,7 @@ class EncoderRectPlan:
 
 @dataclass
 class EncoderGroupPlan:
-    """Slow path: one group of equal-extent requests inside the packed buffer.
+    """Jagged path: one group of equal-extent requests inside the packed buffer.
 
     A group of one is the ordinary single-request case, so this covers both.
     """
@@ -370,7 +404,7 @@ def build_encoder_plan(
     # A dropped request shifts every later lane, and the pooler addresses rows by its
     # own cumsum over all requests, so the grid would be misaligned rather than padded.
     rect = (
-        encoder_fast_path_shape(len(members), max_len, rectangles)
+        encoder_rectangle_for(len(members), max_len, rectangles)
         if len(members) == attn_metadata.num_seqs
         else None
     )
@@ -449,9 +483,6 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
             self._gather_fn = _encoder_gather_kernel
             self._attn_fn = _encoder_sdpa_kernel
             self._fused_fn = _encoder_fused_kernel
-        # Grouping only pays off through the compiled kernels; in eager mode the
-        # per-request loop has no launch overhead to amortise.
-        self._batched_attn = self._compile_attn and envs.SPYRE_ENCODER_BATCHED_ATTN
         # get_current_vllm_config() only works at construction time; forward() runs
         # through a custom-op boundary that loses the context.
         config = get_current_vllm_config()
@@ -603,9 +634,6 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         if attn_metadata is None:
             return output
 
-        # Attribute compiles since the last kernel call to the body or pooler.
-        note_unattributed_compiles("model body / pooler")
-
         num_heads = query.shape[1]
         num_kv_heads = key.shape[1]
         head_size = query.shape[2]
@@ -619,7 +647,7 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
 
         plan = attn_metadata.encoder_plan
         if plan is None:
-            # Fallback for a caller that did not pre-build one. Slow path only: the grid
+            # Fallback for a caller that did not pre-build one. Jagged path only: the grid
             # layout is a contract with ``_preprocess``, so a rectangle the runner did
             # not lay out would read the wrong rows.
             plan = build_encoder_plan(
@@ -628,27 +656,17 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
                 width_cap_for=self._width_caps,
                 device=query.device,
                 dtype=query.dtype,
-                batched=self._batched_attn,
+                batched=self._compile_attn,
             )
             attn_metadata.encoder_plan = plan
 
-        # Sub-stick head sizes: run the whole attention at a stick-aligned head dim
-        # on our own buffers, then narrow on the host and write back through the
-        # flattened output view, whose rows are a whole number of sticks.
+        # A sub-stick head size runs the whole attention widened to a stick, on our own
+        # output buffer; `caller_output` is the narrow one to write back into at the end.
+        caller_output = output
         head_pad = -head_size % ENCODER_LEN_ALIGNMENT
-        narrow_into = None
         if head_pad:
-            query = _host_pad_head_dim(query, head_size + head_pad)
-            key = _host_pad_head_dim(key, head_size + head_pad)
-            value = _host_pad_head_dim(value, head_size + head_pad)
-            narrow_into, output = (
-                output,
-                convert(
-                    torch.zeros(
-                        (output.shape[0], num_heads, head_size + head_pad), dtype=output.dtype
-                    ),
-                    output.device,
-                ),
+            query, key, value, output = _widen_head_dim(
+                query, key, value, output, num_heads, head_size + head_pad
             )
             head_size += head_pad
 
@@ -656,12 +674,16 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         fused_store_ok = (
             self._compile_attn
             and output.dtype == query.dtype
-            # A compiled kernel reads its arguments from offset 0: torch-spyre#3770.
+            # A nonzero offset is a separate compiled variant (torch-spyre#4449), so
+            # store through our own buffer instead of specialising per buffer.
             and output.storage_offset() == 0
             and output.is_contiguous()
         )
 
         if fused_store_ok:
+            # Here, not in the runner's warmup: a Spyre tensor's device layout is part of
+            # the compile cache key, so the declared shapes must be traced against these
+            # buffers. Self-guarded, so only the first call of the run does the work.
             self.warm_kernels(query, key, value, output, num_heads, num_kv_heads, head_size)
 
         if isinstance(plan, EncoderRectPlan):
@@ -669,13 +691,8 @@ class SpyreEncoderAttentionImpl(SpyreAttentionImpl):
         else:
             self._forward_groups(plan, query, key, value, output, fused_store_ok, head_size)
 
-        if narrow_into is not None:
-            rows = narrow_into.shape[0]
-            on_host = convert(output, "cpu")[..., : narrow_into.shape[-1]].contiguous()
-            narrow_into.reshape(rows, -1).copy_(
-                convert(on_host.reshape(rows, -1), narrow_into.device)
-            )
-            return narrow_into
+        if output is not caller_output:
+            return _narrow_head_dim_into(output, caller_output)
         return output
 
     def _forward_rect(self, plan, query, key, value, output, fused_store_ok, head_size) -> None:

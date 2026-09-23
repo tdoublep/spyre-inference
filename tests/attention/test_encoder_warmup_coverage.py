@@ -23,11 +23,9 @@ its cache key.
 
 import pytest
 import torch
-from torch._dynamo.utils import counters
 from vllm.config import DeviceConfig, ModelConfig, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationConfig
 
-from spyre_inference.v1.attention.backends import spyre_attn
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     ENCODER_LEN_ALIGNMENT,
     EncoderRectPlan,
@@ -42,7 +40,7 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
 )
 
 # (max_model_len, max_num_seqs, max_num_batched_tokens). The first is the plan's
-# worked example; the second is the narrow config, where no batch can miss the fast
+# worked example; the second is the narrow config, where no batch can miss the rectangular
 # path and the group family is therefore empty.
 _CONFIGS = [
     (512, 32, 2048),
@@ -231,7 +229,7 @@ class TestEveryReachableBatchLandsOnADeclaredShape:
                 if length < 1:
                     continue
                 # Ragged as well as uniform: a step with several extents is what makes
-                # the slow path's group space multi-dimensional.
+                # the jagged path's group space multi-dimensional.
                 for lens in (
                     [length] * num_seqs,
                     [max(1, length - i * 37) for i in range(num_seqs)],
@@ -262,7 +260,7 @@ class TestEveryReachableBatchLandsOnADeclaredShape:
         lens = [64] * 17
         plan = build_encoder_plan(
             _fake_metadata(lens),
-            # No rectangles, so the slow path is forced regardless of the batch.
+            # No rectangles, so the jagged path is forced regardless of the batch.
             rectangles=(),
             width_cap_for={ENCODER_LEN_ALIGNMENT: 16},
             device=torch.device("cpu"),
@@ -271,34 +269,3 @@ class TestEveryReachableBatchLandsOnADeclaredShape:
         )
         assert [p.group for p in plan] == [16, 1]
         assert set(encoder_group_shapes(config)) >= {(16, 64), (1, 64)}
-
-
-def test_call_kernel_warns_only_after_warmup_is_marked_complete(monkeypatch, caplog):
-    """``_call_kernel`` must stay silent until warmup claims coverage, mirroring how a
-    real server calls ``mark_warmup_complete()`` only once startup finishes.
-
-    This is the late-compile counter the design leans on: "nothing compiles in the
-    serving path" is checked rather than assumed.
-    """
-    saved = spyre_attn._warmup_complete
-    label = f"test kernel {id(test_call_kernel_warns_only_after_warmup_is_marked_complete)}"
-
-    # Simulates "a compile happened during this call" without a real Inductor
-    # compile: _call_kernel only compares the counter before/after its own call.
-    def fn(x):
-        counters["stats"]["unique_graphs"] += 1
-        return x + 1
-
-    try:
-        spyre_attn._warmup_complete = False
-
-        with caplog.at_level("WARNING"):
-            spyre_attn._call_kernel(label, fn, 1)
-        assert "compiled outside warmup" not in caplog.text
-
-        spyre_attn.mark_warmup_complete()
-        with caplog.at_level("WARNING"):
-            spyre_attn._call_kernel(label, fn, 1)
-        assert "compiled outside warmup" in caplog.text
-    finally:
-        spyre_attn._warmup_complete = saved
