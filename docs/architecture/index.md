@@ -297,14 +297,17 @@ loop either: a sequence's whole K/V fits one tensor, so nothing forces the block
 the decoder needs.
 
 Everything hangs off one number, `R = encoder_budget_rows(...)`: the token budget, capped
-at 2048, floored at the aligned `max_model_len`, and capped at what `max_num_seqs`
-sequences of that length could carry. **The pooling body is always `R` rows.** Fixing it
+at 2048, floored at `max_model_len` rounded up to a power-of-two multiple of 64, capped at
+what `max_num_seqs` sequences of that length could carry, and finally floored to a whole
+multiple of that longest length — which is what makes every declared length divide `R`. **The pooling body is always `R` rows.** Fixing it
 is what reduces the attention kernels' cache keys to the sequence shapes alone — both
 kernels take the body buffer as an argument, so a varying buffer size would multiply every
 attention graph.
 
 On top of that one buffer sit two paths over a single power-of-two length ladder
-(`ENCODER_LEN_ALIGNMENT = 64` steps up to `max_model_len`):
+(`ENCODER_LEN_ALIGNMENT = 64` doubling up to `max_model_len`, rounded up to a power-of-two
+multiple of 64 — the same rounding a request's own extent gets, so the ladder declares
+exactly the extents a request can be assigned):
 
 1. **Rectangular path** — one rectangle per length, `B = R / L`, so a rectangle is exactly the
    body buffer. The runner pads each sequence to `L` and the batch to `B` in `_preprocess`

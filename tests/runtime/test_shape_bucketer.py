@@ -181,11 +181,22 @@ class TestEncoderLenLadder:
         cfg = _pooling_vllm_config(max_model_len=512, max_num_batched_tokens=2048)
         assert encoder_len_ladder(cfg) == [64, 128, 256, 512]
 
-    def test_top_entry_is_the_stick_above_max_model_len(self):
+    def test_top_entry_is_the_power_of_two_stick_count_above_max_model_len(self):
         """Rounded *up*: an extent is a matmul dimension, and rounding down would
-        leave the longest requests with no covering bucket."""
+        leave the longest requests with no covering bucket. To a power-of-two stick
+        count, not just a whole stick, so every entry divides the budget."""
         cfg = _pooling_vllm_config(max_model_len=500, max_num_batched_tokens=2048)
         assert encoder_len_ladder(cfg) == [64, 128, 256, 512]
+        # 320 is a whole number of sticks (64*5) but not a power-of-two count.
+        cfg = _pooling_vllm_config(max_model_len=320, max_num_batched_tokens=2048)
+        assert encoder_len_ladder(cfg) == [64, 128, 256, 512]
+
+    def test_override_entries_are_power_of_two_stick_counts(self, monkeypatch):
+        """Same rounding as the derived ladder, or the documented knob would put the
+        non-dividing entry back."""
+        monkeypatch.setenv("SPYRE_ATTN_QUERY_BUCKETS", "320")
+        cfg = _pooling_vllm_config(max_model_len=512, max_num_batched_tokens=2048)
+        assert encoder_len_ladder(cfg) == [512]
 
     def test_short_model_gets_one_bucket(self):
         cfg = _pooling_vllm_config(max_model_len=100, max_num_batched_tokens=2048)
@@ -206,6 +217,13 @@ class TestEncoderBudget:
         assert encoder_budget_rows(500, 256, 32) == 512
         assert encoder_budget_rows(512, 2048, 32) == 2048
 
+    def test_floored_to_a_multiple_of_the_longest_length(self):
+        """Every declared length divides the budget, so no rectangle truncates. An
+        awkward --max-num-batched-tokens costs rows, not correctness."""
+        assert encoder_budget_rows(512, 1000, 32) == 512  # 1000 -> 1 * 512
+        assert encoder_budget_rows(512, 1600, 32) == 1536  # 1600 -> 3 * 512
+        assert encoder_budget_rows(320, 2048, 32) == 2048  # longest 512, 2048 = 4 * 512
+
     def test_capped_at_what_max_num_seqs_can_carry(self):
         """A rectangle is always the whole buffer, so a narrow engine would otherwise
         run the body on budget rows for one short request."""
@@ -219,14 +237,44 @@ class TestEncoderRectangles:
         cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=32, max_num_batched_tokens=2048)
         assert encoder_rectangles(cfg) == [(64, 32), (128, 16), (256, 8), (512, 4)]
 
-    def test_every_rectangle_is_exactly_the_budget(self):
-        """The single body shape depends on it."""
-        for max_num_seqs in (1, 4, 32):
-            cfg = _pooling_vllm_config(
-                max_model_len=512, max_num_seqs=max_num_seqs, max_num_batched_tokens=2048
-            )
-            budget = encoder_shape_tables(cfg).budget
-            assert {length * batch for length, batch in encoder_rectangles(cfg)} == {budget}
+    @pytest.mark.parametrize("max_num_seqs", [1, 4, 32])
+    @pytest.mark.parametrize("max_model_len", [64, 100, 320, 384, 512, 576, 1024, 4096])
+    @pytest.mark.parametrize("max_num_batched_tokens", [512, 1000, 2048, 8192])
+    def test_every_rectangle_is_exactly_the_budget(
+        self, max_num_seqs, max_model_len, max_num_batched_tokens
+    ):
+        """The single body shape depends on it: a rectangle reinterprets the body buffer
+        with ``view``, so a ``budget // length`` that truncates would not cover it.
+
+        Parametrised past the power-of-two cases on purpose. A ``max_model_len`` that is
+        not a power-of-two stick count, or a ``max_num_batched_tokens`` that is not a
+        multiple of the longest length, both used to leave rectangles short of the body.
+        """
+        cfg = _pooling_vllm_config(
+            max_model_len=max_model_len,
+            max_num_seqs=max_num_seqs,
+            max_num_batched_tokens=max_num_batched_tokens,
+        )
+        budget = encoder_shape_tables(cfg).budget
+        assert {length * batch for length, batch in encoder_rectangles(cfg)} == {budget}
+
+    @pytest.mark.parametrize("max_model_len", [64, 100, 320, 384, 512, 576, 1024])
+    def test_ladder_declares_every_extent_a_request_can_take(self, max_model_len):
+        """``_alignment_units_for`` rounds a request's extent to a power-of-two stick
+        count, so the ladder has to contain exactly those -- an extent it omits is a
+        group width of 1 that warmup never traced, and one it adds is warmed for nothing.
+        """
+        from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
+            ENCODER_LEN_ALIGNMENT,
+            _alignment_units_for,
+        )
+
+        cfg = _pooling_vllm_config(max_model_len=max_model_len, max_num_batched_tokens=2048)
+        ladder = set(encoder_len_ladder(cfg))
+        assignable = {
+            _alignment_units_for(n) * ENCODER_LEN_ALIGNMENT for n in range(1, max_model_len + 1)
+        }
+        assert assignable <= ladder, f"undeclared extents: {sorted(assignable - ladder)}"
 
     def test_width_for_is_capped_by_max_num_seqs(self):
         cfg = _pooling_vllm_config(max_model_len=512, max_num_seqs=4, max_num_batched_tokens=2048)

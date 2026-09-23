@@ -42,6 +42,7 @@ from functools import lru_cache
 import torch
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.utils.math_utils import cdiv, next_power_of_2
 
 from spyre_inference import envs
 
@@ -53,6 +54,21 @@ ENCODER_SEQ_ALIGNMENT = 64
 
 def _align_up(n: int, align: int = ENCODER_SEQ_ALIGNMENT) -> int:
     return max(align, (n + align - 1) // align * align)
+
+
+def _align_up_pow2(n: int) -> int:
+    """Round up to a whole *power-of-two* number of sticks, not just a whole stick.
+
+    Every declared length and the budget are rounded this way, which is what makes each
+    length divide the budget: all of them are ``64 * 2**k``, so the smaller always
+    divides the larger, and ``budget // length`` never truncates. A rectangle reinterprets
+    the body buffer via ``view``, so a truncated width would not cover it.
+
+    ``_alignment_units_for`` rounds a request's own extent the same way, so the ladder
+    declares exactly the extents a request can be assigned -- no dead entry, and none
+    missing.
+    """
+    return ENCODER_SEQ_ALIGNMENT * next_power_of_2(cdiv(n, ENCODER_SEQ_ALIGNMENT))
 
 
 def _floor_pow2(n: int) -> int:
@@ -137,14 +153,16 @@ def _encoder_lengths(max_model_len: int) -> tuple[int, ...]:
     entries mean a shorter warmup and more padding per request; there is deliberately no
     separate override for the groups, which would let the two families disagree.
 
-    The limit is rounded *up* to a stick. An extent is a matmul dimension, so it
-    cannot be the raw ``max_model_len`` when that is not a whole number of sticks,
-    and rounding down would leave the longest requests uncovered.
+    The limit is rounded *up*, to a power-of-two stick count (``_align_up_pow2``). An
+    extent is a matmul dimension, so it cannot be the raw ``max_model_len`` when that is
+    not a whole number of sticks, and rounding down would leave the longest requests
+    uncovered. Power-of-two rather than merely stick-aligned so that every entry divides
+    the budget -- see ``_align_up_pow2``.
     """
-    limit = _align_up(max_model_len)
+    limit = _align_up_pow2(max_model_len)
     override = envs.SPYRE_ATTN_QUERY_BUCKETS
     if override:
-        raw = {_align_up(int(v)) for v in override.split(",") if v.strip() and int(v) > 0}
+        raw = {_align_up_pow2(int(v)) for v in override.split(",") if v.strip() and int(v) > 0}
         kept = sorted(v for v in raw if v <= limit)
         dropped = sorted(v for v in raw if v > limit)
         if dropped:
@@ -206,11 +224,17 @@ def encoder_budget_rows(max_model_len: int, max_num_batched_tokens: int, max_num
     every step: one 64-token request against a 2048-token budget would run the body on
     2048 rows, since a rectangle is always the whole buffer.
 
+    Floored to a whole multiple of that longest length, so every declared length divides
+    it and no rectangle's ``length * batch`` truncates below the body. That is the only
+    place a user-supplied ``max_num_batched_tokens`` is rounded, so an awkward one costs
+    rows rather than correctness.
+
     A formula rather than a field on the tables because ``check_and_update_config``
     needs it before the config the tables memoise on is final.
     """
-    longest = _align_up(max_model_len)
-    return max(longest, min(int(max_num_batched_tokens), max(1, int(max_num_seqs)) * longest))
+    longest = _align_up_pow2(max_model_len)
+    rows = min(int(max_num_batched_tokens), max(1, int(max_num_seqs)) * longest)
+    return max(longest, rows // longest * longest)
 
 
 def encoder_len_ladder(vllm_config: VllmConfig) -> list[int]:

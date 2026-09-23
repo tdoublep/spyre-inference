@@ -63,14 +63,17 @@ Spyre compile is on by default (`STOCK_TORCH_COMPILE`, `dynamic=False`). Pass
 
 Everything derives from one number, `R` — the token budget. It is
 `--max-num-batched-tokens`, capped at 2048 (the measured throughput argmax across
-pooling models), floored at `--max-model-len`, and capped again at what
-`--max-num-seqs` sequences of that length could carry. `--max-num-seqs` is then
-lowered to `R / 64` if it was higher, since no batch wider than that fits.
+pooling models), floored at `--max-model-len` rounded up to a power-of-two multiple of
+64, and capped again at what `--max-num-seqs` sequences of that length could carry, then
+floored to a whole multiple of it so that every length divides `R`. `--max-num-seqs` is
+then lowered to `R / 64` if it was higher, since no batch wider than that fits.
 
 - **Body** (Linear / LN): one shape, `R` rows. Every pooling step pads to it.
   Fixing it is what keeps the attention kernels keyed on sequence shapes alone.
-- **Lengths**: powers of two from 64 (one Spyre stick) up to `--max-model-len`.
-  `SPYRE_ATTN_QUERY_BUCKETS` overrides the ladder.
+- **Lengths**: powers of two from 64 (one Spyre stick) up to `--max-model-len`, rounded
+  up to a power-of-two multiple of 64. Every length is then `64 * 2^k`, so each divides
+  `R` and each rectangle covers the body exactly. `SPYRE_ATTN_QUERY_BUCKETS` overrides the
+  ladder, rounded the same way.
 - **Attention, rectangular path**: for each length `L`, one rectangle `B = R / L`. The
   runner pads every sequence to `L` and the batch to `B`, so Q/K/V *are* the grid:
   one reshape, one `F.scaled_dot_product_attention`, one store, no data movement
