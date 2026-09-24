@@ -133,11 +133,11 @@ def _min_num_kv_heads(vllm_config: VllmConfig) -> int:
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
     arch = model_config.model_arch_config
-    overrides = arch.per_layer_overrides
-    if not overrides:
-        return model_config.get_num_kv_heads(parallel_config)
+    model_wide = model_config.get_num_kv_heads(parallel_config)
+    overrides = arch.per_layer_overrides or ()
     return min(
-        model_config.get_num_kv_heads(parallel_config, arch[i]) for i in range(len(overrides))
+        (model_config.get_num_kv_heads(parallel_config, arch[i]) for i in range(len(overrides))),
+        default=model_wide,
     )
 
 

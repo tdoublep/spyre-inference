@@ -527,6 +527,12 @@ class TestSingleKvHeadBlockFloor:
         b = SpyreAttnBucketer(make_config(num_kv_heads=8, per_layer_kv_heads=[8, 8, 4]))
         assert min(b.num_blocks_buckets) == 1
 
+    def test_an_empty_override_list_falls_back_to_the_model_wide_count(self):
+        """A config reporting no per-layer overrides is homogeneous, so the model-wide
+        count decides; min() over no layers must not raise."""
+        b = SpyreAttnBucketer(make_config(num_kv_heads=1, per_layer_kv_heads=[]))
+        assert min(b.num_blocks_buckets) == 2
+
     def test_no_floor_above_one_kv_head(self):
         b = SpyreAttnBucketer(make_config(num_kv_heads=2))
         assert min(b.num_blocks_buckets) == 1
