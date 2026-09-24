@@ -220,6 +220,28 @@ class TestTracedForward:
         query, key, value = self._inputs(layer, 256)
         assert layer.forward(query, key, value, output_dtype=torch.float32) == "upstream"
 
+    def test_falls_through_on_a_requested_output_shape(self, monkeypatch):
+        """The inline path returns [tokens, heads * head_size] and ignores output_shape.
+
+        Even a shape equal to what it would return takes the fallthrough, so the contract
+        is "no output_shape" rather than "a compatible one".
+        """
+        layer = _layer()
+        install_encoder([layer])
+        monkeypatch.setattr(enc, "_ORIG_ATTENTION_FORWARD", lambda *a, **k: "upstream")
+        extent, width = 64, 4
+        publish_encoder_grid(
+            EncoderRectPlan(
+                extent=extent,
+                width=width,
+                mask=encoder_key_pad_mask(extent, [extent] * width, torch.float16),
+                query_lens=[extent] * width,
+            )
+        )
+        query, key, value = self._inputs(layer, extent * width)
+        wanted = torch.Size((extent * width, layer.num_heads * layer.head_size))
+        assert layer.forward(query, key, value, output_shape=wanted) == "upstream"
+
     def test_inlined_result_matches_the_kernel_the_impl_runs(self):
         """Parity: the traced path and the opaque path must be the same computation."""
         layer = _layer()

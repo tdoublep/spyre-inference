@@ -838,7 +838,9 @@ def _spyre_encoder_attention_forward(
     ragged path is untouched.
     """
     mask = _encoder_grid.mask
-    if mask is None or output_dtype not in (None, query.dtype):
+    # The inline path returns [tokens, num_heads * head_size], so a caller asking for any
+    # other output shape or dtype has to take the fallthrough.
+    if mask is None or output_dtype not in (None, query.dtype) or output_shape is not None:
         return _ORIG_ATTENTION_FORWARD(self, query, key, value, output_shape, output_dtype)
 
     num_heads, num_kv_heads = self.num_heads, self.num_kv_heads
