@@ -1042,7 +1042,9 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
                 block_table_tensor=torch.zeros(1, bucket.num_blocks, dtype=torch.int32),
                 slot_mapping=torch.zeros(query_len, dtype=torch.int64),
                 causal=True,
-                is_prefilling=torch.tensor([query_len > 1]),
+                # Even at one token: a one-token decode takes the batched kernel, so the
+                # per-seq loop sees that width only as a prefill's one-token tail.
+                is_prefilling=torch.tensor([True]),
             ),
         )
 
