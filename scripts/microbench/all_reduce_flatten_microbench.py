@@ -181,6 +181,7 @@ def worker(args):
         cpu_group = ps._TP.cpu_group
         tp = dist.get_world_size(cpu_group)
         device = torch.device(f"spyre:{local_rank}")
+        variants = tuple(args.variants.split(","))
 
         def make(flatten):
             def all_reduce(x):
@@ -206,7 +207,7 @@ def worker(args):
             x, w, res = (a.to(device) for a in (x_cpu, w_cpu, res_cpu))
 
             steps = {}
-            for v in VARIANTS:
+            for v in variants:
                 step = torch.compile(make(v == "flat"), dynamic=False)
                 out, code = run_and_get_code(step, x, w, res)
                 torch.spyre.synchronize(device)
@@ -221,9 +222,9 @@ def worker(args):
                 torch.spyre.synchronize(device)
                 steps[v] = step
 
-            reps = {v: [] for v in VARIANTS}
+            reps = {v: [] for v in variants}
             for i in range(args.reps):
-                for v in VARIANTS if i % 2 == 0 else reversed(VARIANTS):
+                for v in variants if i % 2 == 0 else reversed(variants):
                     dist.barrier(group=cpu_group)
                     t0 = time.perf_counter()
                     for _ in range(args.iters):
@@ -260,6 +261,7 @@ def main():
     p.add_argument("--graph", default="linear")
     p.add_argument("--world-sizes", default="2,4")
     p.add_argument("--graphs", default="bare,linear")
+    p.add_argument("--variants", default=",".join(VARIANTS), help="worker only: subset to run")
     p.add_argument("--shapes", default=DEFAULT_SHAPES)
     p.add_argument("--iters", type=int, default=50)
     p.add_argument("--reps", type=int, default=10)
