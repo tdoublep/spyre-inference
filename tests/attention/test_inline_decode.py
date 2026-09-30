@@ -307,7 +307,8 @@ class TestWarmup:
     [
         pytest.param(1, 8, True, id="bs1"),
         pytest.param(2, 4, True, id="bs2"),
-        pytest.param(4, 8, False, id="bs4_device_bound"),
+        pytest.param(4, 8, True, id="bs4"),
+        pytest.param(8, 4, False, id="bs8"),
         pytest.param(1, 2, False, id="bs1_capped"),
     ],
 )

@@ -954,13 +954,7 @@ class TorchSpyreModelRunner(GPUModelRunner):
 
     @torch.inference_mode()
     def _warm_inline_decode(self) -> None:
-        """Compile the block graph of every pure-decode step that traces attention in.
-
-        Those graphs specialise on the decode grid's shapes, which the body-bucket dummies
-        above never publish. Each dummy's grid comes out of ``build()``, the function
-        serving publishes through, under the same inference mode, so both hand Dynamo the
-        same tensors.
-        """
+        """Compile each inline decode block graph, its grid published as serving does."""
         # Nothing traces in eagerly, and a grid needs a bound cache to mirror onto.
         if self.compilation_config.mode is CompilationMode.NONE or not self._spyre_kv_caches:
             return
