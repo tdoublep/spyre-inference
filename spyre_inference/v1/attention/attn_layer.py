@@ -16,11 +16,8 @@
 
 ``install()``, called from the attention metadata builder, binds the forward below onto
 each eligible layer instance; every other ``Attention`` keeps upstream's forward and its
-``unified_kv_cache_update`` op. A pure-decode step whose batched decode variant the impl
-accepts (``inline_batched_decode``) runs that kernel inside the block graph, reading the
-static arguments off its ``DecodeGrid``. Every other step keeps the opaque core: a mixed
-step's per-sequence loop cannot be captured with ``fullgraph=True``, and its structure
-depends on the step's composition.
+``unified_kv_cache_update`` op. Any other step keeps the opaque core: a mixed step's
+per-sequence loop cannot be captured with ``fullgraph=True``.
 """
 
 import collections
@@ -96,11 +93,7 @@ class SlotMapping:
 
 
 class DecodeGrid:
-    """This step's batched-decode index tensors on device, or None off a pure-decode step.
-
-    Shares the slot mapping's layers: the mirror goes through a layer's impl, which owns
-    the page-index layout, and happens in ``build()`` so no layer pays for it in-forward.
-    """
+    """This step's batched-decode index tensors on device, or None off the inline path."""
 
     def __init__(self, slots: SlotMapping) -> None:
         self._slots = slots
@@ -155,7 +148,6 @@ class DecodeGrid:
         return "inline"
 
     def _count(self, path: str, attn_metadata: "SpyreAttentionMetadata") -> None:
-        """Log the decode-path hit rate periodically; only a log line leaves the worker."""
         from spyre_inference.v1.attention.backends.spyre_attn import is_warmup_complete
 
         if not is_warmup_complete():
@@ -258,13 +250,8 @@ def _spyre_attention_forward(
 
 
 def _inline_batched_decode(self: Attention, grid: DecodeGrid, query: torch.Tensor) -> torch.Tensor:
-    """Batched decode traced into the caller's graph, after the KV write it must see.
-
-    The static arguments come from the grid's shapes, which Dynamo guards on: the grid
-    object is stable across steps, so a per-step value there would never be guarded.
-    The pages are read through the same views the write scattered into, so the graph
-    mutates and reads one input rather than two aliasing ones.
-    """
+    # Static arguments come from the grid's shapes, which Dynamo guards on; pages are read
+    # through the views the KV write scattered into, so the graph mutates one input.
     impl = self.impl
     mask, rep_row_ids = cast(torch.Tensor, grid.mask), cast(torch.Tensor, grid.rep_row_ids)
     b_seqs = mask.shape[-4]

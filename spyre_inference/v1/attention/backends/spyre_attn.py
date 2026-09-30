@@ -1090,11 +1090,7 @@ class SpyreAttentionMetadataBuilder(AttentionMetadataBuilder[SpyreAttentionMetad
     def publish_decode_warmup_variant(
         self, bucket: SpyreAttnBatchedDecodeBucket
     ) -> tuple[int, int, int] | None:
-        """Publish the decode grid a pure-decode step at ``bucket`` gets, via build().
-
-        Returns the ``(num_seqs, blocks_per_chunk, num_chunks)`` key the grid realizes,
-        or None when that step stays on the opaque path.
-        """
+        """The key a pure-decode step at ``bucket`` publishes via build(), or None if opaque."""
         metadata = self.build_for_batched_decode_variant(bucket)
         if self._decode_grid.mask is None:
             return None
@@ -1331,12 +1327,9 @@ class SpyreAttentionImpl(AttentionImpl[SpyreAttentionMetadata]):
         """Whether batched decode may run under the tiled walk; overridable."""
         return False
 
-    # The batched decode kernel attn_layer traces into the block graph, or None to keep
-    # every decode behind the opaque op.
     inline_decode_kernel = None
 
     def inline_batched_decode(self, b_seqs: int, blocks_per_chunk: int) -> bool:
-        """Whether this batched decode variant may be traced into the block graph."""
         return False
 
     def _batched_decode_preconditions_met(self, attn_metadata: "SpyreAttentionMetadata") -> bool:
