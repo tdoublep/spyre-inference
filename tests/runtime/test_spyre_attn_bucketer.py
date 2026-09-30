@@ -273,9 +273,7 @@ class TestVariants:
         assert SpyreAttnBucketer(make_config(max_num_seqs=8)).num_seqs_buckets == [1, 2, 4, 8]
         assert SpyreAttnBucketer(make_config(max_num_seqs=6)).num_seqs_buckets == [1, 2, 4, 6]
 
-    @pytest.mark.parametrize(
-        "max_num_seqs, expected", [(1, [1]), (2, [1, 2]), (3, [1, 2, 3])]
-    )
+    @pytest.mark.parametrize("max_num_seqs, expected", [(1, [1]), (2, [1, 2]), (3, [1, 2, 3])])
     def test_num_seqs_buckets_at_small_max_num_seqs(self, max_num_seqs, expected):
         b = SpyreAttnBucketer(make_config(max_num_seqs=max_num_seqs))
         assert b.num_seqs_buckets == expected
