@@ -308,7 +308,12 @@ def _moe_persistent(
     return result
 
 
-def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+def _gathered(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    route_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     recipe = layer.spyre_moe_recipe
     return _moe_gathered(
         x,
@@ -318,19 +323,22 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
         layer.spyre_moe_down,
         layer.top_k,
         layer.spyre_moe_stick,
-        layer.spyre_moe_route_dtype,
+        route_dtype or layer.spyre_moe_route_dtype,
         recipe.routing,
         recipe.activation,
     )
 
 
 def _gathered_tokens(
-    layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    route_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     # The gathered kernel only lowers at one token. ``dynamic=False`` specializes this loop to
     # the packed bucket, so slicing, expert calls, and assembly stay in one compiled region.
     rows = [
-        _gathered(layer, x[token : token + 1], router_logits[token : token + 1])
+        _gathered(layer, x[token : token + 1], router_logits[token : token + 1], route_dtype)
         for token in range(x.shape[0])
     ]
     return torch.cat(rows)
@@ -442,24 +450,13 @@ def _install_traced_named_dims() -> None:
     nd._propagate_named_dims_impl = with_expert_names
 
 
-def install_traced_prefill(runner: Any) -> None:
-    """Route multi-token MoE through the traceable entry so it joins the block graph.
-
-    Single-token decode keeps vLLM's opaque ``moe_forward``: the token count is fixed per
-    compiled graph, so the choice resolves at trace time.
-    """
+def install_traced_moe(runner: Any) -> None:
+    """Route MoE through vLLM's traceable entry so it joins the block graph."""
     from torch_spyre._inductor import config as spyre_config
     from vllm.model_executor.layers.fused_moe.runner import moe_runner
 
     assert runner.shared_experts is None, "traced Spyre MoE does not handle shared experts"
-    opaque = runner._forward_entry
-
-    def entry(hidden_states: torch.Tensor, *args: Any) -> torch.Tensor:
-        if hidden_states.shape[0] > 1:
-            return moe_runner._moe_forward(hidden_states, *args)
-        return opaque(hidden_states, *args)
-
-    runner._forward_entry = entry
+    runner._forward_entry = moe_runner._moe_forward
     # Config scopes cannot be entered while tracing, so the block compile gets them globally.
     for options in (_MOE_COMPILER_CONFIG, _PERSISTENT_COMPILER_CONFIG):
         for key, value in options.items():
@@ -576,12 +573,16 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         layer = cast("RoutedExperts", layer)
-        if torch.compiler.is_compiling():
-            # Only multi-token batches are traced (install_traced_prefill); they always
-            # exceed the gathered bound, which compile_sizes keeps far below the chunk.
-            return self._traced_persistent(layer, x, router_logits)
-        moe_scope, persistent_scope = _compiler_scopes()
         tokens = x.shape[0]
+        if torch.compiler.is_compiling():
+            # In-graph the input is an intermediate the compiler lays out, so no storage
+            # offset is baked into a kernel and the addressability check does not apply.
+            if tokens > envs.SPYRE_MOE_GATHERED_MAX_TOKENS:
+                return self._traced_persistent(layer, x, router_logits)
+            # In-graph the fp32 softmax hits a stick mismatch against the fp16 router output.
+            fn = _gathered if tokens == 1 else _gathered_tokens
+            return fn(layer, x, router_logits, router_logits.dtype)
+        moe_scope, persistent_scope = _compiler_scopes()
         # A single row is handed to the region whole, so no row slice needs an addressable offset.
         if tokens == 1 or (
             tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS
