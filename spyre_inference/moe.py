@@ -379,6 +379,9 @@ def _experts(layer: RoutedExperts, x: torch.Tensor, route: torch.Tensor) -> torc
 
 
 def _region(layer: RoutedExperts, name: str, fn: Any) -> Any:
+    # Traced into the caller's graph (SPYRE_MOE_TRACED): inline instead of nesting a region.
+    if torch.compiler.is_compiling():
+        return fn
     region = layer.spyre_moe_regions.get(name)
     if region is None:
         region = torch.compile(fn, backend="inductor", fullgraph=True, dynamic=False)
@@ -394,6 +397,74 @@ def _reset_named_dims() -> None:
     from torch_spyre._inductor.wsr.propagate_named_dims import reset
 
     reset()
+
+
+# Expert stacks of traced layers and their dim names. torch-spyre clears its input-name
+# registry after every graph, so these are re-attached before each named-dims pass.
+_traced_expert_dims: dict[int, tuple[torch.Tensor, list[str]]] = {}
+
+
+def _install_traced_named_dims() -> None:
+    from torch._inductor.virtualized import V
+    from torch_spyre._inductor.wsr import propagate_named_dims as nd
+
+    impl = nd._propagate_named_dims_impl
+    if getattr(impl, "_spyre_moe_traced", False):
+        return
+
+    def with_expert_names(graph):
+        inputs = [t for t in V.get_real_inputs() if isinstance(t, torch.Tensor)]
+        real = {id(t) for t in inputs}
+        hidden = None
+        for key, (tensor, names) in _traced_expert_dims.items():
+            if key in real:
+                for name, extent in zip(names, tensor.shape):
+                    nd.declare_tensor_dim(name, int(extent))
+                nd.declare_tensor_dim("ONE", 1)
+                nd._named_tensor_dims[tensor] = names
+                hidden = int(tensor.shape[names.index("H")])
+        if hidden is not None:
+            # As hf_adapters does: name the activations entering the graph, and let T
+            # propagate through the norms to the expert loop's work division. Weights
+            # ([out, H] projections) are Parameters and must not be read as tokens.
+            for t in inputs:
+                if (
+                    t.dim() in (2, 3)
+                    and t.shape[-1] == hidden
+                    and not isinstance(t, torch.nn.Parameter)
+                    and id(t) not in _traced_expert_dims
+                ):
+                    nd.declare_tensor_dim("T", t.numel() // hidden)
+                    nd._named_tensor_dims[t] = ["T", "H"]
+        return impl(graph)
+
+    with_expert_names._spyre_moe_traced = True  # ty: ignore[unresolved-attribute]
+    nd._propagate_named_dims_impl = with_expert_names
+
+
+def install_traced_prefill(runner: Any) -> None:
+    """Route multi-token MoE through the traceable entry so it joins the block graph.
+
+    Single-token decode keeps vLLM's opaque ``moe_forward``: the token count is fixed per
+    compiled graph, so the choice resolves at trace time.
+    """
+    from torch_spyre._inductor import config as spyre_config
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    assert runner.shared_experts is None, "traced Spyre MoE does not handle shared experts"
+    opaque = runner._forward_entry
+
+    def entry(hidden_states: torch.Tensor, *args: Any) -> torch.Tensor:
+        if hidden_states.shape[0] > 1:
+            return moe_runner._moe_forward(hidden_states, *args)
+        return opaque(hidden_states, *args)
+
+    runner._forward_entry = entry
+    # Config scopes cannot be entered while tracing, so the block compile gets them globally.
+    for options in (_MOE_COMPILER_CONFIG, _PERSISTENT_COMPILER_CONFIG):
+        for key, value in options.items():
+            setattr(spyre_config, key, value)
+    _install_traced_named_dims()
 
 
 def _to_spyre_expert_weight(weight: torch.Tensor, pad: tuple[int, ...]) -> torch.Tensor:
@@ -456,6 +527,19 @@ def _prepare_layer(layer: RoutedExperts) -> None:
         else dtype
     )
     layer.spyre_moe_route_identity = torch.eye(stick, dtype=dtype).to("spyre")
+    if envs.SPYRE_MOE_TRACED:
+        # Buffers are lifted as graph inputs, so their dim names can attach to real tensors.
+        for name, names in (
+            ("spyre_moe_gate", ["E", "H", "M"]),
+            ("spyre_moe_up", ["E", "H", "M"]),
+            ("spyre_moe_down", ["E", "M", "H"]),
+            ("spyre_moe_route_identity", None),
+        ):
+            tensor = getattr(layer, name)
+            delattr(layer, name)
+            layer.register_buffer(name, tensor, persistent=False)
+            if names is not None:
+                _traced_expert_dims[id(tensor)] = (tensor, names)
     logger.info_once(
         "Spyre: relaid out routed-expert stacks (%d experts, hidden=%d, intermediate=%d%s).",
         experts,
@@ -492,6 +576,10 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         layer = cast("RoutedExperts", layer)
+        if torch.compiler.is_compiling():
+            # Only multi-token batches are traced (install_traced_prefill); they always
+            # exceed the gathered bound, which compile_sizes keeps far below the chunk.
+            return self._traced_persistent(layer, x, router_logits)
         moe_scope, persistent_scope = _compiler_scopes()
         tokens = x.shape[0]
         # A single row is handed to the region whole, so no row slice needs an addressable offset.
@@ -517,3 +605,15 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
                     return _region(layer, "experts", _experts)(layer, x, route)
             finally:
                 _reset_named_dims()
+
+    @staticmethod
+    def _traced_persistent(
+        layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
+    ) -> torch.Tensor:
+        """The persistent path inside the block graph; its scopes are set globally."""
+        if layer.spyre_moe_recipe.routing == "full_softmax":
+            # In-graph the fp32 softmax hits a stick mismatch against the fp16 router output.
+            route = _route(layer, _probs(router_logits, router_logits.dtype))
+        else:
+            route = _route_selected(layer, _topk_probs(router_logits, layer.top_k))
+        return _experts(layer, x, route)
