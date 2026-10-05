@@ -55,6 +55,7 @@ from spyre_inference.v1.attention.ops.page_attn_head_major_decode import (
 )
 from spyre_inference.v1.attention.ops.page_attn_head_major_prefill import (
     page_attn_head_major_prefill_kernel,
+    page_attn_head_major_prefill_oneshot_kernel,
 )
 from spyre_inference.v1.attention.ops.reshape_and_cache_head_major import (
     reshape_and_cache_head_major_kernel,
@@ -72,6 +73,9 @@ logger = init_logger(__name__)
 _page_attn_prefill_compiled = torch.compile(
     page_attn_head_major_prefill_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
 )
+_page_attn_prefill_oneshot_compiled = torch.compile(
+    page_attn_head_major_prefill_oneshot_kernel, dynamic=False, fullgraph=True
+)
 _page_attn_decode_compiled = torch.compile(
     page_attn_head_major_decode_kernel, dynamic=False, fullgraph=USE_FOR_EACH_TILE
 )
@@ -82,6 +86,10 @@ _batched_decode_compiled = torch.compile(
 # Warmup's recorder covers these, so a compile afterwards is a coverage gap.
 compile_guard.watch(
     page_attn_head_major_prefill_kernel, "page attention prefill kernel (head-major)"
+)
+compile_guard.watch(
+    page_attn_head_major_prefill_oneshot_kernel,
+    "page attention one-shot prefill kernel (head-major)",
 )
 compile_guard.watch(page_attn_head_major_decode_kernel, "page attention decode kernel (head-major)")
 compile_guard.watch(batched_decode_head_major_kernel, "batched decode kernel (head-major)")
@@ -336,10 +344,11 @@ class SpyreHeadMajorAttentionImpl(SpyreAttentionImpl):
         # Beyond one query token the page transfer LX residency saves is amortised over every
         # query row, and the unrolling it costs is not.
         if padded_query_len > 1:
+            oneshot = num_blocks * self.block_size <= envs.SPYRE_ATTN_ONESHOT_MAX_KV
             with _capped_cores(self.num_kv_heads * padded_query_len):
                 return _call_kernel(
                     "page attention (prefill)",
-                    _page_attn_prefill_compiled,
+                    _page_attn_prefill_oneshot_compiled if oneshot else _page_attn_prefill_compiled,
                     query,
                     row_table,
                     k_pages,

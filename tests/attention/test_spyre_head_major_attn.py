@@ -498,6 +498,9 @@ _SHAPES = [
 # layout plan rather than a result, so it is not asserted here.
 @pytest.mark.parametrize("seq_lens", _SHAPES)
 @pytest.mark.parametrize(
+    "oneshot_max_kv", [pytest.param("8192", id="oneshot"), pytest.param("0", id="page_walk")]
+)
+@pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
     indirect=True,
@@ -506,8 +509,15 @@ _SHAPES = [
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
 def test_head_major_attn_core(
-    default_vllm_config, seq_lens, configure_compilation, configure_device
+    default_vllm_config,
+    monkeypatch,
+    seq_lens,
+    oneshot_max_kv,
+    configure_compilation,
+    configure_device,
 ):
+    monkeypatch.setenv("SPYRE_ATTN_ONESHOT_MAX_KV", oneshot_max_kv)
+    envs.clear_env_cache()
     _run_head_major_attn_test(
         seq_lens=seq_lens,
         block_size=128,
@@ -518,6 +528,10 @@ def test_head_major_attn_core(
 
 
 @pytest.mark.parametrize(
+    ("oneshot_max_kv", "prefill_kernel"),
+    [pytest.param("8192", "oneshot", id="oneshot"), pytest.param("0", "prefill", id="page_walk")],
+)
+@pytest.mark.parametrize(
     "configure_compilation",
     [pytest.param("STOCK_TORCH_COMPILE", id="compiled")],
     indirect=True,
@@ -526,15 +540,22 @@ def test_head_major_attn_core(
     "configure_device", [pytest.param("spyre", id="device_spyre")], indirect=True
 )
 def test_head_major_dispatches_by_query_width(
-    default_vllm_config, monkeypatch, configure_compilation, configure_device
+    default_vllm_config,
+    monkeypatch,
+    oneshot_max_kv,
+    prefill_kernel,
+    configure_compilation,
+    configure_device,
 ):
-    """A decode takes the LX-resident kernel and a wider query the batched one. Sending a
-    wide query to the decode kernel pays for residency the query width already amortises."""
+    """A decode takes the LX-resident kernel and a wider query a prefill one: the one-shot
+    kernel up to SPYRE_ATTN_ONESHOT_MAX_KV, the page walk past it. Sending a wide query to
+    the decode kernel pays for residency the query width already amortises."""
     from spyre_inference.v1.attention.backends import spyre_head_major_attn as hm
 
     # Batched decode now covers every batch size, and it serves a mixed batch's decode
     # prefix before the per-seq loop runs, so the per-seq kernels are the subject here.
     monkeypatch.setenv("SPYRE_BATCHED_DECODE", "0")
+    monkeypatch.setenv("SPYRE_ATTN_ONESHOT_MAX_KV", oneshot_max_kv)
     envs.clear_env_cache()
 
     called = []
@@ -553,6 +574,11 @@ def test_head_major_dispatches_by_query_width(
     monkeypatch.setattr(
         hm, "_page_attn_prefill_compiled", spy("prefill", hm._page_attn_prefill_compiled)
     )
+    monkeypatch.setattr(
+        hm,
+        "_page_attn_prefill_oneshot_compiled",
+        spy("oneshot", hm._page_attn_prefill_oneshot_compiled),
+    )
 
     _run_head_major_attn_test(
         seq_lens=[(1, 300), (64, 200)],
@@ -562,7 +588,7 @@ def test_head_major_dispatches_by_query_width(
         configure_device=configure_device,
     )
 
-    assert sorted(called) == ["decode", "prefill"], called
+    assert sorted(called) == sorted(["decode", prefill_kernel]), called
 
 
 @pytest.mark.parametrize("block_size", [64, 128])

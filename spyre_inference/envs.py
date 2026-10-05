@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     SPYRE_ATTN_NUM_SEQS_BUCKETS: str | None = None
     SPYRE_ATTN_KV_LAYOUT: str = "head_major"
     SPYRE_ATTN_MAX_CORES: int = 0
+    SPYRE_ATTN_ONESHOT_MAX_KV: int = 8192
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
@@ -100,6 +101,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Core cap for the attention compile only, leaving the rest of the model on all 32.
     # "0" (default) lets the LX path pick its own cap and leaves the others uncapped.
     "SPYRE_ATTN_MAX_CORES": lambda: int(os.getenv("SPYRE_ATTN_MAX_CORES", "0")),
+    # Largest prefill KV extent (tokens) attended with one softmax over all gathered pages
+    # instead of the per-page online-softmax walk; 0 disables it.
+    "SPYRE_ATTN_ONESHOT_MAX_KV": lambda: int(os.getenv("SPYRE_ATTN_ONESHOT_MAX_KV", "8192")),
     # When "1" (default), enables the batched multi-sequence decode kernel.
     # Under the default tiled walk it applies only to the
     # head-major cache, which uses a split page index, so a token-major run keeps

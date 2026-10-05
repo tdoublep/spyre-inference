@@ -130,3 +130,53 @@ def page_attn_head_major_prefill_kernel(
         out.index_copy_(0, query_row_index, attn)
         return out
     return attn
+
+
+def page_attn_head_major_prefill_oneshot_kernel(
+    query,
+    query_row_index,
+    k_pages,
+    v_pages,
+    page_index_table,
+    mask_stack,
+    scale,
+    num_blocks,
+    padded_query_len,
+    num_heads,
+    num_kv_heads,
+    head_size,
+    block_size,
+    logits_soft_cap=0.0,
+    out=None,
+):
+    """`page_attn_head_major_prefill_kernel` as one softmax over every gathered page.
+
+    Materializes a [kv_head, group, query, kv_len] score tensor, so it is only used for short KV.
+    """
+    num_queries_per_kv = num_heads // num_kv_heads
+    kv_len = num_blocks * block_size
+
+    q_rows = query.index_select(0, query_row_index)
+    q = (
+        q_rows.unsqueeze(0)
+        .transpose(1, 2)
+        .reshape(num_kv_heads, num_queries_per_kv, padded_query_len, head_size)
+    )
+    page_ids = page_index_table[:num_blocks, 0]
+    k = k_pages.index_select(0, page_ids).permute(1, 0, 2, 3)
+    v = v_pages.index_select(0, page_ids).permute(1, 0, 2, 3)
+    k = k.reshape(num_kv_heads, 1, kv_len, head_size)
+    v = v.reshape(num_kv_heads, 1, kv_len, head_size)
+    mask = mask_stack[:num_blocks].permute(1, 0, 2).reshape(padded_query_len, kv_len)
+
+    scores = torch.matmul(q, k.transpose(-2, -1)) * scale
+    if logits_soft_cap > 0.0:
+        scores = torch.tanh(scores / logits_soft_cap) * logits_soft_cap
+    probs = torch.softmax(scores + mask, dim=-1)
+    attn = torch.matmul(probs, v)
+    attn = attn.reshape(1, num_heads, padded_query_len, head_size).transpose(1, 2)
+    attn = attn.reshape(padded_query_len, num_heads, head_size)
+    if out is not None:
+        out.index_copy_(0, query_row_index, attn)
+        return out
+    return attn
