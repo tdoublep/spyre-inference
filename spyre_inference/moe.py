@@ -307,7 +307,12 @@ def _moe_persistent(
     return result
 
 
-def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
+def _gathered(
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    route_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     recipe = layer.spyre_moe_recipe
     return _moe_gathered(
         x,
@@ -317,19 +322,22 @@ def _gathered(layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
         layer.spyre_moe_down,
         layer.top_k,
         layer.spyre_moe_stick,
-        layer.spyre_moe_route_dtype,
+        route_dtype or layer.spyre_moe_route_dtype,
         recipe.routing,
         recipe.activation,
     )
 
 
 def _gathered_tokens(
-    layer: RoutedExperts, x: torch.Tensor, router_logits: torch.Tensor
+    layer: RoutedExperts,
+    x: torch.Tensor,
+    router_logits: torch.Tensor,
+    route_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     # The gathered kernel only lowers at one token. ``dynamic=False`` specializes this loop to
     # the packed bucket, so slicing, expert calls, and assembly stay in one compiled region.
     rows = [
-        _gathered(layer, x[token : token + 1], router_logits[token : token + 1])
+        _gathered(layer, x[token : token + 1], router_logits[token : token + 1], route_dtype)
         for token in range(x.shape[0])
     ]
     return torch.cat(rows)
@@ -395,6 +403,57 @@ def _reset_named_dims() -> None:
     reset()
 
 
+# torch-spyre clears its input-name registry after every graph, so traced layers'
+# expert stacks are re-named before each named-dims pass.
+_traced_expert_dims: dict[int, tuple[torch.Tensor, list[str]]] = {}
+
+
+def _install_traced_named_dims() -> None:
+    from torch._inductor.virtualized import V
+    from torch_spyre._inductor.wsr import propagate_named_dims
+
+    impl = propagate_named_dims._propagate_named_dims_impl
+    if getattr(impl, "_spyre_moe_traced", False):
+        return
+
+    def with_expert_names(graph):
+        inputs = [t for t in V.get_real_inputs() if isinstance(t, torch.Tensor)]
+        real = {id(t) for t in inputs}
+        hidden = None
+        for key, (tensor, names) in _traced_expert_dims.items():
+            if key in real:
+                for name, extent in zip(names, tensor.shape):
+                    propagate_named_dims.declare_tensor_dim(name, int(extent))
+                propagate_named_dims.declare_tensor_dim("ONE", 1)
+                propagate_named_dims._named_tensor_dims[tensor] = names
+                hidden = int(tensor.shape[names.index("H")])
+        if hidden is not None:
+            # Name the activations [T, H] so T reaches the expert loop's work division;
+            # [out, H] projection weights are Parameters, not tokens.
+            for t in inputs:
+                if (
+                    t.dim() in (2, 3)
+                    and t.shape[-1] == hidden
+                    and not isinstance(t, torch.nn.Parameter)
+                    and id(t) not in _traced_expert_dims
+                ):
+                    propagate_named_dims.declare_tensor_dim("T", t.numel() // hidden)
+                    propagate_named_dims._named_tensor_dims[t] = ["T", "H"]
+        return impl(graph)
+
+    with_expert_names._spyre_moe_traced = True
+    propagate_named_dims._propagate_named_dims_impl = with_expert_names  # ty: ignore[invalid-assignment]
+
+
+def install_traced_moe(runner: Any) -> None:
+    """Route MoE through vLLM's traceable entry so it joins the block graph."""
+    from vllm.model_executor.layers.fused_moe.runner import moe_runner
+
+    assert runner.shared_experts is None, "traced Spyre MoE does not handle shared experts"
+    runner._forward_entry = moe_runner._moe_forward
+    _install_traced_named_dims()
+
+
 def _to_spyre_expert_weight(weight: torch.Tensor, pad: tuple[int, ...]) -> torch.Tensor:
     """Move one expert stack to the device in the gather-friendly MoE layout.
 
@@ -455,6 +514,19 @@ def _prepare_layer(layer: RoutedExperts) -> None:
         else dtype
     )
     layer.spyre_moe_route_identity = torch.eye(stick, dtype=dtype).to("spyre")
+    if envs.SPYRE_MOE_TRACED:
+        # Buffers are lifted as graph inputs, so their dim names can attach to real tensors.
+        for name, names in (
+            ("spyre_moe_gate", ["E", "H", "M"]),
+            ("spyre_moe_up", ["E", "H", "M"]),
+            ("spyre_moe_down", ["E", "M", "H"]),
+            ("spyre_moe_route_identity", None),
+        ):
+            tensor = getattr(layer, name)
+            delattr(layer, name)
+            layer.register_buffer(name, tensor, persistent=False)
+            if names is not None:
+                _traced_expert_dims[id(tensor)] = (tensor, names)
     logger.info_once(
         "Spyre: relaid out routed-expert stacks (%d experts, hidden=%d, intermediate=%d%s).",
         experts,
@@ -491,8 +563,20 @@ class SpyreUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         layer = cast("RoutedExperts", layer)
-        moe_scope, persistent_scope = _compiler_scopes()
         tokens = x.shape[0]
+        if torch.compiler.is_compiling():
+            # In-graph inputs are compiler-laid-out, so no offset check; an in-graph fp32
+            # softmax hits a stick incompatibility, so routing stays in the logits' dtype.
+            if tokens == 1:
+                return _gathered(layer, x, router_logits, router_logits.dtype)
+            if tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS:
+                return _gathered_tokens(layer, x, router_logits, router_logits.dtype)
+            if layer.spyre_moe_recipe.routing == "full_softmax":
+                route = _route(layer, _probs(router_logits, router_logits.dtype))
+            else:
+                route = _route_selected(layer, _topk_probs(router_logits, layer.top_k))
+            return _experts(layer, x, route)
+        moe_scope, persistent_scope = _compiler_scopes()
         # A single row is handed to the region whole, so no row slice needs an addressable offset.
         if tokens == 1 or (
             tokens <= envs.SPYRE_MOE_GATHERED_MAX_TOKENS

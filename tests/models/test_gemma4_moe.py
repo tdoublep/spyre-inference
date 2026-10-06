@@ -477,6 +477,55 @@ def test_named_dims_are_reset_when_a_region_raises(monkeypatch):
     assert resets == [1], "the reset must survive a failing region"
 
 
+@pytest.mark.parametrize(
+    ("routing", "tokens", "expected"),
+    [
+        ("full_softmax", 1, ["_gathered"]),
+        ("full_softmax", 3, ["_gathered_tokens"]),
+        ("full_softmax", 8, ["_probs", "_route", "_experts"]),
+        ("topk_softmax", 8, ["_topk_probs", "_route_selected", "_experts"]),
+    ],
+)
+def test_traced_dispatch_inlines_forms_without_compiled_regions(
+    monkeypatch, routing, tokens, expected
+):
+    """Inside the block graph the forms are traced directly, routing in the logits' dtype."""
+    from spyre_inference import moe as moe_module
+
+    monkeypatch.setenv("SPYRE_MOE_GATHERED_MAX_TOKENS", "4")
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    monkeypatch.setattr(moe_module, "_region", lambda *args: pytest.fail("entered a region"))
+    calls = []
+    for name in ("_gathered", "_gathered_tokens", "_probs", "_topk_probs", "_route"):
+        monkeypatch.setattr(
+            moe_module, name, lambda *args, _name=name: calls.append((_name, args[-1]))
+        )
+    for name in ("_route_selected", "_experts"):
+        monkeypatch.setattr(moe_module, name, lambda *args, _name=name: calls.append((_name,)))
+
+    _apply(_dispatch_layer(routing), tokens=tokens)
+    assert [call[0] for call in calls] == expected
+    if expected[0] in ("_gathered", "_gathered_tokens", "_probs"):
+        assert calls[0][1] == torch.float32, "routing must stay in the logits' dtype in-graph"
+
+
+def test_installing_traced_moe_leaves_the_compiler_config_alone(monkeypatch):
+    """The block graph holds attention and dense layers too, so no MoE flag may go global."""
+    from torch_spyre._inductor import config as spyre_config
+    from torch_spyre._inductor.wsr import propagate_named_dims
+
+    from spyre_inference.moe import install_traced_moe
+
+    monkeypatch.setattr(
+        propagate_named_dims,
+        "_propagate_named_dims_impl",
+        propagate_named_dims._propagate_named_dims_impl,
+    )
+    before = spyre_config.get_config_copy()
+    install_traced_moe(SimpleNamespace(shared_experts=None, _forward_entry=None))
+    assert spyre_config.get_config_copy() == before
+
+
 def test_gathered_matches_dense_reference(moe_weights):
     """The decode form, at the single token whose combine has a legal device layout.
 
