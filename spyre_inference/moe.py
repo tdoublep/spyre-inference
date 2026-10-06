@@ -514,19 +514,18 @@ def _prepare_layer(layer: RoutedExperts) -> None:
         else dtype
     )
     layer.spyre_moe_route_identity = torch.eye(stick, dtype=dtype).to("spyre")
-    if envs.SPYRE_MOE_TRACED:
-        # Buffers are lifted as graph inputs, so their dim names can attach to real tensors.
-        for name, names in (
-            ("spyre_moe_gate", ["E", "H", "M"]),
-            ("spyre_moe_up", ["E", "H", "M"]),
-            ("spyre_moe_down", ["E", "M", "H"]),
-            ("spyre_moe_route_identity", None),
-        ):
-            tensor = getattr(layer, name)
-            delattr(layer, name)
-            layer.register_buffer(name, tensor, persistent=False)
-            if names is not None:
-                _traced_expert_dims[id(tensor)] = (tensor, names)
+    # Buffers are lifted as graph inputs, so their dim names can attach to real tensors.
+    for name, names in (
+        ("spyre_moe_gate", ["E", "H", "M"]),
+        ("spyre_moe_up", ["E", "H", "M"]),
+        ("spyre_moe_down", ["E", "M", "H"]),
+        ("spyre_moe_route_identity", None),
+    ):
+        tensor = getattr(layer, name)
+        delattr(layer, name)
+        layer.register_buffer(name, tensor, persistent=False)
+        if names is not None:
+            _traced_expert_dims[id(tensor)] = (tensor, names)
     logger.info_once(
         "Spyre: relaid out routed-expert stacks (%d experts, hidden=%d, intermediate=%d%s).",
         experts,
