@@ -1380,6 +1380,8 @@ def test_head_major_inline_decode_reads_its_own_write(
         query_quant=None,
         kv_cache=kv_cache,
     )
+    # The runner sets this; `step` below really does compile with fullgraph=True.
+    monkeypatch.setattr(attn_layer, "outer_graph_fullgraph", True)
     slots, grid = attn_layer.install([layer])
     assert grid.inline
     slots.publish(slot_mapping)

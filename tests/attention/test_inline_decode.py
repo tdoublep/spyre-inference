@@ -14,6 +14,7 @@
 
 """Card-free tests for pure-decode attention traced into the block graph."""
 
+import types
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -23,6 +24,7 @@ from vllm.v1.attention.backend import AttentionType
 
 from spyre_inference import envs
 from spyre_inference.v1.attention import attn_layer
+from spyre_inference.v1.attention.backends.spyre_attn import SpyreAttentionImpl
 from spyre_inference.v1.attention.ops import batched_decode_head_major as bdhm
 from spyre_inference.v1.attention.ops import tile_loop
 
@@ -44,7 +46,6 @@ def _impl(**overrides):
         kv_slot_views=lambda kv_cache: (kv_cache[0].view(-1, HEAD), kv_cache[1].view(-1, HEAD)),
         inline_decode_kernel=bdhm.batched_decode_head_major_kernel,
         _batched_decode_supported=lambda: True,
-        _batched_decode_preconditions_met=lambda md: md.padded_num_seqs is not None,
         inline_batched_decode=lambda b_seqs, bpc: True,
         scale=0.3,
         num_kv_heads=KV,
@@ -52,6 +53,11 @@ def _impl(**overrides):
         block_size=BLOCK,
         head_size=HEAD,
         logits_soft_cap=0.0,
+    )
+    # The real gate, not a copy: a copy would pass vacuously if the torch-spyre#4033
+    # whole-cache-gather bound ever moves.
+    impl._batched_decode_preconditions_met = types.MethodType(
+        SpyreAttentionImpl._batched_decode_preconditions_met, impl
     )
     for key, value in overrides.items():
         setattr(impl, key, value)
@@ -103,6 +109,7 @@ def _metadata(num_seqs=4, num_decode_seqs=4, padded=4, bpc=2):
         num_decode_seqs=num_decode_seqs,
         padded_num_seqs=padded,
         blocks_per_chunk=bpc,
+        decode_uniformity=1.0,
         rep_row_ids_dev=None,
         chunk_page_ids_dev=None,
         mask_by_chunk_dev=None,

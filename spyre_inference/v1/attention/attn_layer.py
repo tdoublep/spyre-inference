@@ -43,9 +43,9 @@ logger = init_logger(__name__)
 # slots. `index_copy_` has no skip index, so they absorb writes with nowhere to go.
 _NULL_SLOT = 0
 
-# Set by the model runner: a block compiled without fullgraph could graph-break inside
-# for_each_tile silently rather than fail, so decode attention stays opaque there.
-outer_graph_fullgraph: bool = True
+# Set by the model runner before install() reads it. Defaults to refusing: a block compiled
+# without fullgraph graph-breaks inside for_each_tile silently rather than failing.
+outer_graph_fullgraph: bool = False
 
 _DECODE_PATH_LOG_EVERY = 256
 
@@ -75,6 +75,11 @@ class SlotMapping:
     def _write_index(self, slot_mapping: torch.Tensor, device: torch.device):
         """The device-side KV store index in this group's cache layout."""
         return self._layers[0].impl.kv_write_index(slot_mapping, device)  # ty: ignore[possibly-missing-attribute]
+
+    def resolve(self) -> tuple[torch.device, list[Attention]] | None:
+        """This group's device and cache-bound layers, or None before the caches arrive."""
+        device = self._resolve_device()
+        return None if device is None else (device, self._layers)
 
     def publish(self, slot_mapping: torch.Tensor) -> None:
         """Mirror a step's host slot mapping to device for the traced write to read."""
@@ -116,14 +121,15 @@ class DecodeGrid:
         per_seq = "per_seq" if pure_decode else "mixed"
         if attn_metadata.padded_num_seqs is None:
             return per_seq
-        device = self._slots._resolve_device()
-        if device is None:
+        resolved = self._slots.resolve()
+        if resolved is None:
             return per_seq
-        num_pages = self._slots._layers[0].kv_cache[0].shape[0]
+        device, layers = resolved
+        num_pages = layers[0].kv_cache[0].shape[0]
         impl = next(
             (
                 layer.impl
-                for layer in self._slots._layers
+                for layer in layers
                 if layer.impl._batched_decode_preconditions_met(attn_metadata, num_pages)  # ty: ignore[possibly-missing-attribute]
             ),
             None,
@@ -135,10 +141,7 @@ class DecodeGrid:
         if not pure_decode:
             return "mixed"
         b_seqs, bpc = attn_metadata.padded_num_seqs, attn_metadata.blocks_per_chunk
-        if (
-            not self.inline
-            or not impl.inline_batched_decode(b_seqs, bpc)  # ty: ignore[possibly-missing-attribute]
-        ):
+        if not self.inline or not impl.inline_batched_decode(b_seqs, bpc):  # ty: ignore[possibly-missing-attribute]
             return "batched_opaque"
         self.rep_row_ids = attn_metadata.rep_row_ids_dev
         self.page_ids = attn_metadata.chunk_page_ids_dev
@@ -294,7 +297,7 @@ def _inline_decode_refusal(layer: Attention) -> str | None:
     if envs.SPYRE_ATTN_MAX_CORES:
         return "SPYRE_ATTN_MAX_CORES caps every attention compile, which a block graph cannot scope"
     if not outer_graph_fullgraph:
-        return "the block compiles without fullgraph (Spyre FP8 linears)"
+        return "the block does not compile with fullgraph (eager, or Spyre FP8 linears)"
     return None
 
 

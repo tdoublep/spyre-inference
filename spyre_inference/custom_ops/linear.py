@@ -40,6 +40,7 @@ logger = init_logger(__name__)
 
 # torch-spyre#4032: on some weight shapes a single row runs well below the rate a full
 # 8 PT rows sustain. Two or more rows run faster unpadded, so only one row is padded.
+# Applies to both `pad_rows=True` callers: merged-column layers and the pooling classifier.
 _PAD_ROWS = 8
 _MAX_PAD_WEIGHT = 200_000_000
 

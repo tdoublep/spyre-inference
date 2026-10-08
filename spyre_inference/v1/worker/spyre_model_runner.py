@@ -786,6 +786,10 @@ class TorchSpyreModelRunner(GPUModelRunner):
         # so the backend compiles one block rather than a program that grows with depth.
         granularity = _compile_granularity()
 
+        # Reset before the eager short-circuit: module-global, so a previous runner in this
+        # process must not leave it set for an eager one.
+        attn_layer.outer_graph_fullgraph = False
+
         if self.vllm_config.model_config.enforce_eager or mode is CompilationMode.NONE:
             logger.info("Compilation disabled (enforce_eager=True)")
             return
