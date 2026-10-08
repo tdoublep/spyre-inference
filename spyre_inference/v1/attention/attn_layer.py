@@ -149,9 +149,11 @@ class DecodeGrid:
         return "inline"
 
     def _count(self, path: str, attn_metadata: "SpyreAttentionMetadata") -> None:
-        from spyre_inference.v1.attention.backends.spyre_attn import is_warmup_complete
+        from spyre_inference.v1.worker import compile_guard
 
-        if not is_warmup_complete():
+        # Armed right after warmup, so it stands in for "serving now" (#1109 removed
+        # is_warmup_complete).
+        if not compile_guard.is_armed():
             return
         self.steps[path] += 1
         if path == "batched_opaque":
