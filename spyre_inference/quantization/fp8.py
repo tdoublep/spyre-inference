@@ -18,12 +18,13 @@ lacks (#1458): shard scales go to the kernel as ``[1]`` or per-channel instead. 
 
 from __future__ import annotations
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import (
     LinearBase,
+    UnquantizedLinearMethod,
     register_weight_loader_v2_supported_method,
 )
 from vllm.model_executor.layers.quantization import register_quantization_config
@@ -32,6 +33,9 @@ from vllm.model_executor.layers.quantization.utils.fp8_utils import FP8_SCALE_SE
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import convert_to_channelwise
 from vllm.model_executor.utils import is_weights_pre_processed, replace_parameter
+
+if TYPE_CHECKING:
+    from vllm.model_executor.models.utils import WeightsMapper
 
 logger = init_logger(__name__)
 
@@ -88,7 +92,18 @@ class SpyreFp8LinearMethod(Fp8LinearMethod):
 
 
 class SpyreFp8Config(Fp8Config):
+    def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
+        # modules_to_not_convert names whole modules (e.g. model.vision_tower); mapped bare,
+        # they miss the dotted prefix rules and fall through to the catch-all "model.".
+        mapped = hf_to_vllm_mapper.apply_list([f"{name}." for name in self.ignored_layers])
+        self.ignored_layers = [name.removesuffix(".") for name in mapped]
+
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
+        # Upstream matches ignored names exactly, which misses a named module's sublayers.
+        if isinstance(layer, LinearBase) and any(
+            prefix.startswith(f"{ignored}.") for ignored in self.ignored_layers
+        ):
+            return UnquantizedLinearMethod()
         if isinstance(layer, LinearBase) and not is_layer_skipped(
             prefix=prefix,
             ignored_layers=self.ignored_layers,
