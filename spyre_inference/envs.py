@@ -44,7 +44,6 @@ if TYPE_CHECKING:
     SPYRE_BATCHED_DECODE: bool = True
     SPYRE_JAGGED_DECODE: bool = True
     SPYRE_BLOCKED_TRANSPOSE: bool = True
-    SPYRE_ENCODER_HEAD_GROUPS: int = 1
     SPYRE_KERNEL_CACHE: bool = False
     SPYRE_LOGITS_CPU_GATHER: bool = False
     SPYRE_MAX_NUM_PARTIAL_PREFILLS: int = 1
@@ -127,9 +126,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Set to "0" when torch runs far more threads than the CPUs it gets (e.g. with
     # SPYRE_UPDATE_THREAD_CONFIG=0 in a CPU-limited pod): there it is slower.
     "SPYRE_BLOCKED_TRANSPOSE": lambda: bool(int(os.getenv("SPYRE_BLOCKED_TRANSPOSE", "1"))),
-    # BERT-family encoders: run attention as this many head groups, each with its own Q/K/V
-    # matmuls and out-proj rows, on the traced rectangle path. 1 = one group.
-    "SPYRE_ENCODER_HEAD_GROUPS": lambda: int(os.getenv("SPYRE_ENCODER_HEAD_GROUPS", "1")),
     # When "1", reuse compiled Spyre kernels across processes by caching them on
     # disk. Off by default. TORCHINDUCTOR_FORCE_DISABLE_CACHES=1 disables the cache
     # even when this flag is enabled.

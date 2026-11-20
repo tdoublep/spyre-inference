@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 
 from spyre_inference.custom_ops import bert_split_qkv
-from spyre_inference.custom_ops.bert_split_qkv import split_bert_qkv
+from spyre_inference.custom_ops.bert_split_qkv import grouped_rectangles, split_bert_qkv
 from spyre_inference.v1.attention.backends.spyre_encoder_attn import (
     _encoder_rect_kernel,
     encoder_grid,
@@ -112,12 +112,20 @@ def test_head_groups_match_one_group(default_vllm_config, tp_group, monkeypatch,
     monkeypatch.setattr(bert_split_qkv, "encoder_inline_active", lambda: inline)
     try:
         one = _attention("one")
+        one.spyre_group_rects = frozenset()
         split_bert_qkv(nn.Sequential(one))
         two = _attention("two")
-        monkeypatch.setattr(bert_split_qkv.envs, "SPYRE_ENCODER_HEAD_GROUPS", 2, raising=False)
+        two.spyre_group_rects = frozenset({(WIDTH, EXTENT)})
         split_bert_qkv(nn.Sequential(two))
 
-        assert two.self.spyre_head_groups == 2 and not hasattr(two.self, "q_weight_t")
+        assert hasattr(two.self, "q_weight_t_1") and not hasattr(one.self, "q_weight_t_1")
         torch.testing.assert_close(two(x), one(x), rtol=1e-5, atol=1e-5)
     finally:
         encoder_grid().publish(None)
+
+
+def test_planner_groups_only_kv_tiled_rectangles():
+    rects = [(64, 32), (128, 16), (256, 8), (512, 4)]
+    assert grouped_rectangles(rects, 16, 16, 64) == {(4, 512)}  # e5-large, bge-reranker-large
+    assert grouped_rectangles(rects, 12, 12, 64) == set()  # granite-embedding
+    assert grouped_rectangles([(64, 8), (128, 4)], 16, 16, 64) == set()  # all-roberta, L 128
