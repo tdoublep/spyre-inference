@@ -219,7 +219,7 @@ class TorchSpyrePlatform(CpuPlatform):
                         pooling_default_max_num_seqs,
                     )
 
-                    default = pooling_default_max_num_seqs(model_config.max_model_len, default)
+                    default = pooling_default_max_num_seqs(model_config.max_model_len)
                 self.max_num_seqs = min(self.max_num_seqs, default)
 
         _spyre_patched._spyre_patched = True

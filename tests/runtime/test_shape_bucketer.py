@@ -37,10 +37,11 @@ from spyre_inference.v1.worker.spyre_shape_bucketer import (
 
 
 @pytest.mark.parametrize(
-    "max_model_len, want", [(128, 4), (512, 4), (513, 2), (1024, 2), (2048, 1), (8192, 1)]
+    "max_model_len, want",
+    [(64, 32), (128, 16), (256, 8), (512, 4), (513, 2), (1024, 2), (2048, 1), (8192, 1)],
 )
 def test_pooling_default_max_num_seqs_never_reaches_the_ragged_path(max_model_len, want):
-    seqs = pooling_default_max_num_seqs(max_model_len, default=4)
+    seqs = pooling_default_max_num_seqs(max_model_len)
     assert seqs == want
     cfg = MagicMock()
     cfg.model_config.max_model_len = max_model_len
