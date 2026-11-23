@@ -133,6 +133,7 @@ def install_bert_head_groups(model_config) -> None:
         sa = cast(BertSelfAttention, self.self)
         try:
             config = get_current_vllm_config()
+            # Eager never inlines encoder attention, so _grouped_forward would always fall back.
             if config.compilation_config.mode != CompilationMode.STOCK_TORCH_COMPILE:
                 return
             from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_rectangles
