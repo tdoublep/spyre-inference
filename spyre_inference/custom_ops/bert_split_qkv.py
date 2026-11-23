@@ -20,7 +20,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
-from vllm.config import get_current_vllm_config
+from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
 from vllm.model_executor.models.bert import BertAttention, BertSelfAttention
@@ -132,9 +132,12 @@ def install_bert_head_groups(model_config) -> None:
             return
         sa = cast(BertSelfAttention, self.self)
         try:
+            config = get_current_vllm_config()
+            if config.compilation_config.mode != CompilationMode.STOCK_TORCH_COMPILE:
+                return
             from spyre_inference.v1.worker.spyre_shape_bucketer import encoder_rectangles
 
-            rects = encoder_rectangles(get_current_vllm_config())
+            rects = encoder_rectangles(config)
             self.spyre_group_rects = grouped_rectangles(
                 rects, sa.num_heads, sa.num_kv_heads, sa.head_dim
             )
