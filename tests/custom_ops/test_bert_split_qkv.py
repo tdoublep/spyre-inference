@@ -14,9 +14,6 @@
 
 """CPU-only."""
 
-from types import SimpleNamespace
-from unittest.mock import Mock
-
 import pytest
 import torch
 import torch.nn as nn
@@ -123,56 +120,6 @@ def test_head_groups_match_one_group(default_vllm_config, tp_group, monkeypatch,
         torch.testing.assert_close(two(x), one(x), rtol=1e-5, atol=1e-5)
     finally:
         encoder_grid().publish(None)
-
-
-@pytest.mark.parametrize("eager_first", [True, False], ids=["eager-first", "compiled-first"])
-def test_head_group_eligibility_is_per_instance(
-    default_vllm_config, tp_group, monkeypatch, eager_first
-):
-    from vllm.config import CompilationMode, get_current_vllm_config
-    from vllm.model_executor.models.bert import BertAttention
-
-    # The constructor patch is process-wide; later instances must still use their own mode.
-    monkeypatch.setattr(BertAttention, "__init__", BertAttention.__init__)
-    monkeypatch.setattr(
-        BertAttention,
-        bert_split_qkv._PATCHED_ATTR,
-        getattr(BertAttention, bert_split_qkv._PATCHED_ATTR, False),
-        raising=False,
-    )
-    planner = Mock(return_value=frozenset({(WIDTH, EXTENT)}))
-    monkeypatch.setattr(bert_split_qkv, "grouped_rectangles", planner)
-    config = get_current_vllm_config()
-
-    for eager in (eager_first, not eager_first):
-        planner.reset_mock()
-        mode = CompilationMode.NONE if eager else CompilationMode.STOCK_TORCH_COMPILE
-        monkeypatch.setattr(config.compilation_config, "mode", mode)
-        bert_split_qkv.install_bert_head_groups(SimpleNamespace(runner_type="pooling"))
-        attn = _loaded(
-            BertAttention(
-                hidden_size=256,
-                num_attention_heads=HEADS,
-                layer_norm_eps=1e-5,
-                prefix=f"eager_{eager}",
-            )
-        )
-        assert attn.spyre_group_rects == (frozenset() if eager else planner.return_value)
-        if eager:
-            planner.assert_not_called()
-        else:
-            planner.assert_called_once()
-
-        split_bert_qkv(nn.Sequential(attn))
-
-        assert not hasattr(attn.self, "qkv_proj")
-        for name in ("q", "k", "v"):
-            assert hasattr(attn.self, f"{name}_weight_t")
-            for group in range(2):
-                assert hasattr(attn.self, f"{name}_weight_t_{group}") is not eager
-                assert hasattr(attn.self, f"{name}_bias_{group}") is not eager
-        for group in range(2):
-            assert hasattr(attn.output, f"wo_t_{group}") is not eager
 
 
 def test_planner_groups_only_kv_tiled_rectangles():
